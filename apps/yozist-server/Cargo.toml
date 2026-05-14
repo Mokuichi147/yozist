@@ -24,3 +24,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 figment.workspace = true
 serde.workspace = true
+axum.workspace = true
+rand.workspace = true

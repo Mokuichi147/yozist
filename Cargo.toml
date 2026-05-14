@@ -73,7 +73,7 @@ jsonwebtoken = "9"
 rand = "0.8"
 
 # CLI / Config
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 
 [profile.release]

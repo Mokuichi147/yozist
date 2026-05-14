@@ -2843,16 +2843,19 @@ dependencies = [
  "axum",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
+ "uuid",
  "yozist-ai",
  "yozist-auth",
  "yozist-core",
  "yozist-db",
  "yozist-storage",
+ "yozist-tagging",
  "yozist-versioning",
 ]
 
@@ -2911,8 +2914,10 @@ name = "yozist-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "figment",
+ "rand",
  "serde",
  "tokio",
  "tracing",
