@@ -9,6 +9,8 @@ description = "yozist: authentication + ACL (port of Mokuichi147/UserPermission 
 [dependencies]
 yozist-core.workspace = true
 yozist-db.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 argon2.workspace = true

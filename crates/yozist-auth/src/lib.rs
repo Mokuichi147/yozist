@@ -15,17 +15,20 @@
 //! - **動的パス発行**: REST から saved-query share を作成、期限付き発行に対応
 //!
 //! # TODO
-//! - [ ] 元 `UserPermission` の API カバレッジ 100%
+//! - [ ] 元 `UserPermission` の API カバレッジ 100%（更新・削除・グループ一覧 等）
 //! - [ ] `smb-server::ConfigHandle` 連携で SMB ユーザーを動的同期
 //! - [ ] グループ階層（ネスト）対応
+//! - [ ] Authorizer の本実装（ACL ルール評価エンジン）
 //! - [ ] 監査ログ（誰がいつ何にアクセス）
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use yozist_core::{FileId, GroupId, SeriesId, TagId, UserId};
+use yozist_core::{GroupId, UserId};
 
 pub mod permission;
+pub mod sqlite;
 pub use permission::{Permission, PermissionMask, Subject, Target};
+pub use sqlite::SqliteAuthService;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
@@ -48,7 +51,7 @@ pub struct AuthToken(pub String);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
-    pub sub: String,      // user id
+    pub sub: String, // user id
     pub username: String,
     pub exp: i64,
     pub iat: i64,
@@ -103,8 +106,12 @@ pub enum AuthError {
     InvalidToken,
     #[error("user not found")]
     UserNotFound,
+    #[error("username already exists")]
+    UsernameTaken,
     #[error("db error: {0}")]
     Db(#[from] yozist_db::DbError),
+    #[error("sqlx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
     #[error("hash error: {0}")]
     Hash(String),
     #[error("jwt error: {0}")]
@@ -126,12 +133,3 @@ impl From<AuthError> for yozist_core::Error {
         }
     }
 }
-
-// 将来の `permission` モジュールから参照される ID 再エクスポート
-pub use yozist_core::{FileId as _FileIdRe, SeriesId as _SeriesIdRe, TagId as _TagIdRe};
-#[allow(dead_code)]
-type _UseFileId = FileId;
-#[allow(dead_code)]
-type _UseSeriesId = SeriesId;
-#[allow(dead_code)]
-type _UseTagId = TagId;
