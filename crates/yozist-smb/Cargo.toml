@@ -1,0 +1,24 @@
+[package]
+name = "yozist-smb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: SMB network layer (tag/series-oriented virtual filesystem)."
+
+[dependencies]
+yozist-core.workspace = true
+yozist-db.workspace = true
+yozist-storage.workspace = true
+yozist-versioning.workspace = true
+yozist-auth.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# smb-server v0.4 は rustc 1.95+ を要求。
+# スケルトン段階では型・スタブのみ用意し、本統合は次タスクで feature `smb-backend` 経由で有効化する。
+# [target.'cfg(any())'.dependencies]
+# smb-server = "0.4"

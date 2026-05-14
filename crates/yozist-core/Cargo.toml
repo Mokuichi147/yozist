@@ -1,0 +1,17 @@
+[package]
+name = "yozist-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: core types, IDs, errors, and metadata structures shared across all crates."
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+time.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

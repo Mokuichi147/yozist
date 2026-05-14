@@ -1,0 +1,71 @@
+//! yozist-db — メタデータ DB 抽象。`MetaStore` トレイトと SQLite 実装を提供。
+//!
+//! # 設計原則
+//! - **メタデータの権威性**: ファイル・タグ・シリーズ・コミット・ACL すべての
+//!   真実の所有者は `MetaStore`。blob 自体は何のメタも持たない。
+//! - **抽象化**: 初期は SQLite。Postgres 等への切替は feature flag で。
+//! - **WAL モード必須**: 並行アクセスに対応するため SQLite は `journal_mode=WAL`。
+//!
+//! # TODO
+//! - [ ] PostgresMetaStore（feature `postgres`）
+//! - [ ] スキーマバージョン管理（マイグレーションテーブル）
+//! - [ ] フルテキスト検索（FTS5 / pg_trgm）
+//! - [ ] ACL クエリの WHERE 句注入ヘルパ
+
+use async_trait::async_trait;
+use std::sync::Arc;
+use yozist_core::{Commit, FileId, FileMeta, Series, SeriesId, SeriesMember, Tag, TagId};
+
+pub mod sqlite;
+pub use sqlite::SqliteMetaStore;
+
+/// メタデータ保存の統一インターフェース。
+#[async_trait]
+pub trait MetaStore: Send + Sync {
+    // ---- files ----
+    async fn insert_file(&self, meta: &FileMeta) -> Result<(), DbError>;
+    async fn get_file(&self, id: &FileId) -> Result<Option<FileMeta>, DbError>;
+    async fn update_file(&self, meta: &FileMeta) -> Result<(), DbError>;
+    async fn list_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError>;
+
+    // ---- tags ----
+    async fn upsert_tag(&self, tag: &Tag) -> Result<TagId, DbError>;
+    async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
+    async fn detach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
+    async fn list_files_by_tags(&self, tags: &[TagId]) -> Result<Vec<FileMeta>, DbError>;
+
+    // ---- series ----
+    async fn upsert_series(&self, series: &Series) -> Result<SeriesId, DbError>;
+    async fn add_to_series(&self, member: &SeriesMember) -> Result<(), DbError>;
+    async fn list_series_members(&self, series: &SeriesId) -> Result<Vec<SeriesMember>, DbError>;
+
+    // ---- commits ----
+    async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError>;
+    async fn list_commits(&self, file: &FileId) -> Result<Vec<Commit>, DbError>;
+}
+
+pub type SharedMetaStore = Arc<dyn MetaStore>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DbError {
+    #[error("sqlx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    #[error("not found")]
+    NotFound,
+    #[error("conflict: {0}")]
+    Conflict(String),
+    #[error("invalid data: {0}")]
+    Invalid(String),
+}
+
+impl From<DbError> for yozist_core::Error {
+    fn from(e: DbError) -> Self {
+        match e {
+            DbError::NotFound => yozist_core::Error::NotFound("metadata".into()),
+            DbError::Conflict(m) => yozist_core::Error::Conflict(m),
+            _ => yozist_core::Error::Metadata(e.to_string()),
+        }
+    }
+}

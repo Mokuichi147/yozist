@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yozist-core",
+    "crates/yozist-storage",
+    "crates/yozist-db",
+    "crates/yozist-versioning",
+    "crates/yozist-tagging",
+    "crates/yozist-auth",
+    "crates/yozist-ai",
+    "crates/yozist-smb",
+    "crates/yozist-api",
+    "apps/yozist-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/mokuichi147/yozist"
+authors = ["mokuichi147 <mokuichi147@gmail.com>"]
+
+[workspace.dependencies]
+# Internal crates
+yozist-core = { path = "crates/yozist-core" }
+yozist-storage = { path = "crates/yozist-storage" }
+yozist-db = { path = "crates/yozist-db" }
+yozist-versioning = { path = "crates/yozist-versioning" }
+yozist-tagging = { path = "crates/yozist-tagging" }
+yozist-auth = { path = "crates/yozist-auth" }
+yozist-ai = { path = "crates/yozist-ai" }
+yozist-smb = { path = "crates/yozist-smb" }
+yozist-api = { path = "crates/yozist-api" }
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors and logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Core data types
+uuid = { version = "1.10", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde", "macros"] }
+bytes = "1.7"
+
+# DB
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "uuid", "time"] }
+
+# Storage / compression / hashing
+sha2 = "0.10"
+zstd = "0.13"
+
+# Diff / CRDT
+similar = "2.6"
+
+# HTTP / API
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+
+# Auth
+argon2 = "0.5"
+jsonwebtoken = "9"
+rand = "0.8"
+
+# CLI / Config
+clap = { version = "4", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

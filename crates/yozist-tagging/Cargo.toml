@@ -1,0 +1,15 @@
+[package]
+name = "yozist-tagging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: 3-layer tag (system/AI/manual) and series management."
+
+[dependencies]
+yozist-core.workspace = true
+yozist-db.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

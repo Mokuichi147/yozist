@@ -1,0 +1,22 @@
+[package]
+name = "yozist-versioning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: pluggable CRDT/LWW versioning engine with format registry."
+
+[dependencies]
+yozist-core.workspace = true
+yozist-storage.workspace = true
+yozist-db.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

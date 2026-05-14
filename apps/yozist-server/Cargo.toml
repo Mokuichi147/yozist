@@ -1,0 +1,26 @@
+[package]
+name = "yozist-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: all-in-one server binary (SMB + REST API + WebUI)."
+
+[dependencies]
+yozist-core.workspace = true
+yozist-storage.workspace = true
+yozist-db.workspace = true
+yozist-versioning.workspace = true
+yozist-tagging.workspace = true
+yozist-auth.workspace = true
+yozist-ai.workspace = true
+yozist-smb.workspace = true
+yozist-api.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+figment.workspace = true
+serde.workspace = true

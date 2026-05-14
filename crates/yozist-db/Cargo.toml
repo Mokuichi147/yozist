@@ -1,0 +1,23 @@
+[package]
+name = "yozist-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: metadata store abstraction (MetaStore trait + SQLite implementation)."
+
+[dependencies]
+yozist-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

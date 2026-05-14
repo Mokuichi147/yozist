@@ -1,0 +1,24 @@
+[package]
+name = "yozist-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: REST API + AI endpoints + WebUI (axum + leptos placeholder)."
+
+[dependencies]
+yozist-core.workspace = true
+yozist-db.workspace = true
+yozist-storage.workspace = true
+yozist-versioning.workspace = true
+yozist-auth.workspace = true
+yozist-ai.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

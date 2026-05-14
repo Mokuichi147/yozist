@@ -1,0 +1,21 @@
+[package]
+name = "yozist-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yozist: pluggable blob storage abstraction (BlobStore trait + reference implementations)."
+
+[dependencies]
+yozist-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
