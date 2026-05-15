@@ -7,8 +7,8 @@
 
 use async_trait::async_trait;
 use smb_server::{
-    BackendCapabilities, DirEntry, Handle, OpenIntent, OpenOptions, ShareBackend, SmbError,
-    SmbPath, SmbResult,
+    BackendCapabilities, DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend,
+    SmbError, SmbPath, SmbResult,
 };
 
 use crate::handle::{file_meta_to_info, YozistDirHandle, YozistFileHandle};
@@ -233,27 +233,306 @@ impl ShareBackend for AllBackend {
     }
 }
 
-/// 階層パス＝タグ AND 条件として解釈する share（v2 stub）。
+/// 階層パス＝タグ AND 条件として解釈する share。
+///
+/// パス例:
+/// - `\` → 全タグを subdir として表示
+/// - `\work\` → タグ「work」を持つ全ファイルを表示
+/// - `\work\urgent\` → 「work」AND「urgent」両方を持つファイル
+///
+/// 操作セマンティクス:
+/// - `mkdir tags\foo` → 新規 Manual タグ作成
+/// - `cp file → tags\work\` → 新規ファイル + work タグ付与
+/// - `rm tags\work\foo` → そのファイルから work タグを取り外す
+///   （ファイル実体は残る）
+/// - `mv tags\A\foo → tags\B\foo` → A→B のタグ付け替え
 pub struct TagsBackend {
-    #[allow(dead_code)]
     deps: ShareDeps,
 }
 impl TagsBackend {
     pub fn new(deps: ShareDeps) -> Self {
         Self { deps }
     }
+
+    /// パスの各コンポーネントをタグとファイルに分解。
+    /// 末尾要素が `<uuid>__<name>` ならファイル、それ以外は全てタグ。
+    async fn parse_path(
+        &self,
+        comps: &[String],
+    ) -> SmbResult<(Vec<yozist_core::TagId>, Option<(yozist_core::FileId, String)>)> {
+        if comps.is_empty() {
+            return Ok((vec![], None));
+        }
+        let (last, rest) = comps.split_last().unwrap();
+        // 末尾がファイル形式か判定
+        let file = if let Some((id_str, _name)) = last.split_once(ID_SEP) {
+            if let Ok(u) = uuid::Uuid::parse_str(id_str) {
+                Some((yozist_core::FileId::from_uuid(u), last.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let tag_names: Vec<&str> = if file.is_some() {
+            rest.iter().map(String::as_str).collect()
+        } else {
+            comps.iter().map(String::as_str).collect()
+        };
+
+        let mut tag_ids = Vec::with_capacity(tag_names.len());
+        for name in tag_names {
+            let tag = self
+                .deps
+                .meta
+                .get_tag_by_name(name)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                .ok_or(SmbError::PathNotFound)?;
+            tag_ids.push(tag.id);
+        }
+        Ok((tag_ids, file))
+    }
+
+    async fn list_dir_entries(
+        &self,
+        tag_ids: &[yozist_core::TagId],
+    ) -> SmbResult<Vec<DirEntry>> {
+        let mut out = Vec::new();
+
+        // 1. 全タグを subdir として列挙（自分自身を含むタグは除外）
+        let all_tags = self
+            .deps
+            .meta
+            .list_tags()
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let now = crate::handle::system_time_to_filetime(std::time::SystemTime::now());
+        for t in &all_tags {
+            if tag_ids.contains(&t.id) {
+                continue;
+            }
+            out.push(DirEntry {
+                info: FileInfo {
+                    name: t.name.clone(),
+                    end_of_file: 0,
+                    allocation_size: 0,
+                    creation_time: now,
+                    last_access_time: now,
+                    last_write_time: now,
+                    change_time: now,
+                    is_directory: true,
+                    file_index: 0,
+                },
+            });
+        }
+
+        // 2. tag_ids に該当するファイル一覧
+        let files = if tag_ids.is_empty() {
+            // ルートではファイル一覧は出さない（タグだけ表示）
+            vec![]
+        } else {
+            self.deps
+                .meta
+                .list_files_by_tags(tag_ids)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+        };
+        for meta in files {
+            let name = format!("{}{}{}", meta.id, ID_SEP, meta.display_name);
+            out.push(DirEntry {
+                info: crate::handle::file_meta_to_info(&meta, name),
+            });
+        }
+        Ok(out)
+    }
 }
+
 #[async_trait]
 impl ShareBackend for TagsBackend {
-    async fn open(&self, _p: &SmbPath, _o: OpenOptions) -> SmbResult<Box<dyn Handle>> {
-        Err(SmbError::NotSupported)
+    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+        let comps = path.components();
+
+        // ルート
+        if comps.is_empty() {
+            if opts.non_directory {
+                return Err(SmbError::IsDirectory);
+            }
+            let entries = self.list_dir_entries(&[]).await?;
+            return Ok(Box::new(YozistDirHandle::new("tags", entries)));
+        }
+
+        let (tag_ids, file) = match self.parse_path(comps).await {
+            Ok(v) => v,
+            Err(SmbError::PathNotFound) => {
+                // 存在しないタグ名 → mkdir 系の Create か新規ファイル作成かを判定
+                match opts.intent {
+                    OpenIntent::Create
+                    | OpenIntent::OpenOrCreate
+                    | OpenIntent::OverwriteOrCreate => {
+                        // 末尾要素を新規タグまたは新規ファイルとして扱う
+                        let (last, rest) = comps.split_last().unwrap();
+                        // 親パス（rest）は全て既存タグでなければエラー
+                        let mut parent_tag_ids = Vec::new();
+                        for name in rest {
+                            let tag = self
+                                .deps
+                                .meta
+                                .get_tag_by_name(name)
+                                .await
+                                .map_err(|e| {
+                                    SmbError::Io(std::io::Error::other(e.to_string()))
+                                })?
+                                .ok_or(SmbError::PathNotFound)?;
+                            parent_tag_ids.push(tag.id);
+                        }
+                        if opts.directory {
+                            // mkdir → 新規タグ作成
+                            self.deps
+                                .meta
+                                .upsert_tag(&yozist_core::Tag {
+                                    id: yozist_core::TagId::new(),
+                                    name: last.clone(),
+                                    kind: yozist_core::TagKind::Manual,
+                                    confidence: None,
+                                })
+                                .await
+                                .map_err(|e| {
+                                    SmbError::Io(std::io::Error::other(e.to_string()))
+                                })?;
+                            return Ok(Box::new(YozistDirHandle::new(last.clone(), vec![])));
+                        }
+                        // 新規ファイル: 親タグを自動付与する Handle を返す
+                        let display = match last.split_once(ID_SEP) {
+                            Some((_, rest)) => rest.to_string(),
+                            None => last.clone(),
+                        };
+                        let h = YozistFileHandle::open_new_with_tags(
+                            self.deps.engine.clone(),
+                            self.deps.meta.clone(),
+                            display,
+                            true,
+                            parent_tag_ids,
+                        );
+                        return Ok(Box::new(h));
+                    }
+                    _ => return Err(SmbError::PathNotFound),
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+        match file {
+            None => {
+                // ディレクトリオープン
+                if opts.non_directory {
+                    return Err(SmbError::IsDirectory);
+                }
+                let entries = self.list_dir_entries(&tag_ids).await?;
+                let name = comps.last().cloned().unwrap_or_else(|| "tags".into());
+                Ok(Box::new(YozistDirHandle::new(name, entries)))
+            }
+            Some((file_id, full_name)) => {
+                // ファイルオープン: 既存ファイルとして
+                if opts.directory {
+                    return Err(SmbError::NotADirectory);
+                }
+                let meta = self
+                    .deps
+                    .meta
+                    .get_file(&file_id)
+                    .await
+                    .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                    .ok_or(SmbError::NotFound)?;
+                if matches!(opts.intent, OpenIntent::Create) {
+                    return Err(SmbError::Exists);
+                }
+                let mut h = YozistFileHandle::open_existing(
+                    &self.deps,
+                    self.deps.engine.clone(),
+                    meta.id,
+                    meta.display_name.clone(),
+                    opts.read,
+                    opts.write,
+                )
+                .await?;
+                if matches!(opts.intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate) {
+                    h.set_truncated();
+                }
+                let _ = full_name;
+                Ok(Box::new(h))
+            }
+        }
     }
-    async fn unlink(&self, _p: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        let comps = path.components();
+        if comps.is_empty() {
+            return Err(SmbError::AccessDenied);
+        }
+        let (tag_ids, file) = self.parse_path(comps).await?;
+        match file {
+            // ファイル削除: そのタグを取り外すのみ（ファイル実体は残す）。
+            // タグが指定されていない（ルート直下のファイル）場合はファイルを deleted フラグ化。
+            Some((file_id, _)) => {
+                if tag_ids.is_empty() {
+                    let mut meta = self
+                        .deps
+                        .meta
+                        .get_file(&file_id)
+                        .await
+                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                        .ok_or(SmbError::NotFound)?;
+                    meta.deleted = true;
+                    meta.updated_at = time::OffsetDateTime::now_utc();
+                    self.deps
+                        .meta
+                        .update_file(&meta)
+                        .await
+                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                } else {
+                    // 末尾タグだけ取り外す
+                    let last_tag = *tag_ids.last().unwrap();
+                    self.deps
+                        .meta
+                        .detach_tag(&file_id, &last_tag)
+                        .await
+                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                }
+                Ok(())
+            }
+            // タグディレクトリ削除: rmdir 相当。タグ自体は残し、空かどうかは判定しない (TODO)。
+            None => Err(SmbError::NotEmpty),
+        }
     }
-    async fn rename(&self, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+        let (from_tags, from_file) = self.parse_path(from.components()).await?;
+        let (to_tags, to_file) = self.parse_path(to.components()).await?;
+        let (file_id, _) = match (from_file, to_file) {
+            (Some(f), Some(_)) => f,
+            (Some(f), None) => f, // 移動先がディレクトリ扱いだが、簡易化のため同じ FileId として扱う
+            _ => return Err(SmbError::NotSupported),
+        };
+        // from の末尾タグを外し、to の全タグを付与する単純化セマンティクス
+        if let Some(last) = from_tags.last() {
+            self.deps
+                .meta
+                .detach_tag(&file_id, last)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        for t in &to_tags {
+            self.deps
+                .meta
+                .attach_tag(&file_id, t)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        Ok(())
     }
+
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: false,

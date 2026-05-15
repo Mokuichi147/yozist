@@ -59,17 +59,21 @@ pub async fn serve(cfg: SmbConfig, deps: ShareDeps) -> Result<(), SmbError> {
         builder = builder.user(u, p);
     }
 
-    let all = Share::new("all", AllBackend::new(deps.clone()));
-    let all = if cfg.initial_users.is_empty() {
-        all.public()
-    } else {
-        cfg.initial_users
-            .iter()
-            .fold(all, |sh, (u, _)| sh.user(u, Access::ReadWrite))
+    let setup_share = |_name: &str, share: Share| {
+        if cfg.initial_users.is_empty() {
+            share.public()
+        } else {
+            cfg.initial_users
+                .iter()
+                .fold(share, |sh, (u, _)| sh.user(u, Access::ReadWrite))
+        }
     };
+    let all_share = setup_share("all", Share::new("all", AllBackend::new(deps.clone())));
+    let tags_share = setup_share("tags", Share::new("tags", TagsBackend::new(deps.clone())));
 
     let server = builder
-        .share(all)
+        .share(all_share)
+        .share(tags_share)
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 

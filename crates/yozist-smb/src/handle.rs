@@ -20,11 +20,13 @@ use yozist_core::{ActorId, FileId};
 use yozist_versioning::VersioningEngine;
 
 use crate::ShareDeps;
+use yozist_db::SharedMetaStore;
 
 /// 既存ファイル or 新規ファイル用の汎用 Handle。
 pub struct YozistFileHandle {
     inner: Mutex<HandleState>,
     engine: Arc<VersioningEngine>,
+    meta: Option<SharedMetaStore>,
     actor: ActorId,
 }
 
@@ -41,6 +43,8 @@ struct HandleState {
     readable: bool,
     /// 書き込み可能か。
     writable: bool,
+    /// 新規作成時に自動付与するタグ。
+    pending_tags: Vec<yozist_core::TagId>,
 }
 
 impl YozistFileHandle {
@@ -66,8 +70,10 @@ impl YozistFileHandle {
                 dirty: false,
                 readable,
                 writable,
+                pending_tags: Vec::new(),
             }),
             engine,
+            meta: None,
             actor: ActorId::new(),
         })
     }
@@ -86,8 +92,34 @@ impl YozistFileHandle {
                 dirty: false,
                 readable: true,
                 writable,
+                pending_tags: Vec::new(),
             }),
             engine,
+            meta: None,
+            actor: ActorId::new(),
+        }
+    }
+
+    /// 新規ファイルを開き、close 時にタグも自動付与する。
+    pub fn open_new_with_tags(
+        engine: Arc<VersioningEngine>,
+        meta: SharedMetaStore,
+        display_name: String,
+        writable: bool,
+        tags: Vec<yozist_core::TagId>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(HandleState {
+                file_id: None,
+                display_name,
+                buffer: Vec::new(),
+                dirty: false,
+                readable: true,
+                writable,
+                pending_tags: tags,
+            }),
+            engine,
+            meta: Some(meta),
             actor: ActorId::new(),
         }
     }
@@ -175,10 +207,15 @@ impl Handle for YozistFileHandle {
     }
 
     async fn close(self: Box<Self>) -> smb_server::SmbResult<()> {
-        // dirty なら commit を発火。
-        let (file_id, name, buffer, dirty) = {
+        let (file_id, name, buffer, dirty, pending_tags) = {
             let st = self.inner.lock();
-            (st.file_id, st.display_name.clone(), st.buffer.clone(), st.dirty)
+            (
+                st.file_id,
+                st.display_name.clone(),
+                st.buffer.clone(),
+                st.dirty,
+                st.pending_tags.clone(),
+            )
         };
         if !dirty {
             return Ok(());
@@ -193,12 +230,24 @@ impl Handle for YozistFileHandle {
                     })?;
             }
             None => {
-                self.engine
+                let (file, _commit) = self
+                    .engine
                     .create_file(name, &buffer, self.actor, None)
                     .await
                     .map_err(|e| {
                         smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
                     })?;
+                if !pending_tags.is_empty() {
+                    if let Some(meta) = &self.meta {
+                        for t in &pending_tags {
+                            meta.attach_tag(&file.id, t).await.map_err(|e| {
+                                smb_server::SmbError::Io(std::io::Error::other(
+                                    e.to_string(),
+                                ))
+                            })?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
