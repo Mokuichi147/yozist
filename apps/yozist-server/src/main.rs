@@ -149,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
                     authz,
                     auth,
                     acl_admin: db_authz,
+                    audit: audit.clone(),
                 };
                 Some(tokio::spawn(async move {
                     if let Err(e) = yozist_smb::serve(cfg, deps).await {

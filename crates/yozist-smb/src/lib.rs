@@ -22,7 +22,7 @@
 use smb_server::{Access, Share, SmbServer};
 use std::sync::Arc;
 use yozist_auth::{AuthContext, AuthService, Authorizer, DbAuthorizer};
-use yozist_db::SharedMetaStore;
+use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
 use yozist_storage::SharedBlobStore;
 use yozist_versioning::VersioningEngine;
 
@@ -40,6 +40,8 @@ pub struct ShareDeps {
     pub auth: Arc<dyn AuthService>,
     /// ACL ルール CRUD 用の具象参照（新規ファイル作成時のオーナー ACL 発行に使用）。
     pub acl_admin: Arc<DbAuthorizer>,
+    /// 監査ログ（REST/SMB 共通）。SMB 経路は actor_label を `smb:<user>` で記録。
+    pub audit: SharedAuditLog,
 }
 
 impl ShareDeps {
@@ -78,6 +80,50 @@ impl ShareDeps {
         // 当面は list_users から線形検索で実装（SMB 接続は頻度が低いため許容）。
         let users = self.auth.list_users().await?;
         Ok(users.into_iter().find(|u| u.username == username))
+    }
+
+    /// SMB 操作を audit に記録する。`actor_label` は `smb:<user>` 形式。
+    pub async fn audit_smb<R, E>(
+        &self,
+        identity: &smb_server::Identity,
+        action: &str,
+        target_type: Option<&str>,
+        target_ref: Option<&str>,
+        result: &Result<R, E>,
+    ) where
+        E: std::fmt::Display,
+    {
+        let (actor_id, label_owned) = match identity {
+            smb_server::Identity::Anonymous => (None, "smb:anonymous".to_string()),
+            smb_server::Identity::User { user, .. } => {
+                let ctx = self.identity_to_context(identity).await;
+                let id = if let AuthContext::User { user: u, .. } = &ctx {
+                    Some(u.id.to_string())
+                } else {
+                    None
+                };
+                (id, format!("smb:{}", user))
+            }
+        };
+        let result_str = match result {
+            Ok(_) => "ok".to_string(),
+            Err(e) => format!("error: {e}"),
+        };
+        if let Err(e) = self
+            .audit
+            .record(&AuditRecord {
+                actor_id: actor_id.as_deref(),
+                actor_label: Some(&label_owned),
+                action,
+                target_type,
+                target_ref,
+                metadata_json: None,
+                result: &result_str,
+            })
+            .await
+        {
+            tracing::warn!(error = %e, action, "SMB audit write failed");
+        }
     }
 
     /// 共通の権限チェック。失敗時は `SmbError::AccessDenied` を返す。

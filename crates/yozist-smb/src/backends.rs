@@ -186,21 +186,29 @@ impl ShareBackend for AllBackend {
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
-        let mut meta = self
-            .deps
-            .meta
-            .get_file(&id)
-            .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or(SmbError::NotFound)?;
-        meta.deleted = true;
-        meta.updated_at = time::OffsetDateTime::now_utc();
+        let res = async {
+            let mut meta = self
+                .deps
+                .meta
+                .get_file(&id)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                .ok_or(SmbError::NotFound)?;
+            meta.deleted = true;
+            meta.updated_at = time::OffsetDateTime::now_utc();
+            self.deps
+                .meta
+                .update_file(&meta)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            Ok::<_, SmbError>(())
+        }
+        .await;
+        let id_str = id.to_string();
         self.deps
-            .meta
-            .update_file(&meta)
-            .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(())
+            .audit_smb(identity, "delete_file", Some("file"), Some(&id_str), &res)
+            .await;
+        res
     }
 
     async fn rename(
@@ -222,27 +230,33 @@ impl ShareBackend for AllBackend {
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
-        let mut meta = self
-            .deps
-            .meta
-            .get_file(&id)
-            .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
-            .ok_or(SmbError::NotFound)?;
-
-        // 新名から ID プレフィクスを剥がして display_name 更新
-        let new_name = match to_comp[0].split_once(ID_SEP) {
-            Some((_, rest)) => rest.to_string(),
-            None => to_comp[0].clone(),
-        };
-        meta.display_name = new_name;
-        meta.updated_at = time::OffsetDateTime::now_utc();
+        let res = async {
+            let mut meta = self
+                .deps
+                .meta
+                .get_file(&id)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                .ok_or(SmbError::NotFound)?;
+            let new_name = match to_comp[0].split_once(ID_SEP) {
+                Some((_, rest)) => rest.to_string(),
+                None => to_comp[0].clone(),
+            };
+            meta.display_name = new_name;
+            meta.updated_at = time::OffsetDateTime::now_utc();
+            self.deps
+                .meta
+                .update_file(&meta)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            Ok::<_, SmbError>(())
+        }
+        .await;
+        let id_str = id.to_string();
         self.deps
-            .meta
-            .update_file(&meta)
-            .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(())
+            .audit_smb(identity, "rename_file", Some("file"), Some(&id_str), &res)
+            .await;
+        res
     }
 
     fn capabilities(&self) -> BackendCapabilities {
