@@ -84,6 +84,10 @@ pub fn router(state: ApiState) -> Router {
             get(get_saved_query).delete(delete_saved_query),
         )
         .route("/api/queries/:id/files", get(query_files))
+        .route("/api/files/:id/share", post(issue_file_share))
+        .route("/api/queries/:id/share", post(issue_query_share))
+        .route("/api/shared/:token", get(get_shared))
+        .route("/api/shared/:token/files", get(list_shared_files))
         .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
@@ -718,6 +722,134 @@ pub async fn resolve_query(
         }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Shared URL (期限付きトークン)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ShareInput {
+    /// 有効秒数（デフォルト 1 時間）
+    #[serde(default = "default_share_ttl")]
+    ttl_secs: i64,
+}
+
+fn default_share_ttl() -> i64 {
+    3600
+}
+
+#[derive(Serialize)]
+struct ShareTokenResponse {
+    token: String,
+    expires_in_secs: i64,
+    /// クライアントが直接アクセスできる URL パス
+    url: String,
+}
+
+async fn issue_file_share(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<ShareInput>,
+) -> Result<Json<ShareTokenResponse>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    // 共有を発行できるのは ADMIN 権限を持つユーザー
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::File(file_id),
+        PermissionMask::ADMIN,
+    )
+    .await?;
+    let issuer = match &ctx {
+        AuthContext::User { user, .. } => Some(user.username.as_str()),
+        _ => None,
+    };
+    let tok = s
+        .auth
+        .issue_share_token("file", &id, input.ttl_secs, issuer)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(ShareTokenResponse {
+        url: format!("/api/shared/{}", tok.0),
+        token: tok.0,
+        expires_in_secs: input.ttl_secs,
+    }))
+}
+
+async fn issue_query_share(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<ShareInput>,
+) -> Result<Json<ShareTokenResponse>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let issuer = match &ctx {
+        AuthContext::User { user, .. } => Some(user.username.as_str()),
+        _ => None,
+    };
+    let tok = s
+        .auth
+        .issue_share_token("query", &id, input.ttl_secs, issuer)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(ShareTokenResponse {
+        url: format!("/api/shared/{}/files", tok.0),
+        token: tok.0,
+        expires_in_secs: input.ttl_secs,
+    }))
+}
+
+async fn verify_share(
+    s: &ApiState,
+    token: &str,
+    expect_kind: &str,
+) -> Result<String, ApiError> {
+    let claims = s
+        .auth
+        .verify_share_token(token)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    if claims.kind != expect_kind {
+        return Err(ApiError::BadRequest(format!(
+            "token kind mismatch: expected {expect_kind}, got {}",
+            claims.kind
+        )));
+    }
+    Ok(claims.target_id)
+}
+
+/// ファイル共有トークンで内容を返す（認証不要）。
+async fn get_shared(
+    State(s): State<ApiState>,
+    Path(token): Path<String>,
+) -> Result<Vec<u8>, ApiError> {
+    let target_id = verify_share(&s, &token, "file").await?;
+    let file_id = parse_file_id(&target_id)?;
+    s.engine
+        .read_current(file_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// クエリ共有トークンでマッチするファイル一覧を返す。
+async fn list_shared_files(
+    State(s): State<ApiState>,
+    Path(token): Path<String>,
+) -> Result<Json<Vec<FileMeta>>, ApiError> {
+    let target_id = verify_share(&s, &token, "query").await?;
+    let query_id = uuid::Uuid::parse_str(&target_id)
+        .map(SavedQueryId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+    let q = s
+        .meta
+        .get_saved_query(&query_id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let files = resolve_query(&*s.meta, &q.query).await?;
+    Ok(Json(files))
 }
 
 // ---------------------------------------------------------------------------

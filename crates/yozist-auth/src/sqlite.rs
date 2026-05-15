@@ -21,7 +21,7 @@ use uuid::Uuid;
 use yozist_core::{GroupId, UserId};
 
 use crate::{
-    AuthError, AuthService, AuthToken, Group, TokenClaims, User,
+    AuthError, AuthService, AuthToken, Group, ShareClaims, TokenClaims, User,
 };
 
 pub struct SqliteAuthService {
@@ -247,6 +247,41 @@ impl AuthService for SqliteAuthService {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn issue_share_token(
+        &self,
+        kind: &str,
+        target_id: &str,
+        ttl_secs: i64,
+        issuer: Option<&str>,
+    ) -> Result<AuthToken, AuthError> {
+        let iat = OffsetDateTime::now_utc().unix_timestamp();
+        let claims = ShareClaims {
+            kind: kind.to_string(),
+            target_id: target_id.to_string(),
+            exp: iat + ttl_secs,
+            iat,
+            iss: issuer.map(str::to_string),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(&self.secret),
+        )?;
+        Ok(AuthToken(token))
+    }
+
+    async fn verify_share_token(&self, token: &str) -> Result<ShareClaims, AuthError> {
+        // 共有URLは期限を厳密に評価（デフォルトのleeway 60秒は使わない）
+        let mut validation = Validation::default();
+        validation.leeway = 0;
+        let data = decode::<ShareClaims>(
+            token,
+            &DecodingKey::from_secret(&self.secret),
+            &validation,
+        )?;
+        Ok(data.claims)
     }
 }
 

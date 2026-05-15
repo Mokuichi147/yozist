@@ -59,6 +59,21 @@ pub struct TokenClaims {
     pub iat: i64,
 }
 
+/// 期限付き共有 URL のトークンに含めるクレーム。
+///
+/// `kind` でファイル単体共有か保存クエリ共有かを区別する。
+/// `target_id` はそれぞれ対応する UUID 文字列。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareClaims {
+    /// "file" | "query"
+    pub kind: String,
+    /// 対象 ID（FileId / SavedQueryId）
+    pub target_id: String,
+    pub exp: i64,
+    pub iat: i64,
+    pub iss: Option<String>, // 発行者 username
+}
+
 /// 認証リクエストの主体。SMB セッション / API JWT / 内部呼び出しを表現。
 #[derive(Debug, Clone)]
 pub enum AuthContext {
@@ -88,6 +103,18 @@ pub trait AuthService: Send + Sync {
         user: UserId,
         group: GroupId,
     ) -> Result<(), AuthError>;
+
+    /// 期限付き共有トークンを発行する。
+    async fn issue_share_token(
+        &self,
+        kind: &str,
+        target_id: &str,
+        ttl_secs: i64,
+        issuer: Option<&str>,
+    ) -> Result<AuthToken, AuthError>;
+
+    /// 期限付き共有トークンを検証する。
+    async fn verify_share_token(&self, token: &str) -> Result<ShareClaims, AuthError>;
 }
 
 /// 認可（ACL）評価器。
