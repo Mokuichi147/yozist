@@ -1,0 +1,353 @@
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/backend.rs vendor/smb-server/src/backend.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/backend.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/backend.rs	2026-05-15 21:01:24
+@@ -9,6 +9,7 @@
+ 
+ use crate::error::{SmbError, SmbResult};
+ use crate::path::SmbPath;
++use crate::proto::auth::ntlm::Identity;
+ 
+ // ---------------------------------------------------------------------------
+ // OpenOptions
+@@ -159,14 +160,27 @@
+ #[async_trait]
+ pub trait ShareBackend: Send + Sync + 'static {
+     /// Open or create a file or directory. Returns a fresh handle.
+-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>>;
++    ///
++    /// `identity` carries the authenticated SMB user (`Anonymous` for public
++    /// access). Backends use this to enforce per-user authorization.
++    async fn open(
++        &self,
++        identity: &Identity,
++        path: &SmbPath,
++        opts: OpenOptions,
++    ) -> SmbResult<Box<dyn Handle>>;
+ 
+     /// Unlink (delete) a file. Directories: must be empty. v1 does not
+     /// recursively delete.
+-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
++    async fn unlink(&self, identity: &Identity, path: &SmbPath) -> SmbResult<()>;
+ 
+     /// Rename `from` to `to`. The backend must reject if `to` already exists.
+-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()>;
++    async fn rename(
++        &self,
++        identity: &Identity,
++        from: &SmbPath,
++        to: &SmbPath,
++    ) -> SmbResult<()>;
+ 
+     /// Static capabilities. The dispatcher consults these at TREE_CONNECT and
+     /// uses `is_read_only` to clamp authz.
+@@ -220,13 +234,23 @@
+ 
+ #[async_trait]
+ impl ShareBackend for NotSupportedBackend {
+-    async fn open(&self, _path: &SmbPath, _opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
++    async fn open(
++        &self,
++        _identity: &Identity,
++        _path: &SmbPath,
++        _opts: OpenOptions,
++    ) -> SmbResult<Box<dyn Handle>> {
+         Err(SmbError::NotSupported)
+     }
+-    async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
++    async fn unlink(&self, _identity: &Identity, _path: &SmbPath) -> SmbResult<()> {
+         Err(SmbError::NotSupported)
+     }
+-    async fn rename(&self, _from: &SmbPath, _to: &SmbPath) -> SmbResult<()> {
++    async fn rename(
++        &self,
++        _identity: &Identity,
++        _from: &SmbPath,
++        _to: &SmbPath,
++    ) -> SmbResult<()> {
+         Err(SmbError::NotSupported)
+     }
+     fn capabilities(&self) -> BackendCapabilities {
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/fs/local.rs vendor/smb-server/src/fs/local.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/fs/local.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/fs/local.rs	2026-05-15 21:01:48
+@@ -224,7 +224,12 @@
+ 
+ #[async_trait]
+ impl ShareBackend for LocalFsBackend {
+-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
++    async fn open(
++        &self,
++        _identity: &crate::proto::auth::ntlm::Identity,
++        path: &SmbPath,
++        opts: OpenOptions,
++    ) -> SmbResult<Box<dyn Handle>> {
+         // 1. Read-only check: any open that requests creation, write access,
+         //    truncation, or overwrite is rejected up front. Pure read opens
+         //    pass through.
+@@ -365,7 +370,11 @@
+         }))
+     }
+ 
+-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
++    async fn unlink(
++        &self,
++        _identity: &crate::proto::auth::ntlm::Identity,
++        path: &SmbPath,
++    ) -> SmbResult<()> {
+         if self.read_only {
+             return Err(SmbError::AccessDenied);
+         }
+@@ -394,7 +403,12 @@
+         .map_err(io_to_smb)
+     }
+ 
+-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
++    async fn rename(
++        &self,
++        _identity: &crate::proto::auth::ntlm::Identity,
++        from: &SmbPath,
++        to: &SmbPath,
++    ) -> SmbResult<()> {
+         if self.read_only {
+             return Err(SmbError::AccessDenied);
+         }
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/close.rs vendor/smb-server/src/handlers/close.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/close.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/handlers/close.rs	2026-05-15 20:58:31
+@@ -8,7 +8,7 @@
+ 
+ use crate::conn::state::Connection;
+ use crate::dispatch::HandlerResponse;
+-use crate::handlers::shared::lookup_session_tree;
++use crate::handlers::shared::{lookup_identity, lookup_session_tree};
+ use crate::ntstatus;
+ use crate::server::ServerState;
+ 
+@@ -60,10 +60,14 @@
+         let _ = h.close().await;
+     }
+     if delete_on_close {
++        let identity = match lookup_identity(conn, hdr).await {
++            Ok(i) => i,
++            Err(s) => return HandlerResponse::err(s),
++        };
+         let tree = tree_arc.read().await;
+         let backend = tree.share.backend.clone();
+         drop(tree);
+-        if let Err(e) = backend.unlink(&path).await {
++        if let Err(e) = backend.unlink(&identity, &path).await {
+             debug!(error = %e, "delete-on-close unlink failed");
+         }
+     }
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/create.rs vendor/smb-server/src/handlers/create.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/create.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/handlers/create.rs	2026-05-15 20:58:20
+@@ -10,7 +10,7 @@
+ use crate::builder::Access;
+ use crate::conn::state::{Connection, Open};
+ use crate::dispatch::HandlerResponse;
+-use crate::handlers::shared::lookup_session_tree;
++use crate::handlers::shared::{lookup_identity, lookup_session_tree};
+ use crate::ntstatus;
+ use crate::path::SmbPath;
+ use crate::server::ServerState;
+@@ -60,6 +60,10 @@
+         Ok(t) => t,
+         Err(s) => return HandlerResponse::err(s),
+     };
++    let identity = match lookup_identity(conn, hdr).await {
++        Ok(i) => i,
++        Err(s) => return HandlerResponse::err(s),
++    };
+     let tree = tree_arc.read().await;
+     let granted = tree.granted_access;
+     let backend = tree.share.backend.clone();
+@@ -133,7 +137,7 @@
+         delete_on_close,
+     };
+ 
+-    let handle = match backend.open(&path, opts).await {
++    let handle = match backend.open(&identity, &path, opts).await {
+         Ok(h) => h,
+         Err(e) => {
+             debug!(error = %e, path = %path, "backend open failed");
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/set_info.rs vendor/smb-server/src/handlers/set_info.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/set_info.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/handlers/set_info.rs	2026-05-15 20:58:48
+@@ -8,7 +8,7 @@
+ use crate::backend::FileTimes;
+ use crate::conn::state::Connection;
+ use crate::dispatch::HandlerResponse;
+-use crate::handlers::shared::{lookup_open, lookup_session_tree};
++use crate::handlers::shared::{lookup_identity, lookup_open, lookup_session_tree};
+ use crate::info_class as ic;
+ use crate::ntstatus;
+ use crate::path::SmbPath;
+@@ -117,7 +117,11 @@
+                 Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
+             };
+             let from = open_arc.read().await.last_path.clone();
+-            match backend.rename(&from, &new_path).await {
++            let identity = match lookup_identity(conn, hdr).await {
++                Ok(i) => i,
++                Err(s) => return HandlerResponse::err(s),
++            };
++            match backend.rename(&identity, &from, &new_path).await {
+                 Ok(()) => {
+                     open_arc.write().await.last_path = new_path;
+                     Ok(())
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/shared.rs vendor/smb-server/src/handlers/shared.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/handlers/shared.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/handlers/shared.rs	2026-05-15 20:58:13
+@@ -25,6 +25,18 @@
+         .ok_or(ntstatus::STATUS_NETWORK_NAME_DELETED)
+ }
+ 
++/// Convenience: return the authenticated identity (clone) for the session
++/// referenced by `hdr`. Backends receive this through `ShareBackend::open`
++/// etc. to enforce per-user authorization.
++pub async fn lookup_identity(
++    conn: &Arc<Connection>,
++    hdr: &Smb2Header,
++) -> Result<crate::proto::auth::ntlm::Identity, u32> {
++    let sess_arc = lookup_session(conn, hdr.session_id).await?;
++    let sess = sess_arc.read().await;
++    Ok(sess.identity.clone())
++}
++
+ pub async fn lookup_session(conn: &Arc<Connection>, sid: u64) -> Result<Arc<RwLock<Session>>, u32> {
+     if sid == 0 {
+         return Err(ntstatus::STATUS_USER_SESSION_DELETED);
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/info_class.rs vendor/smb-server/src/info_class.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/info_class.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/info_class.rs	2026-05-15 20:22:23
+@@ -342,47 +342,20 @@
+         FILE_DIRECTORY_INFORMATION => {
+             // 64 bytes fixed + name
+             let mut out = Vec::new();
+-            out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
+-            out.extend_from_slice(&(file_index as u32).to_le_bytes()); // FileIndex
+-            out.extend_from_slice(&info.creation_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
+-            out.extend_from_slice(&info.change_time.to_le_bytes());
+-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
+-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
+-            out.extend_from_slice(&info.attributes().to_le_bytes());
+-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
++            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+             out.extend_from_slice(&name_u16);
+             out
+         }
+         FILE_FULL_DIRECTORY_INFORMATION => {
+             let mut out = Vec::new();
+-            out.extend_from_slice(&0u32.to_le_bytes());
+-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
+-            out.extend_from_slice(&info.creation_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
+-            out.extend_from_slice(&info.change_time.to_le_bytes());
+-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
+-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
+-            out.extend_from_slice(&info.attributes().to_le_bytes());
+-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
++            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+             out.extend_from_slice(&name_u16);
+             out
+         }
+         FILE_BOTH_DIRECTORY_INFORMATION => {
+             let mut out = Vec::new();
+-            out.extend_from_slice(&0u32.to_le_bytes());
+-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
+-            out.extend_from_slice(&info.creation_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
+-            out.extend_from_slice(&info.change_time.to_le_bytes());
+-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
+-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
+-            out.extend_from_slice(&info.attributes().to_le_bytes());
+-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
++            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+             out.push(0); // ShortNameLength
+             out.push(0); // Reserved1
+@@ -393,16 +366,7 @@
+         }
+         FILE_ID_BOTH_DIRECTORY_INFORMATION => {
+             let mut out = Vec::new();
+-            out.extend_from_slice(&0u32.to_le_bytes());
+-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
+-            out.extend_from_slice(&info.creation_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
+-            out.extend_from_slice(&info.change_time.to_le_bytes());
+-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
+-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
+-            out.extend_from_slice(&info.attributes().to_le_bytes());
+-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
++            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+             out.push(0); // ShortNameLength
+             out.push(0); // Reserved1
+@@ -414,16 +378,7 @@
+         }
+         FILE_ID_FULL_DIRECTORY_INFORMATION => {
+             let mut out = Vec::new();
+-            out.extend_from_slice(&0u32.to_le_bytes());
+-            out.extend_from_slice(&(file_index as u32).to_le_bytes());
+-            out.extend_from_slice(&info.creation_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_access_time.to_le_bytes());
+-            out.extend_from_slice(&info.last_write_time.to_le_bytes());
+-            out.extend_from_slice(&info.change_time.to_le_bytes());
+-            out.extend_from_slice(&info.end_of_file.to_le_bytes());
+-            out.extend_from_slice(&info.allocation_size.to_le_bytes());
+-            out.extend_from_slice(&info.attributes().to_le_bytes());
+-            out.extend_from_slice(&(name_u16.len() as u32).to_le_bytes());
++            write_dir_entry_prefix(&mut out, info, file_index, name_u16.len());
+             out.extend_from_slice(&0u32.to_le_bytes()); // EaSize
+             out.extend_from_slice(&0u32.to_le_bytes()); // Reserved
+             out.extend_from_slice(&file_index.to_le_bytes()); // FileId
+@@ -440,6 +395,19 @@
+         }
+         _ => Vec::new(),
+     }
++}
++
++fn write_dir_entry_prefix(out: &mut Vec<u8>, info: &FileInfo, file_index: u64, name_len: usize) {
++    out.extend_from_slice(&0u32.to_le_bytes()); // NextEntryOffset (patched later)
++    out.extend_from_slice(&(file_index as u32).to_le_bytes()); // FileIndex
++    out.extend_from_slice(&info.creation_time.to_le_bytes());
++    out.extend_from_slice(&info.last_access_time.to_le_bytes());
++    out.extend_from_slice(&info.last_write_time.to_le_bytes());
++    out.extend_from_slice(&info.change_time.to_le_bytes());
++    out.extend_from_slice(&info.end_of_file.to_le_bytes());
++    out.extend_from_slice(&info.allocation_size.to_le_bytes());
++    out.extend_from_slice(&info.attributes().to_le_bytes());
++    out.extend_from_slice(&(name_len as u32).to_le_bytes());
+ }
+ 
+ /// Round up `n` to the next multiple of 8.
+diff -ruN /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/lib.rs vendor/smb-server/src/lib.rs
+--- /Users/mokuichi147/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/smb-server-0.4.0/src/lib.rs	2006-07-24 10:21:28
++++ vendor/smb-server/src/lib.rs	2026-05-15 20:22:53
+@@ -31,12 +31,17 @@
+ mod server;
+ mod utils;
+ 
+-pub use backend::{DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend};
++pub use backend::{
++    BackendCapabilities, DirEntry, FileInfo, FileTimes, Handle, OpenIntent, OpenOptions,
++    ShareBackend,
++};
+ pub use builder::{Access, Share};
++pub use error::{SmbError, SmbResult};
+ #[cfg(feature = "localfs")]
+ pub use fs::LocalFsBackend;
++pub use path::SmbPath;
+ pub use proto::auth::ntlm::Identity;
+-pub use server::{ConfigHandle, ShareMode, SmbServer};
++pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
+ 
+ pub mod wire {
+     pub use crate::proto::header;

@@ -75,6 +75,11 @@ cargo run -p yozist-server -- migrate
 cargo run -p yozist-server -- serve
 ```
 
+## 関連ドキュメント
+
+- [upstream smb-server PR 案](docs/upstream-smb-server-proposal.md) —
+  vendor patch を upstream の paltaio/rust-smb-server に提案する文書
+
 ## ライセンス
 
 未定。
