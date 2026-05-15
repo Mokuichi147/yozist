@@ -61,6 +61,7 @@ zstd = "0.13"
 
 # Diff / CRDT
 similar = "2.6"
+yrs = "0.21"
 
 # HTTP / API
 axum = "0.7"
