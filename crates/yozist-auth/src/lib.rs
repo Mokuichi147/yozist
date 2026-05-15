@@ -46,6 +46,8 @@ pub struct Group {
     pub id: GroupId,
     pub name: String,
     pub description: Option<String>,
+    /// 親グループ。階層的所属の表現に使う。
+    pub parent_id: Option<GroupId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

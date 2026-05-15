@@ -101,6 +101,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/me", get(me))
         .route("/api/users", get(list_users))
+        .route("/api/groups", get(list_groups).post(create_group))
         .with_state(state)
 }
 
@@ -1401,6 +1402,68 @@ async fn list_users(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(users))
+}
+
+#[derive(Deserialize)]
+struct CreateGroupInput {
+    name: String,
+    description: Option<String>,
+    parent_id: Option<String>,
+}
+
+async fn list_groups(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<Vec<yozist_auth::Group>>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let groups = s
+        .share_admin
+        .list_groups()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(groups))
+}
+
+async fn create_group(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<CreateGroupInput>,
+) -> Result<(StatusCode, Json<yozist_auth::Group>), ApiError> {
+    require_authenticated(&ctx).await?;
+    let parent = input
+        .parent_id
+        .map(|s| {
+            uuid::Uuid::parse_str(&s)
+                .map(yozist_core::GroupId::from_uuid)
+                .map_err(|e| ApiError::BadRequest(format!("parent_id: {e}")))
+        })
+        .transpose()?;
+    let res = s
+        .share_admin
+        .create_group_with_parent(&input.name, input.description.as_deref(), parent)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let id_str = res.as_ref().ok().map(|g| g.id.to_string());
+    let meta = format!(
+        "{{\"name\":\"{}\",\"parent\":{}}}",
+        input.name,
+        match &parent {
+            Some(p) => format!("\"{p}\""),
+            None => "null".into(),
+        }
+    );
+    audit_event(
+        &s,
+        &ctx,
+        "create_group",
+        Some("group"),
+        id_str.as_deref(),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let group = res?;
+    Ok((StatusCode::CREATED, Json(group)))
 }
 
 async fn me(AuthCtx(ctx): AuthCtx) -> Json<MeResponse> {
