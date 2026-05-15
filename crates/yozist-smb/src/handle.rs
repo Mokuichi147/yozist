@@ -21,7 +21,7 @@ use yozist_versioning::VersioningEngine;
 
 use crate::ShareDeps;
 use yozist_auth::{DbAuthorizer, Permission, PermissionMask, Subject, Target};
-use yozist_db::SharedMetaStore;
+use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
 
 /// 既存ファイル or 新規ファイル用の汎用 Handle。
 pub struct YozistFileHandle {
@@ -32,6 +32,10 @@ pub struct YozistFileHandle {
     acl_admin: Option<Arc<DbAuthorizer>>,
     /// 新規作成時のファイルオーナー（ADMIN権限の自動付与先）。
     owner: Option<yozist_core::UserId>,
+    /// SMB セッションのユーザー名（audit_label 用、`smb:<user>` 形式）。
+    smb_actor_label: Option<String>,
+    /// 監査ログ書き込み先（close 時に成功・失敗を記録）。
+    audit: Option<SharedAuditLog>,
     actor: ActorId,
 }
 
@@ -84,6 +88,8 @@ impl YozistFileHandle {
             meta: None,
             acl_admin: None,
             owner: None,
+            smb_actor_label: None,
+            audit: None,
             actor: ActorId::new(),
         })
     }
@@ -109,6 +115,8 @@ impl YozistFileHandle {
             meta: None,
             acl_admin: None,
             owner: None,
+            smb_actor_label: None,
+            audit: None,
             actor: ActorId::new(),
         }
     }
@@ -136,6 +144,8 @@ impl YozistFileHandle {
             meta: Some(meta),
             acl_admin: None,
             owner: None,
+            smb_actor_label: None,
+            audit: None,
             actor: ActorId::new(),
         }
     }
@@ -164,6 +174,8 @@ impl YozistFileHandle {
             meta: Some(meta),
             acl_admin: None,
             owner: None,
+            smb_actor_label: None,
+            audit: None,
             actor: ActorId::new(),
         }
     }
@@ -194,8 +206,25 @@ impl YozistFileHandle {
             meta: Some(meta),
             acl_admin: Some(acl_admin),
             owner: Some(owner),
+            smb_actor_label: None,
+            audit: None,
             actor: ActorId::new(),
         }
+    }
+
+    /// `smb_actor_label`/`audit` を後付け設定する。バックエンドが open 時に呼ぶ。
+    pub fn with_smb_audit(
+        mut self,
+        identity: &smb_server::Identity,
+        audit: SharedAuditLog,
+    ) -> Self {
+        let label = match identity {
+            smb_server::Identity::Anonymous => "smb:anonymous".to_string(),
+            smb_server::Identity::User { user, .. } => format!("smb:{}", user),
+        };
+        self.smb_actor_label = Some(label);
+        self.audit = Some(audit);
+        self
     }
 
     pub fn set_truncated(&mut self) {
@@ -292,61 +321,92 @@ impl Handle for YozistFileHandle {
                 st.pending_series,
             )
         };
+        let label = self.smb_actor_label.clone();
+        let audit = self.audit.clone();
+        let action_label: &str = if file_id.is_some() { "commit" } else { "create_file" };
         if !dirty {
             return Ok(());
         }
-        match file_id {
-            Some(id) => {
-                self.engine
-                    .commit(id, &buffer, self.actor, Some("smb".into()))
-                    .await
-                    .map_err(|e| {
-                        smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
-                    })?;
-            }
-            None => {
-                let (file, _commit) = self
-                    .engine
-                    .create_file(name, &buffer, self.actor, None)
-                    .await
-                    .map_err(|e| {
-                        smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
-                    })?;
-                if let Some(meta) = &self.meta {
-                    for t in &pending_tags {
-                        meta.attach_tag(&file.id, t).await.map_err(|e| {
-                            smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
-                        })?;
-                    }
-                    if let Some((series_id, order_index)) = pending_series {
-                        meta.add_to_series(&yozist_core::SeriesMember {
-                            series_id,
-                            file_id: file.id,
-                            order_index,
-                        })
+        let inner_result: smb_server::SmbResult<Option<String>> = async {
+            match file_id {
+                Some(id) => {
+                    self.engine
+                        .commit(id, &buffer, self.actor, Some("smb".into()))
                         .await
                         .map_err(|e| {
                             smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
                         })?;
-                    }
+                    Ok(Some(id.to_string()))
                 }
-                // オーナー ACL の自動付与（REST 経由の create_file と同じ挙動）
-                if let (Some(acl_admin), Some(owner_id)) = (&self.acl_admin, self.owner) {
-                    let owner_rule = Permission {
-                        subject: Subject::User(owner_id),
-                        target: Target::File(file.id),
-                        mask: PermissionMask::all(),
-                        allow: true,
-                        priority: i32::MAX,
-                        expires_at: None,
-                    };
-                    acl_admin.add_rule(&owner_rule).await.map_err(|e| {
-                        smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
-                    })?;
+                None => {
+                    let (file, _commit) = self
+                        .engine
+                        .create_file(name, &buffer, self.actor, None)
+                        .await
+                        .map_err(|e| {
+                            smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                        })?;
+                    if let Some(meta) = &self.meta {
+                        for t in &pending_tags {
+                            meta.attach_tag(&file.id, t).await.map_err(|e| {
+                                smb_server::SmbError::Io(std::io::Error::other(
+                                    e.to_string(),
+                                ))
+                            })?;
+                        }
+                        if let Some((series_id, order_index)) = pending_series {
+                            meta.add_to_series(&yozist_core::SeriesMember {
+                                series_id,
+                                file_id: file.id,
+                                order_index,
+                            })
+                            .await
+                            .map_err(|e| {
+                                smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                            })?;
+                        }
+                    }
+                    if let (Some(acl_admin), Some(owner_id)) =
+                        (&self.acl_admin, self.owner)
+                    {
+                        let owner_rule = Permission {
+                            subject: Subject::User(owner_id),
+                            target: Target::File(file.id),
+                            mask: PermissionMask::all(),
+                            allow: true,
+                            priority: i32::MAX,
+                            expires_at: None,
+                        };
+                        acl_admin.add_rule(&owner_rule).await.map_err(|e| {
+                            smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                        })?;
+                    }
+                    Ok(Some(file.id.to_string()))
                 }
             }
         }
-        Ok(())
+        .await;
+
+        // 監査記録（SMB 経由のみ）
+        if let (Some(label), Some(audit)) = (label, audit) {
+            let result_str = match &inner_result {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("error: {e}"),
+            };
+            let target_ref = inner_result.as_ref().ok().and_then(|x| x.clone());
+            let _ = audit
+                .record(&AuditRecord {
+                    actor_id: None,
+                    actor_label: Some(&label),
+                    action: action_label,
+                    target_type: Some("file"),
+                    target_ref: target_ref.as_deref(),
+                    metadata_json: None,
+                    result: &result_str,
+                })
+                .await;
+        }
+        inner_result.map(|_| ())
     }
 }
 

@@ -119,7 +119,7 @@ impl ShareBackend for AllBackend {
                     opts.write,
                 )
                 .await?;
-                Ok(Box::new(h))
+                Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
             }
             (OpenIntent::Truncate | OpenIntent::OverwriteOrCreate, Some(meta)) => {
                 self.deps
@@ -139,7 +139,7 @@ impl ShareBackend for AllBackend {
                 )
                 .await?;
                 h.set_truncated();
-                Ok(Box::new(h))
+                Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
             }
             (OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate, None) => {
                 if opts.directory {
@@ -165,7 +165,7 @@ impl ShareBackend for AllBackend {
                     vec![],
                     None,
                 );
-                Ok(Box::new(h))
+                Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
             }
         }
     }
@@ -463,7 +463,7 @@ impl ShareBackend for TagsBackend {
                             parent_tag_ids,
                             None,
                         );
-                        return Ok(Box::new(h));
+                        return Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())));
                     }
                     _ => return Err(SmbError::PathNotFound),
                 }
@@ -517,7 +517,7 @@ impl ShareBackend for TagsBackend {
                     h.set_truncated();
                 }
                 let _ = full_name;
-                Ok(Box::new(h))
+                Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
             }
         }
     }
@@ -529,8 +529,6 @@ impl ShareBackend for TagsBackend {
         }
         let (tag_ids, file) = self.parse_path(comps).await?;
         match file {
-            // ファイル削除: そのタグを取り外すのみ（ファイル実体は残す）。
-            // タグが指定されていない（ルート直下のファイル）場合はファイルを deleted フラグ化。
             Some((file_id, _)) => {
                 self.deps
                     .require(
@@ -539,33 +537,41 @@ impl ShareBackend for TagsBackend {
                         yozist_auth::PermissionMask::WRITE,
                     )
                     .await?;
-                if tag_ids.is_empty() {
-                    let mut meta = self
-                        .deps
-                        .meta
-                        .get_file(&file_id)
-                        .await
-                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
-                        .ok_or(SmbError::NotFound)?;
-                    meta.deleted = true;
-                    meta.updated_at = time::OffsetDateTime::now_utc();
-                    self.deps
-                        .meta
-                        .update_file(&meta)
-                        .await
-                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-                } else {
-                    // 末尾タグだけ取り外す
-                    let last_tag = *tag_ids.last().unwrap();
-                    self.deps
-                        .meta
-                        .detach_tag(&file_id, &last_tag)
-                        .await
-                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                let is_detach = !tag_ids.is_empty();
+                let res = async {
+                    if !is_detach {
+                        let mut meta = self
+                            .deps
+                            .meta
+                            .get_file(&file_id)
+                            .await
+                            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                            .ok_or(SmbError::NotFound)?;
+                        meta.deleted = true;
+                        meta.updated_at = time::OffsetDateTime::now_utc();
+                        self.deps
+                            .meta
+                            .update_file(&meta)
+                            .await
+                            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                    } else {
+                        let last_tag = *tag_ids.last().unwrap();
+                        self.deps
+                            .meta
+                            .detach_tag(&file_id, &last_tag)
+                            .await
+                            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                    }
+                    Ok::<_, SmbError>(())
                 }
-                Ok(())
+                .await;
+                let id_str = file_id.to_string();
+                let action = if is_detach { "detach_tag" } else { "delete_file" };
+                self.deps
+                    .audit_smb(identity, action, Some("file"), Some(&id_str), &res)
+                    .await;
+                res
             }
-            // タグディレクトリ削除: rmdir 相当。タグ自体は残し、空かどうかは判定しない (TODO)。
             None => Err(SmbError::NotEmpty),
         }
     }
@@ -580,7 +586,7 @@ impl ShareBackend for TagsBackend {
         let (to_tags, to_file) = self.parse_path(to.components()).await?;
         let (file_id, _) = match (from_file, to_file) {
             (Some(f), Some(_)) => f,
-            (Some(f), None) => f, // 移動先がディレクトリ扱いだが、簡易化のため同じ FileId として扱う
+            (Some(f), None) => f,
             _ => return Err(SmbError::NotSupported),
         };
         self.deps
@@ -590,22 +596,29 @@ impl ShareBackend for TagsBackend {
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
-        // from の末尾タグを外し、to の全タグを付与する単純化セマンティクス
-        if let Some(last) = from_tags.last() {
-            self.deps
-                .meta
-                .detach_tag(&file_id, last)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let res = async {
+            if let Some(last) = from_tags.last() {
+                self.deps
+                    .meta
+                    .detach_tag(&file_id, last)
+                    .await
+                    .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            }
+            for t in &to_tags {
+                self.deps
+                    .meta
+                    .attach_tag(&file_id, t)
+                    .await
+                    .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            }
+            Ok::<_, SmbError>(())
         }
-        for t in &to_tags {
-            self.deps
-                .meta
-                .attach_tag(&file_id, t)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-        }
-        Ok(())
+        .await;
+        let id_str = file_id.to_string();
+        self.deps
+            .audit_smb(identity, "retag", Some("file"), Some(&id_str), &res)
+            .await;
+        res
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -822,7 +835,7 @@ impl ShareBackend for SeriesBackend {
                         ) {
                             h.set_truncated();
                         }
-                        Ok(Box::new(h))
+                        Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
                     }
                     None => {
                         // 新規ファイル: シリーズ S に追加
@@ -861,7 +874,7 @@ impl ShareBackend for SeriesBackend {
                                     vec![],
                                     Some((s.id, order)),
                                 );
-                                Ok(Box::new(h))
+                                Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
                             }
                             _ => Err(SmbError::NotFound),
                         }
@@ -890,11 +903,23 @@ impl ShareBackend for SeriesBackend {
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
-        self.deps
+        let res = self
+            .deps
             .meta
             .remove_from_series(&series.id, &file_id)
             .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())));
+        let id_str = file_id.to_string();
+        self.deps
+            .audit_smb(
+                identity,
+                "remove_from_series",
+                Some("file"),
+                Some(&id_str),
+                &res,
+            )
+            .await;
+        res?;
         Ok(())
     }
 
@@ -928,42 +953,50 @@ impl ShareBackend for SeriesBackend {
             )
             .await?;
         let new_order = Self::parse_member_name(&to_comp[1]).map(|(o, _, _)| o);
+        let file_id_str = file_id.to_string();
 
-        // 同一シリーズ内のリネーム = 順序変更のみ
-        if from_series.id == to_series.id {
-            if let Some(order) = new_order {
-                self.deps
-                    .meta
-                    .add_to_series(&yozist_core::SeriesMember {
-                        series_id: from_series.id,
-                        file_id,
-                        order_index: order,
-                    })
-                    .await
-                    .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let res = async {
+            if from_series.id == to_series.id {
+                if let Some(order) = new_order {
+                    self.deps
+                        .meta
+                        .add_to_series(&yozist_core::SeriesMember {
+                            series_id: from_series.id,
+                            file_id,
+                            order_index: order,
+                        })
+                        .await
+                        .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                }
+                return Ok::<_, SmbError>(());
             }
-            return Ok(());
+            self.deps
+                .meta
+                .remove_from_series(&from_series.id, &file_id)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            let order = new_order.unwrap_or(10.0);
+            self.deps
+                .meta
+                .add_to_series(&yozist_core::SeriesMember {
+                    series_id: to_series.id,
+                    file_id,
+                    order_index: order,
+                })
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            Ok(())
         }
-        // クロスシリーズ移動
+        .await;
+        let action = if from_series.id == to_series.id {
+            "reorder_series_member"
+        } else {
+            "move_series_member"
+        };
         self.deps
-            .meta
-            .remove_from_series(&from_series.id, &file_id)
-            .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-        let order = new_order.unwrap_or_else(|| {
-            // 簡易: 末尾追加扱い
-            10.0
-        });
-        self.deps
-            .meta
-            .add_to_series(&yozist_core::SeriesMember {
-                series_id: to_series.id,
-                file_id,
-                order_index: order,
-            })
-            .await
-            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-        Ok(())
+            .audit_smb(identity, action, Some("file"), Some(&file_id_str), &res)
+            .await;
+        res
     }
 
     fn capabilities(&self) -> BackendCapabilities {
@@ -1147,7 +1180,7 @@ impl ShareBackend for QueriesBackend {
                     false, // 読取専用ビュー
                 )
                 .await?;
-                Ok(Box::new(h))
+                Ok(Box::new(h.with_smb_audit(identity, self.deps.audit.clone())))
             }
             _ => Err(SmbError::PathNotFound),
         }
