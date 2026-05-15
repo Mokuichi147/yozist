@@ -72,6 +72,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
         .route("/api/tags", get(list_tags).post(upsert_tag))
         .route("/api/files/by-tags", get(list_files_by_tags))
+        .route("/api/search", get(search_files))
         .route("/api/series", get(list_series).post(create_series))
         .route("/api/series/:id", get(get_series))
         .route(
@@ -313,6 +314,7 @@ async fn delete_file(
         meta.deleted = true;
         meta.updated_at = time::OffsetDateTime::now_utc();
         s.meta.update_file(&meta).await.map_err(ApiError::from_db)?;
+        let _ = s.meta.delete_fts(&file_id).await;
         Ok::<_, ApiError>(())
     }
     .await;
@@ -465,6 +467,7 @@ async fn detach_tag(
     )
     .await;
     res?;
+    refresh_fts_tags(&s, &file_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -496,6 +499,59 @@ async fn list_files_by_tags(
         .await
         .map_err(ApiError::from_db)?;
     Ok(Json(files))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: u32,
+}
+
+fn default_search_limit() -> u32 {
+    50
+}
+
+async fn search_files(
+    State(s): State<ApiState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<Vec<FileMeta>>, ApiError> {
+    let ids = s
+        .meta
+        .search_fts(&q.q, q.limit)
+        .await
+        .map_err(ApiError::from_db)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(meta) = s.meta.get_file(&id).await.map_err(ApiError::from_db)? {
+            if !meta.deleted {
+                out.push(meta);
+            }
+        }
+    }
+    Ok(Json(out))
+}
+
+/// タグ変更時に FTS の tags 列を再構築するヘルパ。失敗は無視。
+async fn refresh_fts_tags(state: &ApiState, file_id: &FileId) {
+    let tags = state
+        .meta
+        .list_tags_of(file_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let meta = state.meta.get_file(file_id).await.ok().flatten();
+    if let Some(meta) = meta {
+        // content は維持できないので空にする（テキストファイルは次回 commit 時に更新）。
+        // display_name と tags のみリフレッシュ。content は別のレイヤーで再投入される。
+        let _ = state
+            .meta
+            .upsert_fts(file_id, &meta.display_name, &tags, "")
+            .await;
+    }
 }
 
 async fn upsert_tag(
@@ -580,6 +636,7 @@ async fn attach_tag(
     )
     .await;
     res?;
+    refresh_fts_tags(&s, &file_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

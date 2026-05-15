@@ -142,6 +142,17 @@ impl VersioningEngine {
         updated.updated_at = now;
         self.meta.update_file(&updated).await?;
 
+        // FTS index: display_name + content (テキストフォーマット時のみ内容も)
+        let content_str = if fmt.format_id() == "text/plain" {
+            std::str::from_utf8(&normalized).unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        let _ = self
+            .meta
+            .upsert_fts(&updated.id, &updated.display_name, "", &content_str)
+            .await;
+
         Ok((updated, commit))
     }
 
@@ -207,6 +218,26 @@ impl VersioningEngine {
         file.size = serialized.len() as u64;
         file.updated_at = now;
         self.meta.update_file(&file).await?;
+
+        // FTS 更新 (display_name とタグ一覧と内容)
+        let tag_names = self
+            .meta
+            .list_tags_of(&file.id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let content_str = if fmt.format_id() == "text/plain" {
+            std::str::from_utf8(&serialized).unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        let _ = self
+            .meta
+            .upsert_fts(&file.id, &file.display_name, &tag_names, &content_str)
+            .await;
 
         Ok(commit)
     }

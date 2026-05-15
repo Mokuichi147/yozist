@@ -59,6 +59,20 @@ pub trait MetaStore: Send + Sync {
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError>;
     async fn list_commits(&self, file: &FileId) -> Result<Vec<Commit>, DbError>;
 
+    // ---- full-text search (FTS5) ----
+    /// FTS の対応行を upsert。`display_name` / `tags` / `content` のいずれも空文字可。
+    async fn upsert_fts(
+        &self,
+        file: &FileId,
+        display_name: &str,
+        tags: &str,
+        content: &str,
+    ) -> Result<(), DbError>;
+    /// FTS から削除（ファイル削除時など）。
+    async fn delete_fts(&self, file: &FileId) -> Result<(), DbError>;
+    /// MATCH クエリで一致する `FileId` を新しい順で返す。
+    async fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<FileId>, DbError>;
+
     // ---- saved queries ----
     async fn upsert_saved_query(&self, query: &SavedQuery) -> Result<SavedQueryId, DbError>;
     async fn get_saved_query(

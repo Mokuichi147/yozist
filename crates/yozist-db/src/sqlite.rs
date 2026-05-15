@@ -565,6 +565,59 @@ impl MetaStore for SqliteMetaStore {
         Ok(())
     }
 
+    async fn upsert_fts(
+        &self,
+        file: &FileId,
+        display_name: &str,
+        tags: &str,
+        content: &str,
+    ) -> Result<(), DbError> {
+        // FTS5 では UPSERT が無いので DELETE → INSERT
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM files_fts WHERE file_id = ?")
+            .bind(file.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO files_fts (file_id, display_name, tags, content)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(file.to_string())
+        .bind(display_name)
+        .bind(tags)
+        .bind(content)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_fts(&self, file: &FileId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM files_fts WHERE file_id = ?")
+            .bind(file.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<FileId>, DbError> {
+        let rows = sqlx::query(
+            "SELECT file_id FROM files_fts
+             WHERE files_fts MATCH ?
+             ORDER BY rank LIMIT ?",
+        )
+        .bind(query)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                let s: String = r.try_get("file_id")?;
+                Ok(FileId::from_uuid(parse_uuid(&s)?))
+            })
+            .collect()
+    }
+
     async fn list_commits(&self, file: &FileId) -> Result<Vec<Commit>, DbError> {
         let rows = sqlx::query(
             r#"SELECT * FROM commits

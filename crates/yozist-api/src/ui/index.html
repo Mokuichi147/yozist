@@ -87,6 +87,11 @@
   <div>
     <div class="card">
       <h2>files <span class="small" id="files-count"></span></h2>
+      <div style="display:flex; gap:6px; margin-bottom:8px">
+        <input id="search-input" placeholder="全文検索 (FTS5)" style="flex:1" onkeydown="if(event.key==='Enter')doSearch()">
+        <button onclick="doSearch()">検索</button>
+        <button onclick="clearSearch()" class="small">×</button>
+      </div>
       <div id="file-filter" class="small" style="margin-bottom:8px"></div>
       <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center">
         <input id="upload-name" placeholder="新規ファイル名 (例: memo.md)" style="flex:1">
@@ -146,6 +151,7 @@
 const $ = id => document.getElementById(id);
 let token = localStorage.getItem('yozist_token') || '';
 let filterTags = []; // 選択中のタグ名（AND）
+let searchQuery = '';
 
 function api(path, opts = {}) {
   opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
@@ -390,14 +396,17 @@ async function loadAudit() {
 
 async function loadFiles() {
   let url = '/api/files';
-  if (filterTags.length > 0) {
+  if (searchQuery) {
+    url = '/api/search?q=' + encodeURIComponent(searchQuery);
+  } else if (filterTags.length > 0) {
     url = '/api/files/by-tags?tags=' + encodeURIComponent(filterTags.join(','));
   }
   const files = await fetch(url).then(r => r.json());
   $('files-count').textContent = `(${files.length})`;
-  $('file-filter').textContent = filterTags.length
-    ? 'フィルタ: ' + filterTags.join(' AND ')
-    : '';
+  const filterParts = [];
+  if (searchQuery) filterParts.push(`検索: "${searchQuery}"`);
+  if (filterTags.length) filterParts.push('タグ: ' + filterTags.join(' AND '));
+  $('file-filter').textContent = filterParts.join(' / ');
   const el = $('file-list');
   el.innerHTML = '';
   files.forEach(f => {
@@ -519,6 +528,16 @@ async function addToSeries() {
     body: { file_id: currentFile.id },
   });
   alert('追加しました');
+}
+
+function doSearch() {
+  searchQuery = $('search-input').value.trim();
+  loadFiles();
+}
+function clearSearch() {
+  searchQuery = '';
+  $('search-input').value = '';
+  loadFiles();
 }
 
 async function deleteCurrentFile() {
