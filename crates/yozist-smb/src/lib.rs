@@ -2,32 +2,32 @@
 //!
 //! # 設計
 //! - 採用クレート: [`smb-server`](https://github.com/paltaio/rust-smb-server) v0.4 系
-//!   （Edition 2024 / rustc 1.95+。本スケルトンでは toolchain 制約で参照のみ）
-//! - 各 share（tags / series / recent / all）ごとに `ShareBackend` 実装を持つ
+//! - 各 share（all / tags / series / recent）ごとに `ShareBackend` 実装を持つ
 //! - すべての操作は `yozist-versioning` / `yozist-db` の公開 API 経由
 //!
 //! # Share 一覧
 //! | share | 内容 |
 //! |-------|------|
-//! | `tags` | 階層パス = タグの AND 条件 |
-//! | `series` | 配下に `NNNN__name` 形式で順序付きメンバー |
-//! | `recent` | 直近 N 件（読取専用） |
-//! | `all` | 全ファイルをフラット |
+//! | `all` | 全ファイルをフラット (v1) |
+//! | `tags` | 階層パス = タグの AND 条件 (v2 TODO) |
+//! | `series` | 配下に `NNNN__name` 形式で順序付きメンバー (v2 TODO) |
+//! | `recent` | 直近 N 件（読取専用） (v2 TODO) |
 //!
 //! # TODO
-//! - [ ] `smb-server` v0.4 統合（rustc 1.95+ 切替後）
-//! - [ ] `TagsBackend` の `ShareBackend` impl
-//! - [ ] `SeriesBackend` の `ShareBackend` impl
-//! - [ ] `RecentBackend` / `AllBackend`
+//! - [ ] TagsBackend / SeriesBackend / RecentBackend の本実装
 //! - [ ] `AuthContext` を SMB セッションから抽出するアダプタ
 //! - [ ] SMB Change Notify による他クライアントへの即時反映
+//! - [ ] truncate / set_times の完全対応
 
+use smb_server::{Access, Share, SmbServer};
 use std::sync::Arc;
 use yozist_auth::{AuthContext, Authorizer};
 use yozist_db::SharedMetaStore;
 use yozist_storage::SharedBlobStore;
+use yozist_versioning::VersioningEngine;
 
 pub mod backends;
+pub mod handle;
 pub use backends::{AllBackend, RecentBackend, SeriesBackend, TagsBackend};
 
 /// 各 share 実装が共有する依存。
@@ -35,6 +35,7 @@ pub use backends::{AllBackend, RecentBackend, SeriesBackend, TagsBackend};
 pub struct ShareDeps {
     pub meta: SharedMetaStore,
     pub blob: SharedBlobStore,
+    pub engine: Arc<VersioningEngine>,
     pub authz: Arc<dyn Authorizer>,
 }
 
@@ -47,18 +48,51 @@ pub struct RequestCtx {
 /// 起動設定。
 pub struct SmbConfig {
     pub listen: std::net::SocketAddr,
+    /// 初期ユーザー（user, password）。`smb-server` 組込み認証で利用。
+    pub initial_users: Vec<(String, String)>,
 }
 
-/// SMB サーバー起動エントリ。スケルトン段階では未実装。
-pub async fn serve(_cfg: SmbConfig, _deps: ShareDeps) -> Result<(), SmbError> {
-    // TODO: smb_server::SmbServer::builder() で全 share を組み立てて起動
-    Err(SmbError::NotImplemented)
+/// SMB サーバー起動エントリ。
+pub async fn serve(cfg: SmbConfig, deps: ShareDeps) -> Result<(), SmbError> {
+    let mut builder = SmbServer::builder().listen(cfg.listen);
+    for (u, p) in &cfg.initial_users {
+        builder = builder.user(u, p);
+    }
+
+    let all = Share::new("all", AllBackend::new(deps.clone()));
+    let all = if cfg.initial_users.is_empty() {
+        all.public()
+    } else {
+        cfg.initial_users
+            .iter()
+            .fold(all, |sh, (u, _)| sh.user(u, Access::ReadWrite))
+    };
+
+    let server = builder
+        .share(all)
+        .build()
+        .map_err(|e| SmbError::Build(e.to_string()))?;
+
+    let bound = server
+        .bind()
+        .await
+        .map_err(|e| SmbError::Bind(e.to_string()))?;
+    tracing::info!("SMB server listening on {} (bound={bound})", cfg.listen);
+    server
+        .serve()
+        .await
+        .map_err(|e| SmbError::Serve(e.to_string()))?;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum SmbError {
-    #[error("not implemented (smb-server integration pending toolchain upgrade)")]
-    NotImplemented,
+    #[error("build error: {0}")]
+    Build(String),
+    #[error("bind error: {0}")]
+    Bind(String),
+    #[error("serve error: {0}")]
+    Serve(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

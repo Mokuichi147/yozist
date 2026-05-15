@@ -17,8 +17,7 @@ tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-
-# smb-server v0.4 は rustc 1.95+ を要求。
-# スケルトン段階では型・スタブのみ用意し、本統合は次タスクで feature `smb-backend` 経由で有効化する。
-# [target.'cfg(any())'.dependencies]
-# smb-server = "0.4"
+smb-server = { workspace = true }
+uuid.workspace = true
+time.workspace = true
+parking_lot = "0.12"

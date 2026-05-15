@@ -19,7 +19,8 @@ use tokio::net::TcpListener;
 use yozist_api::ApiState;
 use yozist_auth::{AuthService, Authorizer, DbAuthorizer, SqliteAuthService};
 use yozist_db::{SharedMetaStore, SqliteMetaStore};
-use yozist_storage::FsBlobStore;
+use yozist_smb::{ShareDeps, SmbConfig};
+use yozist_storage::{FsBlobStore, SharedBlobStore};
 use yozist_versioning::{CrdtRegistry, VersioningEngine};
 
 #[derive(Parser, Debug)]
@@ -36,6 +37,14 @@ struct Cli {
     /// API listen アドレス
     #[arg(long, env = "YOZIST_LISTEN", default_value = "127.0.0.1:7878")]
     listen: String,
+
+    /// SMB listen アドレス（空文字列で無効化）
+    #[arg(long, env = "YOZIST_SMB_LISTEN", default_value = "127.0.0.1:4445")]
+    smb_listen: String,
+
+    /// 初期 SMB ユーザー (`user:password`)。複数指定可。
+    #[arg(long, env = "YOZIST_SMB_USER")]
+    smb_user: Vec<String>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -81,9 +90,13 @@ async fn main() -> anyhow::Result<()> {
             let pool = store.pool().clone();
             let meta: SharedMetaStore = Arc::new(store);
 
-            let blob = Arc::new(FsBlobStore::new(&blob_path).await?);
+            let blob: SharedBlobStore = Arc::new(FsBlobStore::new(&blob_path).await?);
             let registry = Arc::new(CrdtRegistry::with_defaults());
-            let engine = Arc::new(VersioningEngine::new(registry, blob, meta.clone()));
+            let engine = Arc::new(VersioningEngine::new(
+                registry,
+                blob.clone(),
+                meta.clone(),
+            ));
 
             let secret_path = cli.data.join("jwt-secret.bin");
             let secret = load_or_create_secret(&secret_path).await?;
@@ -94,17 +107,59 @@ async fn main() -> anyhow::Result<()> {
             let authz: Arc<dyn Authorizer> = db_authz.clone();
 
             let state = ApiState {
-                meta,
-                engine,
-                auth,
-                authz,
+                meta: meta.clone(),
+                engine: engine.clone(),
+                auth: auth.clone(),
+                authz: authz.clone(),
                 acl_admin: db_authz,
             };
             let app = yozist_api::router(state);
 
+            // SMB を別タスクで起動
+            let smb_task = if cli.smb_listen.is_empty() {
+                tracing::info!("SMB disabled (--smb-listen is empty)");
+                None
+            } else {
+                let smb_addr: std::net::SocketAddr = cli
+                    .smb_listen
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid SMB listen addr: {e}"))?;
+                let users: Vec<(String, String)> = cli
+                    .smb_user
+                    .iter()
+                    .filter_map(|s| s.split_once(':').map(|(u, p)| (u.into(), p.into())))
+                    .collect();
+                if users.is_empty() {
+                    tracing::warn!(
+                        "SMB starting in public mode (no --smb-user provided); \
+                         use --smb-user user:pw to require authentication"
+                    );
+                }
+                let cfg = SmbConfig {
+                    listen: smb_addr,
+                    initial_users: users,
+                };
+                let deps = ShareDeps {
+                    meta,
+                    blob,
+                    engine,
+                    authz,
+                };
+                Some(tokio::spawn(async move {
+                    if let Err(e) = yozist_smb::serve(cfg, deps).await {
+                        tracing::error!("SMB server failed: {e}");
+                    }
+                }))
+            };
+
             let listener = TcpListener::bind(&cli.listen).await?;
             tracing::info!("listening on {}", cli.listen);
-            axum::serve(listener, app).await?;
+            let api_result = axum::serve(listener, app).await;
+
+            if let Some(t) = smb_task {
+                t.abort();
+            }
+            api_result?;
         }
     }
     Ok(())

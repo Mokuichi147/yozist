@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor"]
 members = [
     "crates/yozist-core",
     "crates/yozist-storage",
@@ -62,6 +63,10 @@ zstd = "0.13"
 # Diff / CRDT
 similar = "2.6"
 yrs = "0.21"
+# 公開版 smb-server 0.4 は SmbError / SmbPath / BackendCapabilities / FileTimes
+# を再エクスポートしておらず、外部 ShareBackend 実装ができないため、本リポジトリ
+# 内 vendor 版を直接利用する（再エクスポート追加済み）。upstream に PR 予定。
+smb-server = { path = "vendor/smb-server" }
 
 # HTTP / API
 axum = "0.7"

@@ -26,3 +26,4 @@ figment.workspace = true
 serde.workspace = true
 axum.workspace = true
 rand.workspace = true
+async-trait.workspace = true

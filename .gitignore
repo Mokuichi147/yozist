@@ -6,3 +6,5 @@
 /data
 .env
 .DS_Store
+vendor/smb-server/target/
+vendor/smb-server/.git/
