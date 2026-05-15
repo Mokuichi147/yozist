@@ -412,6 +412,12 @@ impl ShareBackend for TagsBackend {
                                 .ok_or(SmbError::PathNotFound)?;
                             parent_tag_ids.push(tag.id);
                         }
+                        // 認証必須（新規タグ/ファイル作成）
+                        let ctx = self.deps.identity_to_context(identity).await;
+                        let owner = match &ctx {
+                            yozist_auth::AuthContext::User { user, .. } => user.id,
+                            _ => return Err(SmbError::AccessDenied),
+                        };
                         if opts.directory {
                             // mkdir → 新規タグ作成
                             self.deps
@@ -428,17 +434,20 @@ impl ShareBackend for TagsBackend {
                                 })?;
                             return Ok(Box::new(YozistDirHandle::new(last.clone(), vec![])));
                         }
-                        // 新規ファイル: 親タグを自動付与する Handle を返す
+                        // 新規ファイル: 親タグを自動付与 + オーナー ACL
                         let display = match last.split_once(ID_SEP) {
                             Some((_, rest)) => rest.to_string(),
                             None => last.clone(),
                         };
-                        let h = YozistFileHandle::open_new_with_tags(
+                        let h = YozistFileHandle::open_new_with_owner(
                             self.deps.engine.clone(),
                             self.deps.meta.clone(),
+                            self.deps.acl_admin.clone(),
                             display,
                             true,
+                            owner,
                             parent_tag_ids,
+                            None,
                         );
                         return Ok(Box::new(h));
                     }
@@ -473,6 +482,14 @@ impl ShareBackend for TagsBackend {
                 if matches!(opts.intent, OpenIntent::Create) {
                     return Err(SmbError::Exists);
                 }
+                let mask = if opts.write {
+                    yozist_auth::PermissionMask::WRITE | yozist_auth::PermissionMask::READ
+                } else {
+                    yozist_auth::PermissionMask::READ
+                };
+                self.deps
+                    .require(identity, &yozist_auth::Target::File(meta.id), mask)
+                    .await?;
                 let mut h = YozistFileHandle::open_existing(
                     &self.deps,
                     self.deps.engine.clone(),
@@ -501,6 +518,13 @@ impl ShareBackend for TagsBackend {
             // ファイル削除: そのタグを取り外すのみ（ファイル実体は残す）。
             // タグが指定されていない（ルート直下のファイル）場合はファイルを deleted フラグ化。
             Some((file_id, _)) => {
+                self.deps
+                    .require(
+                        identity,
+                        &yozist_auth::Target::File(file_id),
+                        yozist_auth::PermissionMask::WRITE,
+                    )
+                    .await?;
                 if tag_ids.is_empty() {
                     let mut meta = self
                         .deps
@@ -545,6 +569,13 @@ impl ShareBackend for TagsBackend {
             (Some(f), None) => f, // 移動先がディレクトリ扱いだが、簡易化のため同じ FileId として扱う
             _ => return Err(SmbError::NotSupported),
         };
+        self.deps
+            .require(
+                identity,
+                &yozist_auth::Target::File(file_id),
+                yozist_auth::PermissionMask::WRITE,
+            )
+            .await?;
         // from の末尾タグを外し、to の全タグを付与する単純化セマンティクス
         if let Some(last) = from_tags.last() {
             self.deps
@@ -753,6 +784,15 @@ impl ShareBackend for SeriesBackend {
                         if matches!(opts.intent, OpenIntent::Create) {
                             return Err(SmbError::Exists);
                         }
+                        let mask = if opts.write {
+                            yozist_auth::PermissionMask::WRITE
+                                | yozist_auth::PermissionMask::READ
+                        } else {
+                            yozist_auth::PermissionMask::READ
+                        };
+                        self.deps
+                            .require(identity, &yozist_auth::Target::File(meta.id), mask)
+                            .await?;
                         let mut h = YozistFileHandle::open_existing(
                             &self.deps,
                             self.deps.engine.clone(),
@@ -775,6 +815,11 @@ impl ShareBackend for SeriesBackend {
                         if opts.directory {
                             return Err(SmbError::NotSupported);
                         }
+                        let ctx = self.deps.identity_to_context(identity).await;
+                        let owner = match &ctx {
+                            yozist_auth::AuthContext::User { user, .. } => user.id,
+                            _ => return Err(SmbError::AccessDenied),
+                        };
                         match opts.intent {
                             OpenIntent::Create
                             | OpenIntent::OpenOrCreate
@@ -792,13 +837,15 @@ impl ShareBackend for SeriesBackend {
                                     .last()
                                     .map(|m| m.order_index + 10.0)
                                     .unwrap_or(10.0);
-                                let h = YozistFileHandle::open_new_with_series(
+                                let h = YozistFileHandle::open_new_with_owner(
                                     self.deps.engine.clone(),
                                     self.deps.meta.clone(),
+                                    self.deps.acl_admin.clone(),
                                     name.clone(),
                                     true,
-                                    s.id,
-                                    order,
+                                    owner,
+                                    vec![],
+                                    Some((s.id, order)),
                                 );
                                 Ok(Box::new(h))
                             }
@@ -822,6 +869,13 @@ impl ShareBackend for SeriesBackend {
             .ok_or(SmbError::PathNotFound)?;
         let (_, file_id, _) =
             Self::parse_member_name(&comps[1]).ok_or(SmbError::NotFound)?;
+        self.deps
+            .require(
+                identity,
+                &yozist_auth::Target::File(file_id),
+                yozist_auth::PermissionMask::WRITE,
+            )
+            .await?;
         self.deps
             .meta
             .remove_from_series(&series.id, &file_id)
@@ -852,6 +906,13 @@ impl ShareBackend for SeriesBackend {
 
         let (_, file_id, _) =
             Self::parse_member_name(&from_comp[1]).ok_or(SmbError::NotFound)?;
+        self.deps
+            .require(
+                identity,
+                &yozist_auth::Target::File(file_id),
+                yozist_auth::PermissionMask::WRITE,
+            )
+            .await?;
         let new_order = Self::parse_member_name(&to_comp[1]).map(|(o, _, _)| o);
 
         // 同一シリーズ内のリネーム = 順序変更のみ
@@ -1048,6 +1109,14 @@ impl ShareBackend for QueriesBackend {
                 let uuid =
                     uuid::Uuid::parse_str(id_str).map_err(|_| SmbError::NotFound)?;
                 let file_id = yozist_core::FileId::from_uuid(uuid);
+                // 読取専用 share だが READ 権限は確認する
+                self.deps
+                    .require(
+                        identity,
+                        &yozist_auth::Target::File(file_id),
+                        yozist_auth::PermissionMask::READ,
+                    )
+                    .await?;
                 let meta = self
                     .deps
                     .meta
