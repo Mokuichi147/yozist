@@ -33,7 +33,8 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, FileId, FileMeta, Series, SeriesId, SeriesMember, Tag, TagId, TagKind, UserId,
+    ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
+    SeriesMember, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::SharedMetaStore;
 use yozist_versioning::VersioningEngine;
@@ -76,6 +77,12 @@ pub fn router(state: ApiState) -> Router {
             "/api/series/:id/members/:file_id",
             axum::routing::delete(remove_series_member),
         )
+        .route("/api/queries", get(list_saved_queries).post(create_saved_query))
+        .route(
+            "/api/queries/:id",
+            get(get_saved_query).delete(delete_saved_query),
+        )
+        .route("/api/queries/:id/files", get(query_files))
         .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
@@ -563,6 +570,153 @@ async fn remove_series_member(
         .await
         .map_err(ApiError::from_db)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Saved Queries (Shareable Path)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateQueryInput {
+    name: String,
+    description: Option<String>,
+    #[serde(default)]
+    tags_and: Vec<String>,
+    #[serde(default)]
+    tags_not: Vec<String>,
+    /// 期限秒数（now + N 秒）。
+    expires_in_secs: Option<i64>,
+}
+
+async fn list_saved_queries(
+    State(s): State<ApiState>,
+) -> Result<Json<Vec<SavedQuery>>, ApiError> {
+    let list = s.meta.list_saved_queries().await.map_err(ApiError::from_db)?;
+    Ok(Json(list))
+}
+
+async fn create_saved_query(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<CreateQueryInput>,
+) -> Result<(StatusCode, Json<SavedQuery>), ApiError> {
+    require_authenticated(&ctx).await?;
+    let now = time::OffsetDateTime::now_utc();
+    let created_by = match &ctx {
+        AuthContext::User { user, .. } => Some(user.id),
+        _ => None,
+    };
+    let expires_at = input
+        .expires_in_secs
+        .map(|s| now + time::Duration::seconds(s));
+    let q = SavedQuery {
+        id: SavedQueryId::new(),
+        name: input.name,
+        query: QueryDef {
+            tags_and: input.tags_and,
+            tags_not: input.tags_not,
+        },
+        description: input.description,
+        created_by,
+        created_at: now,
+        expires_at,
+    };
+    let id = s.meta.upsert_saved_query(&q).await.map_err(ApiError::from_db)?;
+    let saved = SavedQuery { id, ..q };
+    Ok((StatusCode::CREATED, Json(saved)))
+}
+
+async fn get_saved_query(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<SavedQuery>, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(SavedQueryId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+    let q = s
+        .meta
+        .get_saved_query(&id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(q))
+}
+
+async fn delete_saved_query(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let id = uuid::Uuid::parse_str(&id)
+        .map(SavedQueryId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+    s.meta
+        .delete_saved_query(&id)
+        .await
+        .map_err(ApiError::from_db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn query_files(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<FileMeta>>, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(SavedQueryId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+    let q = s
+        .meta
+        .get_saved_query(&id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let files = resolve_query(&*s.meta, &q.query).await?;
+    Ok(Json(files))
+}
+
+/// 共通ヘルパ: SavedQuery の定義を解決して FileMeta 一覧を返す。
+pub async fn resolve_query(
+    meta: &dyn yozist_db::MetaStore,
+    q: &QueryDef,
+) -> Result<Vec<FileMeta>, ApiError> {
+    // タグ名 → TagId 解決
+    let mut and_ids = Vec::with_capacity(q.tags_and.len());
+    for name in &q.tags_and {
+        let tag = meta.get_tag_by_name(name).await.map_err(ApiError::from_db)?;
+        match tag {
+            Some(t) => and_ids.push(t.id),
+            None => return Ok(vec![]), // 存在しないタグ → 空
+        }
+    }
+    let mut not_ids = Vec::with_capacity(q.tags_not.len());
+    for name in &q.tags_not {
+        if let Some(t) = meta.get_tag_by_name(name).await.map_err(ApiError::from_db)? {
+            not_ids.push(t.id);
+        }
+    }
+
+    let candidates = if and_ids.is_empty() {
+        meta.list_files(1000, 0).await.map_err(ApiError::from_db)?
+    } else {
+        meta.list_files_by_tags(&and_ids)
+            .await
+            .map_err(ApiError::from_db)?
+    };
+
+    // tags_not で除外
+    if not_ids.is_empty() {
+        return Ok(candidates);
+    }
+    let mut out = Vec::new();
+    for f in candidates {
+        let tags = meta.list_tags_of(&f.id).await.map_err(ApiError::from_db)?;
+        let has_excluded = tags.iter().any(|t| not_ids.contains(&t.id));
+        if !has_excluded {
+            out.push(f);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

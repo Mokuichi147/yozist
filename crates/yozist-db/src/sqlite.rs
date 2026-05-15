@@ -16,8 +16,8 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 use yozist_core::{
-    ActorId, BlobId, Commit, CommitId, FileId, FileMeta, Series, SeriesId, SeriesMember, Tag,
-    TagId, TagKind,
+    ActorId, BlobId, Commit, CommitId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId,
+    Series, SeriesId, SeriesMember, Tag, TagId, TagKind, UserId,
 };
 
 use crate::{DbError, MetaStore};
@@ -142,6 +142,30 @@ fn row_to_series(row: SqliteRow) -> Result<Series, DbError> {
         id: SeriesId::from_uuid(parse_uuid(&id)?),
         name,
         description,
+    })
+}
+
+fn row_to_saved_query(row: SqliteRow) -> Result<SavedQuery, DbError> {
+    let id: String = row.try_get("id")?;
+    let name: String = row.try_get("name")?;
+    let query_json: String = row.try_get("query_json")?;
+    let description: Option<String> = row.try_get("description")?;
+    let created_by: Option<String> = row.try_get("created_by")?;
+    let created_at: String = row.try_get("created_at")?;
+    let expires_at: Option<String> = row.try_get("expires_at")?;
+
+    let query: QueryDef = serde_json::from_str(&query_json)
+        .map_err(|e| DbError::Invalid(format!("query json: {e}")))?;
+    Ok(SavedQuery {
+        id: SavedQueryId::from_uuid(parse_uuid(&id)?),
+        name,
+        query,
+        description,
+        created_by: created_by
+            .map(|s| parse_uuid(&s).map(UserId::from_uuid))
+            .transpose()?,
+        created_at: parse_dt(&created_at)?,
+        expires_at: expires_at.map(|s| parse_dt(&s)).transpose()?,
     })
 }
 
@@ -463,6 +487,81 @@ impl MetaStore for SqliteMetaStore {
         .bind(&commit.message)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn upsert_saved_query(
+        &self,
+        q: &SavedQuery,
+    ) -> Result<SavedQueryId, DbError> {
+        let body = serde_json::to_string(&q.query)
+            .map_err(|e| DbError::Invalid(format!("query json: {e}")))?;
+        sqlx::query(
+            r#"INSERT INTO saved_queries
+               (id, name, query_json, description, created_by, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                 query_json = excluded.query_json,
+                 description = excluded.description,
+                 expires_at = excluded.expires_at"#,
+        )
+        .bind(q.id.to_string())
+        .bind(&q.name)
+        .bind(body)
+        .bind(&q.description)
+        .bind(q.created_by.map(|u| u.to_string()))
+        .bind(fmt_dt(q.created_at))
+        .bind(q.expires_at.map(fmt_dt))
+        .execute(&self.pool)
+        .await?;
+        Ok(q.id)
+    }
+
+    async fn get_saved_query(
+        &self,
+        id: &SavedQueryId,
+    ) -> Result<Option<SavedQuery>, DbError> {
+        let row = sqlx::query(
+            "SELECT id, name, query_json, description, created_by, created_at, expires_at
+             FROM saved_queries WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_saved_query).transpose()
+    }
+
+    async fn get_saved_query_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<SavedQuery>, DbError> {
+        let row = sqlx::query(
+            "SELECT id, name, query_json, description, created_by, created_at, expires_at
+             FROM saved_queries WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_saved_query).transpose()
+    }
+
+    async fn list_saved_queries(&self) -> Result<Vec<SavedQuery>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, name, query_json, description, created_by, created_at, expires_at
+             FROM saved_queries
+             WHERE expires_at IS NULL OR expires_at > datetime('now')
+             ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_saved_query).collect()
+    }
+
+    async fn delete_saved_query(&self, id: &SavedQueryId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM saved_queries WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

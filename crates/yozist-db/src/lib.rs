@@ -14,7 +14,10 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use yozist_core::{Commit, FileId, FileMeta, Series, SeriesId, SeriesMember, Tag, TagId};
+use yozist_core::{
+    Commit, FileId, FileMeta, SavedQuery, SavedQueryId, Series, SeriesId, SeriesMember, Tag,
+    TagId,
+};
 
 pub mod sqlite;
 pub use sqlite::SqliteMetaStore;
@@ -53,6 +56,19 @@ pub trait MetaStore: Send + Sync {
     // ---- commits ----
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError>;
     async fn list_commits(&self, file: &FileId) -> Result<Vec<Commit>, DbError>;
+
+    // ---- saved queries ----
+    async fn upsert_saved_query(&self, query: &SavedQuery) -> Result<SavedQueryId, DbError>;
+    async fn get_saved_query(
+        &self,
+        id: &SavedQueryId,
+    ) -> Result<Option<SavedQuery>, DbError>;
+    async fn get_saved_query_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<SavedQuery>, DbError>;
+    async fn list_saved_queries(&self) -> Result<Vec<SavedQuery>, DbError>;
+    async fn delete_saved_query(&self, id: &SavedQueryId) -> Result<(), DbError>;
 }
 
 pub type SharedMetaStore = Arc<dyn MetaStore>;

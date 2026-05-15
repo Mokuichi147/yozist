@@ -28,7 +28,7 @@ use yozist_versioning::VersioningEngine;
 
 pub mod backends;
 pub mod handle;
-pub use backends::{AllBackend, RecentBackend, SeriesBackend, TagsBackend};
+pub use backends::{AllBackend, QueriesBackend, RecentBackend, SeriesBackend, TagsBackend};
 
 /// 各 share 実装が共有する依存。
 #[derive(Clone)]
@@ -74,11 +74,16 @@ pub async fn serve(cfg: SmbConfig, deps: ShareDeps) -> Result<(), SmbError> {
         "series",
         Share::new("series", SeriesBackend::new(deps.clone())),
     );
+    let queries_share = setup_share(
+        "queries",
+        Share::new("queries", QueriesBackend::new(deps.clone())),
+    );
 
     let server = builder
         .share(all_share)
         .share(tags_share)
         .share(series_share)
+        .share(queries_share)
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 

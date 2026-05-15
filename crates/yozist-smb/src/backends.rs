@@ -859,6 +859,185 @@ impl ShareBackend for SeriesBackend {
     }
 }
 
+/// 保存クエリを SMB share として公開する読取専用ビュー。
+///
+/// パス例:
+/// - `\` → 全 saved_query を subdir として表示
+/// - `\<query-name>\` → そのクエリで絞り込まれたファイル一覧
+pub struct QueriesBackend {
+    deps: ShareDeps,
+}
+
+impl QueriesBackend {
+    pub fn new(deps: ShareDeps) -> Self {
+        Self { deps }
+    }
+
+    async fn list_root(&self) -> SmbResult<Vec<DirEntry>> {
+        let queries = self
+            .deps
+            .meta
+            .list_saved_queries()
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let now = crate::handle::system_time_to_filetime(std::time::SystemTime::now());
+        Ok(queries
+            .into_iter()
+            .map(|q| DirEntry {
+                info: FileInfo {
+                    name: q.name,
+                    end_of_file: 0,
+                    allocation_size: 0,
+                    creation_time: now,
+                    last_access_time: now,
+                    last_write_time: now,
+                    change_time: now,
+                    is_directory: true,
+                    file_index: 0,
+                },
+            })
+            .collect())
+    }
+
+    async fn resolve(
+        &self,
+        q: &yozist_core::QueryDef,
+    ) -> SmbResult<Vec<yozist_core::FileMeta>> {
+        // タグ名→ID解決 + AND/NOT
+        let mut and_ids = Vec::new();
+        for name in &q.tags_and {
+            let t = self
+                .deps
+                .meta
+                .get_tag_by_name(name)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            match t {
+                Some(t) => and_ids.push(t.id),
+                None => return Ok(vec![]),
+            }
+        }
+        let mut not_ids = Vec::new();
+        for name in &q.tags_not {
+            if let Some(t) = self
+                .deps
+                .meta
+                .get_tag_by_name(name)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+            {
+                not_ids.push(t.id);
+            }
+        }
+        let candidates = if and_ids.is_empty() {
+            self.deps
+                .meta
+                .list_files(1000, 0)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+        } else {
+            self.deps
+                .meta
+                .list_files_by_tags(&and_ids)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+        };
+        if not_ids.is_empty() {
+            return Ok(candidates);
+        }
+        let mut out = Vec::new();
+        for f in candidates {
+            let tags = self
+                .deps
+                .meta
+                .list_tags_of(&f.id)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            if !tags.iter().any(|t| not_ids.contains(&t.id)) {
+                out.push(f);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl ShareBackend for QueriesBackend {
+    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+        let comps = path.components();
+        if comps.is_empty() {
+            if opts.non_directory {
+                return Err(SmbError::IsDirectory);
+            }
+            let entries = self.list_root().await?;
+            return Ok(Box::new(YozistDirHandle::new("queries", entries)));
+        }
+        let query = self
+            .deps
+            .meta
+            .get_saved_query_by_name(&comps[0])
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+            .ok_or(SmbError::PathNotFound)?;
+
+        match comps.len() {
+            1 => {
+                if opts.non_directory {
+                    return Err(SmbError::IsDirectory);
+                }
+                let files = self.resolve(&query.query).await?;
+                let mut entries = Vec::with_capacity(files.len());
+                for meta in files {
+                    let name = format!("{}{}{}", meta.id, ID_SEP, meta.display_name);
+                    entries.push(DirEntry {
+                        info: crate::handle::file_meta_to_info(&meta, name),
+                    });
+                }
+                Ok(Box::new(YozistDirHandle::new(query.name, entries)))
+            }
+            2 => {
+                // ファイル開く: <file-id>__<name>
+                let (id_str, _) = comps[1]
+                    .split_once(ID_SEP)
+                    .ok_or(SmbError::NotFound)?;
+                let uuid =
+                    uuid::Uuid::parse_str(id_str).map_err(|_| SmbError::NotFound)?;
+                let file_id = yozist_core::FileId::from_uuid(uuid);
+                let meta = self
+                    .deps
+                    .meta
+                    .get_file(&file_id)
+                    .await
+                    .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
+                    .ok_or(SmbError::NotFound)?;
+                let h = YozistFileHandle::open_existing(
+                    &self.deps,
+                    self.deps.engine.clone(),
+                    meta.id,
+                    meta.display_name.clone(),
+                    opts.read,
+                    false, // 読取専用ビュー
+                )
+                .await?;
+                Ok(Box::new(h))
+            }
+            _ => Err(SmbError::PathNotFound),
+        }
+    }
+    async fn unlink(&self, _p: &SmbPath) -> SmbResult<()> {
+        Err(SmbError::AccessDenied)
+    }
+    async fn rename(&self, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
+        Err(SmbError::AccessDenied)
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            is_read_only: true,
+            case_sensitive: false,
+        }
+    }
+}
+
 /// 直近更新の読取専用ビュー（v2 stub）。
 pub struct RecentBackend {
     #[allow(dead_code)]

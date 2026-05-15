@@ -57,6 +57,8 @@ id_newtype!(/// グループ。
 GroupId);
 id_newtype!(/// アクター（編集操作の主体）。CRDT の `actor_id` に対応。
 ActorId);
+id_newtype!(/// 保存クエリ（Shareable Path）。
+SavedQueryId);
 
 /// Blob のコンテンツアドレス（SHA-256 を想定）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -129,6 +131,26 @@ pub struct Series {
     pub id: SeriesId,
     pub name: String,
     pub description: Option<String>,
+}
+
+/// クエリ条件。v1 では AND/NOT のタグフィルタのみ。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryDef {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags_and: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags_not: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub id: SavedQueryId,
+    pub name: String,
+    pub query: QueryDef,
+    pub description: Option<String>,
+    pub created_by: Option<UserId>,
+    pub created_at: time::OffsetDateTime,
+    pub expires_at: Option<time::OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
