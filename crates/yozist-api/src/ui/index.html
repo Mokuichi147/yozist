@@ -88,12 +88,31 @@
     <div class="card">
       <h2>files <span class="small" id="files-count"></span></h2>
       <div id="file-filter" class="small" style="margin-bottom:8px"></div>
+      <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center">
+        <input id="upload-name" placeholder="新規ファイル名 (例: memo.md)" style="flex:1">
+        <textarea id="upload-content" placeholder="本文 (省略可)" style="width:100%; min-height:60px; flex-basis:100%"></textarea>
+        <input type="file" id="upload-file" style="font-size:11px">
+        <button class="primary" onclick="doUpload()">登録</button>
+      </div>
       <ul class="list" id="file-list"></ul>
     </div>
     <div class="card" id="file-detail" style="display:none">
       <h2 id="fd-name">…</h2>
       <div id="fd-meta" class="small"></div>
       <div id="fd-tags" style="margin: 8px 0"></div>
+      <div style="display:flex; gap:6px; margin: 6px 0">
+        <button onclick="issueShare()">共有URLを発行</button>
+        <button onclick="toggleEdit()">編集</button>
+      </div>
+      <div id="fd-share" class="small" style="word-break:break-all; margin:6px 0"></div>
+      <div id="fd-editor" style="display:none; margin:6px 0">
+        <textarea id="fd-edit-textarea" style="width:100%; min-height:200px; font-family:monospace; font-size:12px"></textarea>
+        <div style="display:flex; gap:6px; margin-top:6px">
+          <input id="fd-edit-message" placeholder="コミットメッセージ (任意)" style="flex:1">
+          <button class="primary" onclick="saveEdit()">保存</button>
+          <button onclick="toggleEdit()">キャンセル</button>
+        </div>
+      </div>
       <details><summary>content</summary><pre id="fd-content">…</pre></details>
       <details><summary>history</summary><pre id="fd-history">…</pre></details>
     </div>
@@ -224,15 +243,22 @@ async function loadFiles() {
   });
 }
 
+let currentFile = null;
+let currentContent = '';
+
 async function showFile(f) {
+  currentFile = f;
   $('file-detail').style.display = 'block';
   $('fd-name').textContent = f.display_name;
   $('fd-meta').textContent = `id=${f.id}, size=${f.size}B, current_commit=${f.current_commit}`;
+  $('fd-share').textContent = '';
+  $('fd-editor').style.display = 'none';
   const [tags, content, history] = await Promise.all([
     json(`/api/files/${f.id}/tags`),
     api(`/api/files/${f.id}/content`).then(r => r.text()),
     json(`/api/files/${f.id}/history`),
   ]);
+  currentContent = content;
   $('fd-tags').innerHTML = tags.map(t =>
     `<span class="tag-chip ${t.kind}">${escape(t.name)}</span>`
   ).join('') || '<span class="small empty">タグなし</span>';
@@ -240,6 +266,68 @@ async function showFile(f) {
   $('fd-history').textContent = history.map(c =>
     `${c.timestamp} ${c.format_id} blob=${c.blob.slice(0, 12)}… message=${c.message || ''}`
   ).join('\n');
+}
+
+async function doUpload() {
+  const fileInput = $('upload-file');
+  let name = $('upload-name').value.trim();
+  let body;
+  if (fileInput.files.length > 0) {
+    const f = fileInput.files[0];
+    if (!name) name = f.name;
+    body = await f.arrayBuffer();
+  } else {
+    if (!name) return alert('ファイル名 or アップロードファイルを指定してください');
+    body = new TextEncoder().encode($('upload-content').value || '').buffer;
+  }
+  const r = await api('/api/files?name=' + encodeURIComponent(name), {
+    method: 'POST',
+    body,
+    headers: { 'content-type': 'application/octet-stream' },
+  });
+  if (!r.ok) return alert('登録失敗: ' + await r.text());
+  $('upload-name').value = '';
+  $('upload-content').value = '';
+  fileInput.value = '';
+  await refresh();
+}
+
+function toggleEdit() {
+  const ed = $('fd-editor');
+  if (ed.style.display === 'none') {
+    $('fd-edit-textarea').value = currentContent;
+    $('fd-edit-message').value = '';
+    ed.style.display = 'block';
+  } else {
+    ed.style.display = 'none';
+  }
+}
+
+async function saveEdit() {
+  if (!currentFile) return;
+  const newContent = $('fd-edit-textarea').value;
+  const msg = $('fd-edit-message').value;
+  const url = `/api/files/${currentFile.id}/content` + (msg ? `?message=${encodeURIComponent(msg)}` : '');
+  const r = await api(url, {
+    method: 'POST',
+    body: new TextEncoder().encode(newContent).buffer,
+    headers: { 'content-type': 'application/octet-stream' },
+  });
+  if (!r.ok) return alert('保存失敗: ' + await r.text());
+  await showFile(currentFile);
+  await refresh();
+}
+
+async function issueShare() {
+  if (!currentFile) return;
+  const ttl = prompt('有効秒数を入力してください', '3600');
+  if (!ttl) return;
+  const r = await json(`/api/files/${currentFile.id}/share`, {
+    method: 'POST',
+    body: { ttl_secs: parseInt(ttl, 10) },
+  });
+  const fullUrl = location.origin + r.url;
+  $('fd-share').innerHTML = `共有URL (${ttl}秒): <a href="${fullUrl}" target="_blank">${fullUrl}</a>`;
 }
 
 function escape(s) {
