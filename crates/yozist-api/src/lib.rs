@@ -30,6 +30,8 @@ use yozist_auth::{
     AuthContext, AuthService, AuthToken, Authorizer, DbAuthorizer, Permission, PermissionMask,
     Subject, Target,
 };
+
+pub mod ui;
 use yozist_core::{
     ActorId, FileId, FileMeta, Series, SeriesId, SeriesMember, Tag, TagId, TagKind, UserId,
 };
@@ -50,6 +52,8 @@ pub struct ApiState {
 /// ルーター生成。
 pub fn router(state: ApiState) -> Router {
     Router::new()
+        .nest("/ui", ui::router())
+        .route("/", get(redirect_to_ui))
         .route("/health", get(health))
         .route("/api/files", get(list_files).post(create_file))
         .route("/api/files/:id", get(get_file))
@@ -171,6 +175,10 @@ struct Health {
 
 async fn health() -> Json<Health> {
     Json(Health { status: "ok" })
+}
+
+async fn redirect_to_ui() -> axum::response::Redirect {
+    axum::response::Redirect::permanent("/ui")
 }
 
 // ---------------------------------------------------------------------------
