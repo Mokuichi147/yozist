@@ -132,6 +132,10 @@
       <details><summary>history</summary><pre id="fd-history">…</pre></details>
     </div>
     <div class="card">
+      <h2>groups <button onclick="createGroup()" style="float:right; font-size:11px">+ 新規</button></h2>
+      <div id="group-list" class="small">…</div>
+    </div>
+    <div class="card">
       <h2>saved queries <button onclick="createQuery()" style="float:right; font-size:11px">+ 新規</button></h2>
       <div id="query-list" class="small">…</div>
     </div>
@@ -212,7 +216,73 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadTags(), loadSeries(), loadFiles(), loadShares(), loadAudit(), loadQueries()]);
+  await Promise.all([loadTags(), loadSeries(), loadFiles(), loadShares(), loadAudit(), loadQueries(), loadGroups()]);
+}
+
+async function loadGroups() {
+  const el = $('group-list');
+  try {
+    const list = await json('/api/groups');
+    const byId = Object.fromEntries(list.map(g => [g.id, g]));
+    if (list.length === 0) { el.innerHTML = '<div class="empty">グループなし</div>'; return; }
+    el.innerHTML = list.map(g => {
+      const parent = g.parent_id ? ` <span class="small">⊂ ${escape(byId[g.parent_id]?.name || '?')}</span>` : '';
+      return `<div class="row">
+        <strong>${escape(g.name)}</strong>${parent}
+        <button style="float:right;font-size:10px;margin-left:4px" onclick="manageGroupMembers('${g.id}','${escape(g.name)}')">メンバー</button>
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+}
+
+async function createGroup() {
+  const name = prompt('グループ名');
+  if (!name) return;
+  const groups = await json('/api/groups');
+  const parentPrompt = groups.length === 0
+    ? null
+    : prompt(`親グループ番号 (0=なし):\n0: (なし)\n` + groups.map((g, i) => `${i + 1}: ${g.name}`).join('\n'), '0');
+  const parentIdx = parseInt(parentPrompt || '0', 10);
+  const body = { name };
+  if (parentIdx > 0 && parentIdx <= groups.length) {
+    body.parent_id = groups[parentIdx - 1].id;
+  }
+  await json('/api/groups', { method: 'POST', body });
+  await loadGroups();
+}
+
+async function manageGroupMembers(groupId, groupName) {
+  const [members, users] = await Promise.all([
+    json(`/api/groups/${groupId}/members`),
+    json('/api/users'),
+  ]);
+  const usersById = Object.fromEntries(users.map(u => [u.id, u.username]));
+  const memberNames = members.map(uid => usersById[uid] || uid.slice(0, 8)).join(', ') || '(なし)';
+  const action = prompt(
+    `グループ "${groupName}" メンバー:\n${memberNames}\n\n` +
+    `1: ユーザー追加\n2: ユーザー除外\nそれ以外: キャンセル`,
+    '1'
+  );
+  if (action === '1') {
+    const list = users.map((u, i) => `${i + 1}: ${u.username}`).join('\n');
+    const sel = prompt(`追加するユーザー番号:\n${list}`, '1');
+    const idx = parseInt(sel || '0', 10) - 1;
+    if (idx < 0 || idx >= users.length) return;
+    await api(`/api/groups/${groupId}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ user_id: users[idx].id }),
+      headers: { 'content-type': 'application/json' },
+    });
+    alert('追加しました');
+  } else if (action === '2') {
+    if (members.length === 0) return alert('メンバーがいません');
+    const list = members.map((uid, i) => `${i + 1}: ${usersById[uid] || uid.slice(0, 8)}`).join('\n');
+    const sel = prompt(`除外するメンバー番号:\n${list}`, '1');
+    const idx = parseInt(sel || '0', 10) - 1;
+    if (idx < 0 || idx >= members.length) return;
+    await api(`/api/groups/${groupId}/members/${members[idx]}`, { method: 'DELETE' });
+    alert('除外しました');
+  }
 }
 
 async function loadQueries() {

@@ -102,6 +102,14 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/auth/me", get(me))
         .route("/api/users", get(list_users))
         .route("/api/groups", get(list_groups).post(create_group))
+        .route(
+            "/api/groups/:id/members",
+            get(list_group_members).post(add_group_member),
+        )
+        .route(
+            "/api/groups/:id/members/:user_id",
+            axum::routing::delete(remove_group_member),
+        )
         .with_state(state)
 }
 
@@ -1422,6 +1430,93 @@ async fn list_groups(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(groups))
+}
+
+#[derive(Deserialize)]
+struct AddGroupMemberInput {
+    user_id: String,
+}
+
+async fn list_group_members(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<UserId>>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let group_id = uuid::Uuid::parse_str(&id)
+        .map(yozist_core::GroupId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("group id: {e}")))?;
+    let members = s
+        .share_admin
+        .group_members(&group_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(members))
+}
+
+async fn add_group_member(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<AddGroupMemberInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let group_id = uuid::Uuid::parse_str(&id)
+        .map(yozist_core::GroupId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("group id: {e}")))?;
+    let user_id = uuid::Uuid::parse_str(&input.user_id)
+        .map(yozist_core::UserId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("user id: {e}")))?;
+    let res = s
+        .auth
+        .add_user_to_group(user_id, group_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let meta = format!("{{\"user_id\":\"{}\"}}", input.user_id);
+    audit_event(
+        &s,
+        &ctx,
+        "add_group_member",
+        Some("group"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_group_member(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let group_id = uuid::Uuid::parse_str(&id)
+        .map(yozist_core::GroupId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("group id: {e}")))?;
+    let user_uuid = uuid::Uuid::parse_str(&user_id)
+        .map(yozist_core::UserId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("user id: {e}")))?;
+    let res = s
+        .share_admin
+        .remove_user_from_group(&user_uuid, &group_id)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let meta = format!("{{\"user_id\":\"{}\"}}", user_id);
+    audit_event(
+        &s,
+        &ctx,
+        "remove_group_member",
+        Some("group"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn create_group(

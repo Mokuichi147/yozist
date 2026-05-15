@@ -452,6 +452,36 @@ impl SqliteAuthService {
         }
         Ok(())
     }
+
+    /// グループからユーザーを除外する。
+    pub async fn remove_user_from_group(
+        &self,
+        user: &UserId,
+        group: &GroupId,
+    ) -> Result<(), AuthError> {
+        sqlx::query("DELETE FROM user_groups WHERE user_id = ? AND group_id = ?")
+            .bind(user.to_string())
+            .bind(group.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// グループの直接メンバー（親グループ経由は含まない）。
+    pub async fn group_members(&self, group: &GroupId) -> Result<Vec<UserId>, AuthError> {
+        let rows = sqlx::query("SELECT user_id FROM user_groups WHERE group_id = ?")
+            .bind(group.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                let s: String = r.try_get("user_id")?;
+                Uuid::parse_str(&s)
+                    .map(UserId::from_uuid)
+                    .map_err(|e| AuthError::Other(format!("uuid: {e}")))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
