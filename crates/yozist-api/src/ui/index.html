@@ -100,6 +100,14 @@
       <h2 id="fd-name">…</h2>
       <div id="fd-meta" class="small"></div>
       <div id="fd-tags" style="margin: 8px 0"></div>
+      <div style="display:flex; gap:6px; margin:6px 0">
+        <input id="fd-add-tag" placeholder="タグ名を入力して追加" style="flex:1">
+        <button onclick="addTagToCurrent()">+ タグ</button>
+      </div>
+      <div style="display:flex; gap:6px; margin:6px 0">
+        <select id="fd-add-series" style="flex:1"><option value="">シリーズ選択…</option></select>
+        <button onclick="addToSeries()">+ シリーズ</button>
+      </div>
       <div style="display:flex; gap:6px; margin: 6px 0">
         <button onclick="issueShare()">共有URLを発行</button>
         <button onclick="toggleEdit()">編集</button>
@@ -115,6 +123,14 @@
       </div>
       <details><summary>content</summary><pre id="fd-content">…</pre></details>
       <details><summary>history</summary><pre id="fd-history">…</pre></details>
+    </div>
+    <div class="card">
+      <h2>active shares <button onclick="loadShares()" style="float:right; font-size:11px">refresh</button></h2>
+      <div id="share-list" class="small">…</div>
+    </div>
+    <div class="card">
+      <h2>audit log <button onclick="loadAudit()" style="float:right; font-size:11px">refresh</button></h2>
+      <div id="audit-list" class="small">…</div>
     </div>
   </div>
 </div>
@@ -184,7 +200,7 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadTags(), loadSeries(), loadFiles()]);
+  await Promise.all([loadTags(), loadSeries(), loadFiles(), loadShares(), loadAudit()]);
 }
 
 async function loadTags() {
@@ -209,17 +225,77 @@ async function loadSeries() {
   const list = await fetch('/api/series').then(r => r.json());
   const el = $('series-list');
   el.innerHTML = '';
-  if (list.length === 0) { el.innerHTML = '<div class="empty">シリーズなし</div>'; return; }
-  list.forEach(s => {
-    const li = document.createElement('li');
-    li.textContent = s.name;
-    li.title = s.description || '';
-    li.onclick = async () => {
-      const members = await fetch('/api/series/' + s.id + '/members').then(r => r.json());
-      alert(`series "${s.name}" メンバー数 ${members.length}`);
-    };
-    el.appendChild(li);
-  });
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty">シリーズなし</div>';
+  } else {
+    list.forEach(s => {
+      const li = document.createElement('li');
+      li.textContent = s.name;
+      li.title = s.description || '';
+      li.onclick = async () => {
+        const members = await fetch('/api/series/' + s.id + '/members').then(r => r.json());
+        alert(`series "${s.name}"\nメンバー: ${members.length}件\n` + members.map(m =>
+          `[${m.order_index}] ${m.file_id.slice(0,8)}…`).join('\n'));
+      };
+      el.appendChild(li);
+    });
+  }
+  // 「+ 新規シリーズ」ボタンを末尾に追加
+  const add = document.createElement('li');
+  add.style.fontSize = '11px';
+  add.innerHTML = '<a href="#" style="color:#0070f3">+ 新規シリーズ</a>';
+  add.onclick = async (e) => {
+    e.preventDefault();
+    const name = prompt('シリーズ名');
+    if (!name) return;
+    await json('/api/series', { method: 'POST', body: { name } });
+    await refresh();
+  };
+  el.appendChild(add);
+
+  // file-detail の select 更新
+  const sel = $('fd-add-series');
+  if (sel) {
+    sel.innerHTML = '<option value="">シリーズ選択…</option>' +
+      list.map(s => `<option value="${s.id}">${escape(s.name)}</option>`).join('');
+  }
+}
+
+async function loadShares() {
+  const el = $('share-list');
+  try {
+    const list = await json('/api/shares');
+    if (list.length === 0) { el.innerHTML = '<div class="empty">発行済み共有なし</div>'; return; }
+    el.innerHTML = list.map(s => {
+      const revoked = s.revoked_at ? ' <span style="color:#c00">[失効]</span>' : '';
+      const fullJti = s.jti;
+      return `<div class="row">
+        ${s.kind} / ${s.target_id.slice(0,8)}…
+        ${revoked}
+        ${!s.revoked_at ? `<button style="float:right;font-size:10px" onclick="revokeShare('${fullJti}')">失効</button>` : ''}
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+}
+
+async function revokeShare(jti) {
+  if (!confirm('失効しますか？')) return;
+  const r = await api(`/api/shares/${jti}`, { method: 'DELETE' });
+  if (!r.ok) return alert('失効失敗');
+  await loadShares();
+}
+
+async function loadAudit() {
+  const el = $('audit-list');
+  try {
+    const list = await json('/api/audit?limit=15');
+    if (list.length === 0) { el.innerHTML = '<div class="empty">監査記録なし</div>'; return; }
+    el.innerHTML = list.map(a => {
+      const status = a.result.startsWith('ok') ? '✓' : '✗';
+      const time = a.timestamp.replace('T',' ').slice(0,19);
+      return `<div class="row">${status} ${time} ${a.actor_label || '-'} ${a.action} ${a.target_type || ''} ${a.target_ref ? a.target_ref.slice(0,8)+'…' : ''}</div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
 }
 
 async function loadFiles() {
@@ -260,7 +336,9 @@ async function showFile(f) {
   ]);
   currentContent = content;
   $('fd-tags').innerHTML = tags.map(t =>
-    `<span class="tag-chip ${t.kind}">${escape(t.name)}</span>`
+    `<span class="tag-chip ${t.kind}">${escape(t.name)}
+      <a href="#" style="color:#c00; margin-left:4px" onclick="event.preventDefault(); detachTagFromCurrent('${t.id}')">×</a>
+    </span>`
   ).join('') || '<span class="small empty">タグなし</span>';
   $('fd-content').textContent = content.length > 5000 ? content.slice(0, 5000) + '\n…' : content;
   $('fd-history').textContent = history.map(c =>
@@ -316,6 +394,41 @@ async function saveEdit() {
   if (!r.ok) return alert('保存失敗: ' + await r.text());
   await showFile(currentFile);
   await refresh();
+}
+
+async function addTagToCurrent() {
+  if (!currentFile) return;
+  const name = $('fd-add-tag').value.trim();
+  if (!name) return;
+  // 既存タグなら upsert で同じID返る、新規でも作成される
+  const created = await json('/api/tags', { method: 'POST', body: { name } });
+  const r = await api(`/api/files/${currentFile.id}/tags`, {
+    method: 'POST', body: JSON.stringify({ tag_id: created.id }),
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!r.ok) return alert('タグ追加失敗: ' + await r.text());
+  $('fd-add-tag').value = '';
+  await showFile(currentFile);
+  await loadTags();
+}
+
+async function detachTagFromCurrent(tagId) {
+  if (!currentFile) return;
+  const r = await api(`/api/files/${currentFile.id}/tags/${tagId}`, { method: 'DELETE' });
+  if (!r.ok) return alert('タグ取り外し失敗');
+  await showFile(currentFile);
+  await loadTags();
+}
+
+async function addToSeries() {
+  if (!currentFile) return;
+  const sid = $('fd-add-series').value;
+  if (!sid) return alert('シリーズを選択してください');
+  await json(`/api/series/${sid}/members`, {
+    method: 'POST',
+    body: { file_id: currentFile.id },
+  });
+  alert('追加しました');
 }
 
 async function issueShare() {
