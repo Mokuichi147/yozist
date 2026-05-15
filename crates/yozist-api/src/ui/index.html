@@ -110,6 +110,7 @@
       </div>
       <div style="display:flex; gap:6px; margin: 6px 0">
         <button onclick="issueShare()">共有URLを発行</button>
+        <button onclick="grantPermission()">権限付与</button>
         <button onclick="toggleEdit()">編集</button>
         <button style="color:#c00; border-color:#c00" onclick="deleteCurrentFile()">削除</button>
       </div>
@@ -124,6 +125,10 @@
       </div>
       <details><summary>content</summary><pre id="fd-content">…</pre></details>
       <details><summary>history</summary><pre id="fd-history">…</pre></details>
+    </div>
+    <div class="card">
+      <h2>saved queries <button onclick="createQuery()" style="float:right; font-size:11px">+ 新規</button></h2>
+      <div id="query-list" class="small">…</div>
     </div>
     <div class="card">
       <h2>active shares <button onclick="loadShares()" style="float:right; font-size:11px">refresh</button></h2>
@@ -201,7 +206,91 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadTags(), loadSeries(), loadFiles(), loadShares(), loadAudit()]);
+  await Promise.all([loadTags(), loadSeries(), loadFiles(), loadShares(), loadAudit(), loadQueries()]);
+}
+
+async function loadQueries() {
+  const el = $('query-list');
+  try {
+    const list = await fetch('/api/queries').then(r => r.json());
+    if (list.length === 0) { el.innerHTML = '<div class="empty">保存クエリなし</div>'; return; }
+    el.innerHTML = list.map(q => {
+      const cond = [];
+      if (q.query.tags_and && q.query.tags_and.length) cond.push('AND: ' + q.query.tags_and.join(','));
+      if (q.query.tags_not && q.query.tags_not.length) cond.push('NOT: ' + q.query.tags_not.join(','));
+      return `<div class="row">
+        <strong>${escape(q.name)}</strong> <span class="small">${cond.join(' / ') || '全件'}</span>
+        <button style="float:right;font-size:10px;margin-left:4px" onclick="deleteQuery('${q.id}')">削除</button>
+        <button style="float:right;font-size:10px;margin-left:4px" onclick="shareQuery('${q.id}','${escape(q.name)}')">共有</button>
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+}
+
+async function createQuery() {
+  const name = prompt('保存クエリ名');
+  if (!name) return;
+  const tagsAnd = prompt('AND タグ (カンマ区切り、空可)', '');
+  const tagsNot = prompt('NOT タグ (カンマ区切り、空可)', '');
+  const body = {
+    name,
+    tags_and: tagsAnd ? tagsAnd.split(',').map(s => s.trim()).filter(Boolean) : [],
+    tags_not: tagsNot ? tagsNot.split(',').map(s => s.trim()).filter(Boolean) : [],
+  };
+  await json('/api/queries', { method: 'POST', body });
+  await loadQueries();
+}
+
+async function deleteQuery(id) {
+  if (!confirm('削除しますか？')) return;
+  await api(`/api/queries/${id}`, { method: 'DELETE' });
+  await loadQueries();
+}
+
+async function shareQuery(id, name) {
+  const ttl = prompt(`"${name}" の共有URL TTL (秒)`, '3600');
+  if (!ttl) return;
+  const r = await json(`/api/queries/${id}/share`, {
+    method: 'POST',
+    body: { ttl_secs: parseInt(ttl, 10) },
+  });
+  const fullUrl = location.origin + r.url;
+  prompt('クエリ共有URL (コピーしてください):', fullUrl);
+  await loadShares();
+}
+
+async function grantPermission() {
+  if (!currentFile) return;
+  const users = await json('/api/users');
+  if (users.length === 0) return alert('ユーザーが存在しません');
+  const userListStr = users.map((u, i) => `${i + 1}: ${u.username}`).join('\n');
+  const sel = prompt(`権限を付与するユーザー番号:\n${userListStr}`, '1');
+  if (!sel) return;
+  const idx = parseInt(sel, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= users.length) return alert('無効な選択');
+  const target = users[idx];
+
+  const maskStr = prompt(
+    '権限マスク (VIEW=1 READ=2 WRITE=4 ADMIN=8 を合算):\nread=3, write=7, admin=15',
+    '3'
+  );
+  if (!maskStr) return;
+  const mask = parseInt(maskStr, 10);
+  if (isNaN(mask)) return alert('無効なマスク');
+
+  const allow = confirm('OK=allow / Cancel=deny');
+
+  await json('/api/acl', {
+    method: 'POST',
+    body: {
+      subject: `user:${target.id}`,
+      target: `file:${currentFile.id}`,
+      mask,
+      allow,
+      priority: 10,
+    },
+  });
+  alert(`付与しました: ${target.username} に ${allow ? 'allow' : 'deny'} mask=${mask}`);
 }
 
 async function loadTags() {

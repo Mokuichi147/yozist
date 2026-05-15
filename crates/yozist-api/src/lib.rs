@@ -99,6 +99,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
         .route("/api/auth/me", get(me))
+        .route("/api/users", get(list_users))
         .with_state(state)
 }
 
@@ -1330,6 +1331,19 @@ async fn login(
 struct MeResponse {
     user: Option<yozist_auth::User>,
     anonymous: bool,
+}
+
+async fn list_users(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<Vec<yozist_auth::User>>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let users = s
+        .auth
+        .list_users()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(users))
 }
 
 async fn me(AuthCtx(ctx): AuthCtx) -> Json<MeResponse> {
