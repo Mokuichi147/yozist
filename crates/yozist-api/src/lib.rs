@@ -36,7 +36,7 @@ use yozist_core::{
     ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
 };
-use yozist_db::SharedMetaStore;
+use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
 use yozist_versioning::VersioningEngine;
 
 /// API ハンドラが共有する状態。
@@ -49,6 +49,8 @@ pub struct ApiState {
     pub authz: Arc<dyn Authorizer>,
     /// ACL ルール CRUD 用の具象参照（同じインスタンスを `authz` と共有）。
     pub acl_admin: Arc<DbAuthorizer>,
+    /// 監査ログ（REST/SMB/WebUI 全経路から書き込まれる）。
+    pub audit: SharedAuditLog,
 }
 
 /// ルーター生成。
@@ -88,6 +90,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/queries/:id/share", post(issue_query_share))
         .route("/api/shared/:token", get(get_shared))
         .route("/api/shared/:token/files", get(list_shared_files))
+        .route("/api/audit", get(list_audit))
         .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
@@ -216,11 +219,35 @@ async fn create_file(
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
     require_authenticated(&ctx).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
-    let (file, _commit) = s
+    let name_for_audit = q.name.clone();
+    let result = s
         .engine
         .create_file(q.name, &body, actor, None)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()));
+
+    let (actor_id, actor_label) = actor_info(&ctx);
+    let target_ref = result.as_ref().ok().map(|(f, _)| f.id.to_string());
+    let metadata = format!("{{\"name\":\"{}\"}}", name_for_audit);
+    let result_str = match &result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("{e:?}"),
+    };
+    audit_record(
+        &s.audit,
+        AuditRecord {
+            actor_id: actor_id.as_deref(),
+            actor_label: actor_label.as_deref(),
+            action: "create_file",
+            target_type: Some("file"),
+            target_ref: target_ref.as_deref(),
+            metadata_json: Some(&metadata),
+            result: &result_str,
+        },
+    )
+    .await;
+
+    let (file, _commit) = result?;
 
     // オーナー（作成者）に ADMIN 権限を自動付与。これにより以後 ACL rule を
     // 追加しても作成者は自分のファイルへ常にアクセス可能。
@@ -287,12 +314,33 @@ async fn commit_file(
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
-    let commit = s
+    let result = s
         .engine
         .commit(id, &body, actor, q.message)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(commit))
+        .map_err(|e| ApiError::Internal(e.to_string()));
+
+    let id_str = id.to_string();
+    let (actor_id, actor_label) = actor_info(&ctx);
+    let result_str = match &result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("{e:?}"),
+    };
+    audit_record(
+        &s.audit,
+        AuditRecord {
+            actor_id: actor_id.as_deref(),
+            actor_label: actor_label.as_deref(),
+            action: "commit",
+            target_type: Some("file"),
+            target_ref: Some(&id_str),
+            metadata_json: None,
+            result: &result_str,
+        },
+    )
+    .await;
+
+    Ok(Json(result?))
 }
 
 async fn history(
@@ -725,6 +773,50 @@ pub async fn resolve_query(
 }
 
 // ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: u32,
+}
+
+fn default_audit_limit() -> u32 {
+    100
+}
+
+async fn list_audit(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Query(q): Query<AuditQuery>,
+) -> Result<Json<Vec<yozist_db::AuditEntry>>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let entries = s
+        .audit
+        .recent(q.limit)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(entries))
+}
+
+fn actor_info(ctx: &AuthContext) -> (Option<String>, Option<String>) {
+    match ctx {
+        AuthContext::Anonymous => (None, Some("anonymous".into())),
+        AuthContext::System => (None, Some("system".into())),
+        AuthContext::User { user, .. } => {
+            (Some(user.id.to_string()), Some(user.username.clone()))
+        }
+    }
+}
+
+async fn audit_record(audit: &SharedAuditLog, r: AuditRecord<'_>) {
+    if let Err(e) = audit.record(&r).await {
+        tracing::warn!(error = %e, action = r.action, "audit write failed");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared URL (期限付きトークン)
 // ---------------------------------------------------------------------------
 
@@ -1090,8 +1182,9 @@ mod tests {
         let auth: Arc<dyn AuthService> = Arc::new(
             yozist_auth::SqliteAuthService::new(pool.clone(), b"test".to_vec()),
         );
-        let db_authz = Arc::new(DbAuthorizer::new(pool));
+        let db_authz = Arc::new(DbAuthorizer::new(pool.clone()));
         let authz: Arc<dyn Authorizer> = db_authz.clone();
+        let audit = Arc::new(yozist_db::AuditLog::new(pool));
         (
             ApiState {
                 meta,
@@ -1099,6 +1192,7 @@ mod tests {
                 auth,
                 authz,
                 acl_admin: db_authz,
+                audit,
             },
             dir,
         )

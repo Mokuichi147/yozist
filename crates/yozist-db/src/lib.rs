@@ -19,7 +19,9 @@ use yozist_core::{
     TagId,
 };
 
+pub mod audit;
 pub mod sqlite;
+pub use audit::{AuditEntry, AuditLog, AuditRecord, SharedAuditLog};
 pub use sqlite::SqliteMetaStore;
 
 /// メタデータ保存の統一インターフェース。

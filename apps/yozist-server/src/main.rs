@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 
 use yozist_api::ApiState;
 use yozist_auth::{AuthService, Authorizer, DbAuthorizer, SqliteAuthService};
-use yozist_db::{SharedMetaStore, SqliteMetaStore};
+use yozist_db::{AuditLog, SharedMetaStore, SqliteMetaStore};
 use yozist_smb::{ShareDeps, SmbConfig};
 use yozist_storage::{FsBlobStore, SharedBlobStore};
 use yozist_versioning::{CrdtRegistry, VersioningEngine};
@@ -103,15 +103,17 @@ async fn main() -> anyhow::Result<()> {
             let auth: Arc<dyn AuthService> =
                 Arc::new(SqliteAuthService::new(pool.clone(), secret));
 
-            let db_authz = Arc::new(DbAuthorizer::new(pool));
+            let db_authz = Arc::new(DbAuthorizer::new(pool.clone()));
             let authz: Arc<dyn Authorizer> = db_authz.clone();
 
+            let audit = Arc::new(AuditLog::new(pool.clone()));
             let state = ApiState {
                 meta: meta.clone(),
                 engine: engine.clone(),
                 auth: auth.clone(),
                 authz: authz.clone(),
                 acl_admin: db_authz.clone(),
+                audit: audit.clone(),
             };
             let app = yozist_api::router(state);
 
