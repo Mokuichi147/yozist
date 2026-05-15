@@ -30,13 +30,24 @@ pub trait MetaStore: Send + Sync {
 
     // ---- tags ----
     async fn upsert_tag(&self, tag: &Tag) -> Result<TagId, DbError>;
+    async fn get_tag(&self, id: &TagId) -> Result<Option<Tag>, DbError>;
+    async fn get_tag_by_name(&self, name: &str) -> Result<Option<Tag>, DbError>;
+    async fn list_tags(&self) -> Result<Vec<Tag>, DbError>;
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn detach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
+    async fn list_tags_of(&self, file: &FileId) -> Result<Vec<Tag>, DbError>;
     async fn list_files_by_tags(&self, tags: &[TagId]) -> Result<Vec<FileMeta>, DbError>;
 
     // ---- series ----
     async fn upsert_series(&self, series: &Series) -> Result<SeriesId, DbError>;
+    async fn get_series(&self, id: &SeriesId) -> Result<Option<Series>, DbError>;
+    async fn list_series(&self) -> Result<Vec<Series>, DbError>;
     async fn add_to_series(&self, member: &SeriesMember) -> Result<(), DbError>;
+    async fn remove_from_series(
+        &self,
+        series: &SeriesId,
+        file: &FileId,
+    ) -> Result<(), DbError>;
     async fn list_series_members(&self, series: &SeriesId) -> Result<Vec<SeriesMember>, DbError>;
 
     // ---- commits ----

@@ -121,6 +121,30 @@ fn tag_kind_str(k: TagKind) -> &'static str {
     }
 }
 
+fn row_to_tag(row: SqliteRow) -> Result<Tag, DbError> {
+    let id: String = row.try_get("id")?;
+    let name: String = row.try_get("name")?;
+    let kind: String = row.try_get("kind")?;
+    let confidence: Option<f32> = row.try_get("confidence")?;
+    Ok(Tag {
+        id: TagId::from_uuid(parse_uuid(&id)?),
+        name,
+        kind: parse_tag_kind(&kind)?,
+        confidence,
+    })
+}
+
+fn row_to_series(row: SqliteRow) -> Result<Series, DbError> {
+    let id: String = row.try_get("id")?;
+    let name: String = row.try_get("name")?;
+    let description: Option<String> = row.try_get("description")?;
+    Ok(Series {
+        id: SeriesId::from_uuid(parse_uuid(&id)?),
+        name,
+        description,
+    })
+}
+
 fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let id: String = row.try_get("id")?;
     let file_id: String = row.try_get("file_id")?;
@@ -249,6 +273,43 @@ impl MetaStore for SqliteMetaStore {
         Ok(tag.id)
     }
 
+    async fn get_tag(&self, id: &TagId) -> Result<Option<Tag>, DbError> {
+        let row = sqlx::query("SELECT id, name, kind, confidence FROM tags WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_tag).transpose()
+    }
+
+    async fn get_tag_by_name(&self, name: &str) -> Result<Option<Tag>, DbError> {
+        let row = sqlx::query("SELECT id, name, kind, confidence FROM tags WHERE name = ?")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_tag).transpose()
+    }
+
+    async fn list_tags(&self) -> Result<Vec<Tag>, DbError> {
+        let rows = sqlx::query("SELECT id, name, kind, confidence FROM tags ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_tag).collect()
+    }
+
+    async fn list_tags_of(&self, file: &FileId) -> Result<Vec<Tag>, DbError> {
+        let rows = sqlx::query(
+            r#"SELECT t.id, t.name, t.kind, t.confidence
+               FROM tags t
+               JOIN file_tags ft ON ft.tag_id = t.id
+               WHERE ft.file_id = ?
+               ORDER BY t.name ASC"#,
+        )
+        .bind(file.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_tag).collect()
+    }
+
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError> {
         sqlx::query(
             r#"INSERT INTO file_tags (file_id, tag_id) VALUES (?, ?)
@@ -314,6 +375,34 @@ impl MetaStore for SqliteMetaStore {
             .execute(&self.pool)
             .await?;
         Ok(series.id)
+    }
+
+    async fn get_series(&self, id: &SeriesId) -> Result<Option<Series>, DbError> {
+        let row = sqlx::query("SELECT id, name, description FROM series WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(row_to_series).transpose()
+    }
+
+    async fn list_series(&self) -> Result<Vec<Series>, DbError> {
+        let rows = sqlx::query("SELECT id, name, description FROM series ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_series).collect()
+    }
+
+    async fn remove_from_series(
+        &self,
+        series: &SeriesId,
+        file: &FileId,
+    ) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM series_members WHERE series_id = ? AND file_id = ?")
+            .bind(series.to_string())
+            .bind(file.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn add_to_series(&self, member: &SeriesMember) -> Result<(), DbError> {

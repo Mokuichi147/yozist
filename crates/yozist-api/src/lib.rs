@@ -30,7 +30,9 @@ use yozist_auth::{
     AuthContext, AuthService, AuthToken, Authorizer, DbAuthorizer, Permission, PermissionMask,
     Subject, Target,
 };
-use yozist_core::{ActorId, FileId, FileMeta, Tag, TagId, TagKind, UserId};
+use yozist_core::{
+    ActorId, FileId, FileMeta, Series, SeriesId, SeriesMember, Tag, TagId, TagKind, UserId,
+};
 use yozist_db::SharedMetaStore;
 use yozist_versioning::VersioningEngine;
 
@@ -53,8 +55,23 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id", get(get_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
-        .route("/api/files/:id/tags", post(attach_tag))
-        .route("/api/tags", post(upsert_tag))
+        .route(
+            "/api/files/:id/tags",
+            get(list_file_tags).post(attach_tag),
+        )
+        .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
+        .route("/api/tags", get(list_tags).post(upsert_tag))
+        .route("/api/files/by-tags", get(list_files_by_tags))
+        .route("/api/series", get(list_series).post(create_series))
+        .route("/api/series/:id", get(get_series))
+        .route(
+            "/api/series/:id/members",
+            get(list_series_members).post(add_series_member),
+        )
+        .route(
+            "/api/series/:id/members/:file_id",
+            axum::routing::delete(remove_series_member),
+        )
         .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
@@ -285,6 +302,75 @@ struct TagCreated {
     id: TagId,
 }
 
+async fn list_tags(State(s): State<ApiState>) -> Result<Json<Vec<Tag>>, ApiError> {
+    let tags = s.meta.list_tags().await.map_err(ApiError::from_db)?;
+    Ok(Json(tags))
+}
+
+async fn list_file_tags(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(file_id): Path<String>,
+) -> Result<Json<Vec<Tag>>, ApiError> {
+    let file_id = parse_file_id(&file_id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(file_id), PermissionMask::VIEW).await?;
+    let tags = s.meta.list_tags_of(&file_id).await.map_err(ApiError::from_db)?;
+    Ok(Json(tags))
+}
+
+async fn detach_tag(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((file_id, tag_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let file_id = parse_file_id(&file_id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::File(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let tag_id = uuid::Uuid::parse_str(&tag_id)
+        .map(TagId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("tag_id: {e}")))?;
+    s.meta
+        .detach_tag(&file_id, &tag_id)
+        .await
+        .map_err(ApiError::from_db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ByTagsQuery {
+    /// カンマ区切り（タグ名 or タグ UUID）
+    tags: String,
+}
+
+async fn list_files_by_tags(
+    State(s): State<ApiState>,
+    Query(q): Query<ByTagsQuery>,
+) -> Result<Json<Vec<FileMeta>>, ApiError> {
+    let mut tag_ids = Vec::new();
+    for spec in q.tags.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        // UUID として解釈できればそのまま、できなければ名前として lookup。
+        if let Ok(u) = uuid::Uuid::parse_str(spec) {
+            tag_ids.push(TagId::from_uuid(u));
+        } else {
+            match s.meta.get_tag_by_name(spec).await.map_err(ApiError::from_db)? {
+                Some(t) => tag_ids.push(t.id),
+                None => return Ok(Json(vec![])), // 存在しないタグ → 空集合
+            }
+        }
+    }
+    let files = s
+        .meta
+        .list_files_by_tags(&tag_ids)
+        .await
+        .map_err(ApiError::from_db)?;
+    Ok(Json(files))
+}
+
 async fn upsert_tag(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
@@ -333,6 +419,139 @@ async fn attach_tag(
         .map_err(|e| ApiError::BadRequest(format!("tag_id: {e}")))?;
     s.meta
         .attach_tag(&file_id, &tag_id)
+        .await
+        .map_err(ApiError::from_db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Series
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateSeriesInput {
+    name: String,
+    description: Option<String>,
+}
+
+async fn list_series(State(s): State<ApiState>) -> Result<Json<Vec<Series>>, ApiError> {
+    let list = s.meta.list_series().await.map_err(ApiError::from_db)?;
+    Ok(Json(list))
+}
+
+async fn create_series(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<CreateSeriesInput>,
+) -> Result<(StatusCode, Json<Series>), ApiError> {
+    require_authenticated(&ctx).await?;
+    let series = Series {
+        id: SeriesId::new(),
+        name: input.name,
+        description: input.description,
+    };
+    let id = s.meta.upsert_series(&series).await.map_err(ApiError::from_db)?;
+    let saved = Series { id, ..series };
+    Ok((StatusCode::CREATED, Json(saved)))
+}
+
+async fn get_series(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Series>, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let series = s
+        .meta
+        .get_series(&id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(series))
+}
+
+#[derive(Deserialize)]
+struct AddMemberInput {
+    file_id: String,
+    /// 未指定なら末尾追加（最大 +1.0）
+    order_index: Option<f64>,
+}
+
+async fn list_series_members(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<SeriesMember>>, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let members = s
+        .meta
+        .list_series_members(&id)
+        .await
+        .map_err(ApiError::from_db)?;
+    Ok(Json(members))
+}
+
+async fn add_series_member(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<AddMemberInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let series_id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let file_id = parse_file_id(&input.file_id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::File(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let order_index = match input.order_index {
+        Some(v) => v,
+        None => {
+            let existing = s
+                .meta
+                .list_series_members(&series_id)
+                .await
+                .map_err(ApiError::from_db)?;
+            existing.last().map(|m| m.order_index + 1.0).unwrap_or(10.0)
+        }
+    };
+    s.meta
+        .add_to_series(&SeriesMember {
+            series_id,
+            file_id,
+            order_index,
+        })
+        .await
+        .map_err(ApiError::from_db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_series_member(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((series_id, file_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let series_id = uuid::Uuid::parse_str(&series_id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let file_id = parse_file_id(&file_id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::File(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    s.meta
+        .remove_from_series(&series_id, &file_id)
         .await
         .map_err(ApiError::from_db)?;
     Ok(StatusCode::NO_CONTENT)
