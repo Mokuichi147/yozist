@@ -62,7 +62,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(redirect_to_ui))
         .route("/health", get(health))
         .route("/api/files", get(list_files).post(create_file))
-        .route("/api/files/:id", get(get_file))
+        .route("/api/files/:id", get(get_file).delete(delete_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
         .route(
@@ -287,6 +287,46 @@ async fn get_file(
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(meta))
+}
+
+async fn delete_file(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::File(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let res = async {
+        let mut meta = s
+            .meta
+            .get_file(&file_id)
+            .await
+            .map_err(ApiError::from_db)?
+            .ok_or(ApiError::NotFound)?;
+        meta.deleted = true;
+        meta.updated_at = time::OffsetDateTime::now_utc();
+        s.meta.update_file(&meta).await.map_err(ApiError::from_db)?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    audit_event(
+        &s,
+        &ctx,
+        "delete_file",
+        Some("file"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_content(

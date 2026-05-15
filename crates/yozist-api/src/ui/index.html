@@ -111,6 +111,7 @@
       <div style="display:flex; gap:6px; margin: 6px 0">
         <button onclick="issueShare()">共有URLを発行</button>
         <button onclick="toggleEdit()">編集</button>
+        <button style="color:#c00; border-color:#c00" onclick="deleteCurrentFile()">削除</button>
       </div>
       <div id="fd-share" class="small" style="word-break:break-all; margin:6px 0"></div>
       <div id="fd-editor" style="display:none; margin:6px 0">
@@ -429,6 +430,16 @@ async function addToSeries() {
     body: { file_id: currentFile.id },
   });
   alert('追加しました');
+}
+
+async function deleteCurrentFile() {
+  if (!currentFile) return;
+  if (!confirm(`"${currentFile.display_name}" を削除しますか？`)) return;
+  const r = await api(`/api/files/${currentFile.id}`, { method: 'DELETE' });
+  if (!r.ok) return alert('削除失敗: ' + await r.text());
+  $('file-detail').style.display = 'none';
+  currentFile = null;
+  await refresh();
 }
 
 async function issueShare() {
