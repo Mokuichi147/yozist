@@ -72,6 +72,20 @@ pub struct ShareClaims {
     pub exp: i64,
     pub iat: i64,
     pub iss: Option<String>, // 発行者 username
+    /// JWT ID — `share_tokens` テーブルで失効を判定する一意鍵。
+    pub jti: String,
+}
+
+/// `share_tokens` テーブルの 1 行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareTokenRecord {
+    pub jti: String,
+    pub kind: String,
+    pub target_id: String,
+    pub issuer: Option<String>,
+    pub issued_at: time::OffsetDateTime,
+    pub expires_at: Option<time::OffsetDateTime>,
+    pub revoked_at: Option<time::OffsetDateTime>,
 }
 
 /// 認証リクエストの主体。SMB セッション / API JWT / 内部呼び出しを表現。

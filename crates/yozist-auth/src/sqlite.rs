@@ -21,7 +21,7 @@ use uuid::Uuid;
 use yozist_core::{GroupId, UserId};
 
 use crate::{
-    AuthError, AuthService, AuthToken, Group, ShareClaims, TokenClaims, User,
+    AuthError, AuthService, AuthToken, Group, ShareClaims, ShareTokenRecord, TokenClaims, User,
 };
 
 pub struct SqliteAuthService {
@@ -256,13 +256,41 @@ impl AuthService for SqliteAuthService {
         ttl_secs: i64,
         issuer: Option<&str>,
     ) -> Result<AuthToken, AuthError> {
-        let iat = OffsetDateTime::now_utc().unix_timestamp();
+        let iat_dt = OffsetDateTime::now_utc();
+        let iat = iat_dt.unix_timestamp();
+        let exp = iat + ttl_secs;
+        let jti = uuid::Uuid::now_v7().to_string();
+
+        // share_tokens テーブルに記録
+        let iat_str = iat_dt
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
+        let exp_dt = OffsetDateTime::from_unix_timestamp(exp)
+            .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
+        let exp_str = exp_dt
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
+        sqlx::query(
+            "INSERT INTO share_tokens
+               (jti, kind, target_id, issuer, issued_at, expires_at, revoked_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(&jti)
+        .bind(kind)
+        .bind(target_id)
+        .bind(issuer)
+        .bind(iat_str)
+        .bind(exp_str)
+        .execute(&self.pool)
+        .await?;
+
         let claims = ShareClaims {
             kind: kind.to_string(),
             target_id: target_id.to_string(),
-            exp: iat + ttl_secs,
+            exp,
             iat,
             iss: issuer.map(str::to_string),
+            jti,
         };
         let token = encode(
             &Header::default(),
@@ -281,7 +309,94 @@ impl AuthService for SqliteAuthService {
             &DecodingKey::from_secret(&self.secret),
             &validation,
         )?;
-        Ok(data.claims)
+        let claims = data.claims;
+
+        // 失効リストを確認
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT revoked_at FROM share_tokens WHERE jti = ?")
+                .bind(&claims.jti)
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            Some((Some(_),)) => Err(AuthError::InvalidToken),
+            Some((None,)) => Ok(claims),
+            None => {
+                // DB に記録の無いトークン（古い形式等）は無効扱い
+                Err(AuthError::InvalidToken)
+            }
+        }
+    }
+}
+
+impl SqliteAuthService {
+    /// 発行済み共有トークン一覧（issuer が指定されればそのユーザー分のみ）。
+    pub async fn list_share_tokens(
+        &self,
+        issuer: Option<&str>,
+    ) -> Result<Vec<ShareTokenRecord>, AuthError> {
+        let rows = if let Some(u) = issuer {
+            sqlx::query(
+                "SELECT jti, kind, target_id, issuer, issued_at, expires_at, revoked_at
+                 FROM share_tokens WHERE issuer = ? ORDER BY issued_at DESC",
+            )
+            .bind(u)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT jti, kind, target_id, issuer, issued_at, expires_at, revoked_at
+                 FROM share_tokens ORDER BY issued_at DESC",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        rows.into_iter()
+            .map(|r| {
+                let parse_opt = |s: Option<String>| -> Result<Option<OffsetDateTime>, AuthError> {
+                    s.map(|v| {
+                        OffsetDateTime::parse(
+                            &v,
+                            &time::format_description::well_known::Rfc3339,
+                        )
+                        .map_err(|e| AuthError::Other(format!("dt: {e}")))
+                    })
+                    .transpose()
+                };
+                let issued: String = r.try_get("issued_at")?;
+                Ok(ShareTokenRecord {
+                    jti: r.try_get("jti")?,
+                    kind: r.try_get("kind")?,
+                    target_id: r.try_get("target_id")?,
+                    issuer: r.try_get("issuer")?,
+                    issued_at: OffsetDateTime::parse(
+                        &issued,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map_err(|e| AuthError::Other(format!("dt: {e}")))?,
+                    expires_at: parse_opt(r.try_get("expires_at")?)?,
+                    revoked_at: parse_opt(r.try_get("revoked_at")?)?,
+                })
+            })
+            .collect()
+    }
+
+    /// jti を指定して失効させる。既に失効済みなら no-op。
+    pub async fn revoke_share_token(&self, jti: &str) -> Result<(), AuthError> {
+        let now_str = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
+        let res = sqlx::query(
+            "UPDATE share_tokens SET revoked_at = ?
+             WHERE jti = ? AND revoked_at IS NULL",
+        )
+        .bind(now_str)
+        .bind(jti)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(AuthError::UserNotFound); // 流用: not found 系
+        }
+        Ok(())
     }
 }
 

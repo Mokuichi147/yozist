@@ -51,6 +51,8 @@ pub struct ApiState {
     pub acl_admin: Arc<DbAuthorizer>,
     /// 監査ログ（REST/SMB/WebUI 全経路から書き込まれる）。
     pub audit: SharedAuditLog,
+    /// 共有トークンの失効リスト管理用に保持する具象参照。
+    pub share_admin: Arc<yozist_auth::SqliteAuthService>,
 }
 
 /// ルーター生成。
@@ -90,6 +92,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/queries/:id/share", post(issue_query_share))
         .route("/api/shared/:token", get(get_shared))
         .route("/api/shared/:token/files", get(list_shared_files))
+        .route("/api/shares", get(list_share_tokens))
+        .route("/api/shares/:jti", axum::routing::delete(revoke_share_token))
         .route("/api/audit", get(list_audit))
         .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
@@ -1085,6 +1089,60 @@ async fn get_shared(
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
+async fn list_share_tokens(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<Vec<yozist_auth::ShareTokenRecord>>, ApiError> {
+    require_authenticated(&ctx).await?;
+    // 認証済みユーザーは自身が発行した分のみ閲覧（管理者は全件 — 簡易化のため
+    // 現状は全ユーザーが自分の分のみ）。
+    let issuer = match &ctx {
+        AuthContext::User { user, .. } => Some(user.username.clone()),
+        _ => None,
+    };
+    let list = s
+        .share_admin
+        .list_share_tokens(issuer.as_deref())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(list))
+}
+
+async fn revoke_share_token(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(jti): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    // 自分の発行分のみ失効可（管理者扱いは TODO）。
+    let issuer = match &ctx {
+        AuthContext::User { user, .. } => user.username.clone(),
+        _ => return Err(ApiError::Forbidden),
+    };
+    let owned = s
+        .share_admin
+        .list_share_tokens(Some(&issuer))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if !owned.iter().any(|t| t.jti == jti) {
+        return Err(ApiError::Forbidden);
+    }
+    let res = s.share_admin.revoke_share_token(&jti).await;
+    let m = format!("{{\"jti\":\"{jti}\"}}");
+    audit_event(
+        &s,
+        &ctx,
+        "revoke_share_token",
+        Some("share_token"),
+        Some(&jti),
+        Some(&m),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res.map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// クエリ共有トークンでマッチするファイル一覧を返す。
 async fn list_shared_files(
     State(s): State<ApiState>,
@@ -1367,12 +1425,14 @@ mod tests {
         let meta: SharedMetaStore = Arc::new(store);
         let registry = Arc::new(CrdtRegistry::with_defaults());
         let engine = Arc::new(VersioningEngine::new(registry, blob, meta.clone()));
-        let auth: Arc<dyn AuthService> = Arc::new(
-            yozist_auth::SqliteAuthService::new(pool.clone(), b"test".to_vec()),
-        );
         let db_authz = Arc::new(DbAuthorizer::new(pool.clone()));
         let authz: Arc<dyn Authorizer> = db_authz.clone();
-        let audit = Arc::new(yozist_db::AuditLog::new(pool));
+        let audit = Arc::new(yozist_db::AuditLog::new(pool.clone()));
+        let sqlite_auth = Arc::new(yozist_auth::SqliteAuthService::new(
+            pool,
+            b"test".to_vec(),
+        ));
+        let auth: Arc<dyn AuthService> = sqlite_auth.clone();
         (
             ApiState {
                 meta,
@@ -1381,6 +1441,7 @@ mod tests {
                 authz,
                 acl_admin: db_authz,
                 audit,
+                share_admin: sqlite_auth,
             },
             dir,
         )

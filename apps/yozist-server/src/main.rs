@@ -100,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
 
             let secret_path = cli.data.join("jwt-secret.bin");
             let secret = load_or_create_secret(&secret_path).await?;
-            let auth: Arc<dyn AuthService> =
-                Arc::new(SqliteAuthService::new(pool.clone(), secret));
+            let sqlite_auth = Arc::new(SqliteAuthService::new(pool.clone(), secret));
+            let auth: Arc<dyn AuthService> = sqlite_auth.clone();
 
             let db_authz = Arc::new(DbAuthorizer::new(pool.clone()));
             let authz: Arc<dyn Authorizer> = db_authz.clone();
@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
                 authz: authz.clone(),
                 acl_admin: db_authz.clone(),
                 audit: audit.clone(),
+                share_admin: sqlite_auth,
             };
             let app = yozist_api::router(state);
 
