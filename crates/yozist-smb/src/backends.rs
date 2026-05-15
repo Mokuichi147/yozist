@@ -541,27 +541,316 @@ impl ShareBackend for TagsBackend {
     }
 }
 
-/// シリーズ単位の順序付きビュー（v2 stub）。
+/// シリーズ単位の順序付きビュー。
+///
+/// パス例:
+/// - `\` → 全シリーズを subdir として表示
+/// - `\manual\` → シリーズ「manual」のメンバーを order_index 昇順で表示
+///   ファイル名は `NNNN__<file-id>__<display_name>` 形式（NNNN は4桁ゼロ詰め）
+///
+/// 操作セマンティクス:
+/// - `mkdir series\foo` → 新規シリーズ作成
+/// - `cp file → series\X\` → ファイル登録 + シリーズ X に末尾追加
+/// - `rm series\X\foo` → そのファイルをシリーズ X から外す（実体は残る）
+/// - リネームで `NNNN__` 部分を変更 → order_index 更新
 pub struct SeriesBackend {
-    #[allow(dead_code)]
     deps: ShareDeps,
 }
 impl SeriesBackend {
     pub fn new(deps: ShareDeps) -> Self {
         Self { deps }
     }
+
+    /// `NNNN__<file-id>__<name>` を分解。
+    fn parse_member_name(
+        name: &str,
+    ) -> Option<(f64, yozist_core::FileId, String)> {
+        let (idx_str, rest) = name.split_once(ID_SEP)?;
+        let idx: f64 = idx_str.parse().ok()?;
+        let (id_str, _display) = rest.split_once(ID_SEP)?;
+        let uuid = uuid::Uuid::parse_str(id_str).ok()?;
+        Some((idx, yozist_core::FileId::from_uuid(uuid), name.to_string()))
+    }
+
+    fn member_display_name(
+        order: f64,
+        file: &yozist_core::FileMeta,
+    ) -> String {
+        format!(
+            "{:04}{}{}{}{}",
+            order as i64, ID_SEP, file.id, ID_SEP, file.display_name
+        )
+    }
+
+    async fn series_by_name(&self, name: &str) -> SmbResult<Option<yozist_core::Series>> {
+        let list = self
+            .deps
+            .meta
+            .list_series()
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(list.into_iter().find(|s| s.name == name))
+    }
+
+    async fn list_root(&self) -> SmbResult<Vec<DirEntry>> {
+        let list = self
+            .deps
+            .meta
+            .list_series()
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let now = crate::handle::system_time_to_filetime(std::time::SystemTime::now());
+        Ok(list
+            .into_iter()
+            .map(|s| DirEntry {
+                info: FileInfo {
+                    name: s.name,
+                    end_of_file: 0,
+                    allocation_size: 0,
+                    creation_time: now,
+                    last_access_time: now,
+                    last_write_time: now,
+                    change_time: now,
+                    is_directory: true,
+                    file_index: 0,
+                },
+            })
+            .collect())
+    }
+
+    async fn list_series_dir(
+        &self,
+        series_id: &yozist_core::SeriesId,
+    ) -> SmbResult<Vec<DirEntry>> {
+        let members = self
+            .deps
+            .meta
+            .list_series_members(series_id)
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let mut out = Vec::with_capacity(members.len());
+        for m in members {
+            let file = self
+                .deps
+                .meta
+                .get_file(&m.file_id)
+                .await
+                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            if let Some(f) = file {
+                if f.deleted {
+                    continue;
+                }
+                let name = Self::member_display_name(m.order_index, &f);
+                out.push(DirEntry {
+                    info: crate::handle::file_meta_to_info(&f, name),
+                });
+            }
+        }
+        Ok(out)
+    }
 }
+
 #[async_trait]
 impl ShareBackend for SeriesBackend {
-    async fn open(&self, _p: &SmbPath, _o: OpenOptions) -> SmbResult<Box<dyn Handle>> {
-        Err(SmbError::NotSupported)
+    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+        let comps = path.components();
+
+        if comps.is_empty() {
+            if opts.non_directory {
+                return Err(SmbError::IsDirectory);
+            }
+            let entries = self.list_root().await?;
+            return Ok(Box::new(YozistDirHandle::new("series", entries)));
+        }
+
+        // 第 1 階層: シリーズ名
+        let series_name = &comps[0];
+        let series = self.series_by_name(series_name).await?;
+
+        match (comps.len(), series) {
+            (1, Some(s)) => {
+                if opts.non_directory {
+                    return Err(SmbError::IsDirectory);
+                }
+                let entries = self.list_series_dir(&s.id).await?;
+                Ok(Box::new(YozistDirHandle::new(s.name, entries)))
+            }
+            (1, None) => {
+                // mkdir 系: 新規シリーズ作成
+                match opts.intent {
+                    OpenIntent::Create
+                    | OpenIntent::OpenOrCreate
+                    | OpenIntent::OverwriteOrCreate
+                        if opts.directory =>
+                    {
+                        let s = yozist_core::Series {
+                            id: yozist_core::SeriesId::new(),
+                            name: series_name.clone(),
+                            description: None,
+                        };
+                        self.deps
+                            .meta
+                            .upsert_series(&s)
+                            .await
+                            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+                        Ok(Box::new(YozistDirHandle::new(series_name.clone(), vec![])))
+                    }
+                    _ => Err(SmbError::PathNotFound),
+                }
+            }
+            (2, Some(s)) => {
+                let name = &comps[1];
+                match Self::parse_member_name(name) {
+                    Some((_order, file_id, _)) => {
+                        // 既存ファイル
+                        if opts.directory {
+                            return Err(SmbError::NotADirectory);
+                        }
+                        let meta = self
+                            .deps
+                            .meta
+                            .get_file(&file_id)
+                            .await
+                            .map_err(|e| {
+                                SmbError::Io(std::io::Error::other(e.to_string()))
+                            })?
+                            .ok_or(SmbError::NotFound)?;
+                        if matches!(opts.intent, OpenIntent::Create) {
+                            return Err(SmbError::Exists);
+                        }
+                        let mut h = YozistFileHandle::open_existing(
+                            &self.deps,
+                            self.deps.engine.clone(),
+                            meta.id,
+                            meta.display_name.clone(),
+                            opts.read,
+                            opts.write,
+                        )
+                        .await?;
+                        if matches!(
+                            opts.intent,
+                            OpenIntent::Truncate | OpenIntent::OverwriteOrCreate
+                        ) {
+                            h.set_truncated();
+                        }
+                        Ok(Box::new(h))
+                    }
+                    None => {
+                        // 新規ファイル: シリーズ S に追加
+                        if opts.directory {
+                            return Err(SmbError::NotSupported);
+                        }
+                        match opts.intent {
+                            OpenIntent::Create
+                            | OpenIntent::OpenOrCreate
+                            | OpenIntent::OverwriteOrCreate => {
+                                // 末尾追加用 order_index
+                                let existing = self
+                                    .deps
+                                    .meta
+                                    .list_series_members(&s.id)
+                                    .await
+                                    .map_err(|e| {
+                                        SmbError::Io(std::io::Error::other(e.to_string()))
+                                    })?;
+                                let order = existing
+                                    .last()
+                                    .map(|m| m.order_index + 10.0)
+                                    .unwrap_or(10.0);
+                                let h = YozistFileHandle::open_new_with_series(
+                                    self.deps.engine.clone(),
+                                    self.deps.meta.clone(),
+                                    name.clone(),
+                                    true,
+                                    s.id,
+                                    order,
+                                );
+                                Ok(Box::new(h))
+                            }
+                            _ => Err(SmbError::NotFound),
+                        }
+                    }
+                }
+            }
+            _ => Err(SmbError::PathNotFound),
+        }
     }
-    async fn unlink(&self, _p: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+
+    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+        let comps = path.components();
+        if comps.len() != 2 {
+            return Err(SmbError::AccessDenied);
+        }
+        let series = self
+            .series_by_name(&comps[0])
+            .await?
+            .ok_or(SmbError::PathNotFound)?;
+        let (_, file_id, _) =
+            Self::parse_member_name(&comps[1]).ok_or(SmbError::NotFound)?;
+        self.deps
+            .meta
+            .remove_from_series(&series.id, &file_id)
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(())
     }
-    async fn rename(&self, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::NotSupported)
+
+    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+        let from_comp = from.components();
+        let to_comp = to.components();
+        if from_comp.len() != 2 || to_comp.len() != 2 {
+            return Err(SmbError::NotSupported);
+        }
+        let from_series = self
+            .series_by_name(&from_comp[0])
+            .await?
+            .ok_or(SmbError::PathNotFound)?;
+        let to_series = self
+            .series_by_name(&to_comp[0])
+            .await?
+            .ok_or(SmbError::PathNotFound)?;
+
+        let (_, file_id, _) =
+            Self::parse_member_name(&from_comp[1]).ok_or(SmbError::NotFound)?;
+        let new_order = Self::parse_member_name(&to_comp[1]).map(|(o, _, _)| o);
+
+        // 同一シリーズ内のリネーム = 順序変更のみ
+        if from_series.id == to_series.id {
+            if let Some(order) = new_order {
+                self.deps
+                    .meta
+                    .add_to_series(&yozist_core::SeriesMember {
+                        series_id: from_series.id,
+                        file_id,
+                        order_index: order,
+                    })
+                    .await
+                    .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+            }
+            return Ok(());
+        }
+        // クロスシリーズ移動
+        self.deps
+            .meta
+            .remove_from_series(&from_series.id, &file_id)
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        let order = new_order.unwrap_or_else(|| {
+            // 簡易: 末尾追加扱い
+            10.0
+        });
+        self.deps
+            .meta
+            .add_to_series(&yozist_core::SeriesMember {
+                series_id: to_series.id,
+                file_id,
+                order_index: order,
+            })
+            .await
+            .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(())
     }
+
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
             is_read_only: false,

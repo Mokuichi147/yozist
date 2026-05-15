@@ -70,10 +70,15 @@ pub async fn serve(cfg: SmbConfig, deps: ShareDeps) -> Result<(), SmbError> {
     };
     let all_share = setup_share("all", Share::new("all", AllBackend::new(deps.clone())));
     let tags_share = setup_share("tags", Share::new("tags", TagsBackend::new(deps.clone())));
+    let series_share = setup_share(
+        "series",
+        Share::new("series", SeriesBackend::new(deps.clone())),
+    );
 
     let server = builder
         .share(all_share)
         .share(tags_share)
+        .share(series_share)
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 

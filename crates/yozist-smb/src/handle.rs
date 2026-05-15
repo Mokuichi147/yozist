@@ -45,6 +45,8 @@ struct HandleState {
     writable: bool,
     /// 新規作成時に自動付与するタグ。
     pending_tags: Vec<yozist_core::TagId>,
+    /// 新規作成時に追加するシリーズと order_index。
+    pending_series: Option<(yozist_core::SeriesId, f64)>,
 }
 
 impl YozistFileHandle {
@@ -71,6 +73,7 @@ impl YozistFileHandle {
                 readable,
                 writable,
                 pending_tags: Vec::new(),
+                pending_series: None,
             }),
             engine,
             meta: None,
@@ -93,6 +96,7 @@ impl YozistFileHandle {
                 readable: true,
                 writable,
                 pending_tags: Vec::new(),
+                pending_series: None,
             }),
             engine,
             meta: None,
@@ -117,6 +121,33 @@ impl YozistFileHandle {
                 readable: true,
                 writable,
                 pending_tags: tags,
+                pending_series: None,
+            }),
+            engine,
+            meta: Some(meta),
+            actor: ActorId::new(),
+        }
+    }
+
+    /// 新規ファイルを開き、close 時にシリーズへ追加する。
+    pub fn open_new_with_series(
+        engine: Arc<VersioningEngine>,
+        meta: SharedMetaStore,
+        display_name: String,
+        writable: bool,
+        series_id: yozist_core::SeriesId,
+        order_index: f64,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(HandleState {
+                file_id: None,
+                display_name,
+                buffer: Vec::new(),
+                dirty: false,
+                readable: true,
+                writable,
+                pending_tags: Vec::new(),
+                pending_series: Some((series_id, order_index)),
             }),
             engine,
             meta: Some(meta),
@@ -207,7 +238,7 @@ impl Handle for YozistFileHandle {
     }
 
     async fn close(self: Box<Self>) -> smb_server::SmbResult<()> {
-        let (file_id, name, buffer, dirty, pending_tags) = {
+        let (file_id, name, buffer, dirty, pending_tags, pending_series) = {
             let st = self.inner.lock();
             (
                 st.file_id,
@@ -215,6 +246,7 @@ impl Handle for YozistFileHandle {
                 st.buffer.clone(),
                 st.dirty,
                 st.pending_tags.clone(),
+                st.pending_series,
             )
         };
         if !dirty {
@@ -237,15 +269,22 @@ impl Handle for YozistFileHandle {
                     .map_err(|e| {
                         smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
                     })?;
-                if !pending_tags.is_empty() {
-                    if let Some(meta) = &self.meta {
-                        for t in &pending_tags {
-                            meta.attach_tag(&file.id, t).await.map_err(|e| {
-                                smb_server::SmbError::Io(std::io::Error::other(
-                                    e.to_string(),
-                                ))
-                            })?;
-                        }
+                if let Some(meta) = &self.meta {
+                    for t in &pending_tags {
+                        meta.attach_tag(&file.id, t).await.map_err(|e| {
+                            smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                        })?;
+                    }
+                    if let Some((series_id, order_index)) = pending_series {
+                        meta.add_to_series(&yozist_core::SeriesMember {
+                            series_id,
+                            file_id: file.id,
+                            order_index,
+                        })
+                        .await
+                        .map_err(|e| {
+                            smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                        })?;
                     }
                 }
             }
