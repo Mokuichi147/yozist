@@ -8,7 +8,7 @@ use crate::proto::messages::{InfoType, SetInfoRequest, SetInfoResponse};
 use crate::backend::FileTimes;
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::{lookup_open, lookup_session_tree};
+use crate::handlers::shared::{lookup_identity, lookup_open, lookup_session_tree};
 use crate::info_class as ic;
 use crate::ntstatus;
 use crate::path::SmbPath;
@@ -117,7 +117,11 @@ pub async fn handle(
                 Err(_) => return HandlerResponse::err(ntstatus::STATUS_OBJECT_NAME_INVALID),
             };
             let from = open_arc.read().await.last_path.clone();
-            match backend.rename(&from, &new_path).await {
+            let identity = match lookup_identity(conn, hdr).await {
+                Ok(i) => i,
+                Err(s) => return HandlerResponse::err(s),
+            };
+            match backend.rename(&identity, &from, &new_path).await {
                 Ok(()) => {
                     open_arc.write().await.last_path = new_path;
                     Ok(())

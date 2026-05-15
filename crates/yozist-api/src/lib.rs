@@ -42,6 +42,7 @@ use yozist_versioning::VersioningEngine;
 /// API ハンドラが共有する状態。
 #[derive(Clone)]
 pub struct ApiState {
+    // フィールドは Clone なのでこの struct も Arc 越しに自由に clone できる。
     pub meta: SharedMetaStore,
     pub engine: Arc<VersioningEngine>,
     pub auth: Arc<dyn AuthService>,

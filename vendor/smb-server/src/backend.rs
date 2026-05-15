@@ -9,6 +9,7 @@ use std::time::SystemTime;
 
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+use crate::proto::auth::ntlm::Identity;
 
 // ---------------------------------------------------------------------------
 // OpenOptions
@@ -159,14 +160,27 @@ pub struct BackendCapabilities {
 #[async_trait]
 pub trait ShareBackend: Send + Sync + 'static {
     /// Open or create a file or directory. Returns a fresh handle.
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>>;
+    ///
+    /// `identity` carries the authenticated SMB user (`Anonymous` for public
+    /// access). Backends use this to enforce per-user authorization.
+    async fn open(
+        &self,
+        identity: &Identity,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>>;
 
     /// Unlink (delete) a file. Directories: must be empty. v1 does not
     /// recursively delete.
-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()>;
+    async fn unlink(&self, identity: &Identity, path: &SmbPath) -> SmbResult<()>;
 
     /// Rename `from` to `to`. The backend must reject if `to` already exists.
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()>;
+    async fn rename(
+        &self,
+        identity: &Identity,
+        from: &SmbPath,
+        to: &SmbPath,
+    ) -> SmbResult<()>;
 
     /// Static capabilities. The dispatcher consults these at TREE_CONNECT and
     /// uses `is_read_only` to clamp authz.
@@ -220,13 +234,23 @@ pub(crate) struct NotSupportedBackend;
 
 #[async_trait]
 impl ShareBackend for NotSupportedBackend {
-    async fn open(&self, _path: &SmbPath, _opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        _identity: &Identity,
+        _path: &SmbPath,
+        _opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
         Err(SmbError::NotSupported)
     }
-    async fn unlink(&self, _path: &SmbPath) -> SmbResult<()> {
+    async fn unlink(&self, _identity: &Identity, _path: &SmbPath) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
-    async fn rename(&self, _from: &SmbPath, _to: &SmbPath) -> SmbResult<()> {
+    async fn rename(
+        &self,
+        _identity: &Identity,
+        _from: &SmbPath,
+        _to: &SmbPath,
+    ) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
     fn capabilities(&self) -> BackendCapabilities {

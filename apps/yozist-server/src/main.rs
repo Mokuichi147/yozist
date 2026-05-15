@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
                 engine: engine.clone(),
                 auth: auth.clone(),
                 authz: authz.clone(),
-                acl_admin: db_authz,
+                acl_admin: db_authz.clone(),
             };
             let app = yozist_api::router(state);
 
@@ -144,6 +144,8 @@ async fn main() -> anyhow::Result<()> {
                     blob,
                     engine,
                     authz,
+                    auth,
+                    acl_admin: db_authz,
                 };
                 Some(tokio::spawn(async move {
                     if let Err(e) = yozist_smb::serve(cfg, deps).await {

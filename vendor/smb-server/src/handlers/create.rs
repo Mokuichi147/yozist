@@ -10,7 +10,7 @@ use crate::backend::{OpenIntent, OpenOptions};
 use crate::builder::Access;
 use crate::conn::state::{Connection, Open};
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::lookup_session_tree;
+use crate::handlers::shared::{lookup_identity, lookup_session_tree};
 use crate::ntstatus;
 use crate::path::SmbPath;
 use crate::server::ServerState;
@@ -58,6 +58,10 @@ pub async fn handle(
 
     let tree_arc = match lookup_session_tree(conn, hdr).await {
         Ok(t) => t,
+        Err(s) => return HandlerResponse::err(s),
+    };
+    let identity = match lookup_identity(conn, hdr).await {
+        Ok(i) => i,
         Err(s) => return HandlerResponse::err(s),
     };
     let tree = tree_arc.read().await;
@@ -133,7 +137,7 @@ pub async fn handle(
         delete_on_close,
     };
 
-    let handle = match backend.open(&path, opts).await {
+    let handle = match backend.open(&identity, &path, opts).await {
         Ok(h) => h,
         Err(e) => {
             debug!(error = %e, path = %path, "backend open failed");

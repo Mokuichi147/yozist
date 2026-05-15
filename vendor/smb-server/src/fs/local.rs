@@ -224,7 +224,12 @@ fn ascii_eq_ci(a: char, b: char) -> bool {
 
 #[async_trait]
 impl ShareBackend for LocalFsBackend {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        _identity: &crate::proto::auth::ntlm::Identity,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
         // 1. Read-only check: any open that requests creation, write access,
         //    truncation, or overwrite is rejected up front. Pure read opens
         //    pass through.
@@ -365,7 +370,11 @@ impl ShareBackend for LocalFsBackend {
         }))
     }
 
-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+    async fn unlink(
+        &self,
+        _identity: &crate::proto::auth::ntlm::Identity,
+        path: &SmbPath,
+    ) -> SmbResult<()> {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }
@@ -394,7 +403,12 @@ impl ShareBackend for LocalFsBackend {
         .map_err(io_to_smb)
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(
+        &self,
+        _identity: &crate::proto::auth::ntlm::Identity,
+        from: &SmbPath,
+        to: &SmbPath,
+    ) -> SmbResult<()> {
         if self.read_only {
             return Err(SmbError::AccessDenied);
         }

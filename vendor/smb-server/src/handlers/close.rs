@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::conn::state::Connection;
 use crate::dispatch::HandlerResponse;
-use crate::handlers::shared::lookup_session_tree;
+use crate::handlers::shared::{lookup_identity, lookup_session_tree};
 use crate::ntstatus;
 use crate::server::ServerState;
 
@@ -60,10 +60,14 @@ pub async fn handle(
         let _ = h.close().await;
     }
     if delete_on_close {
+        let identity = match lookup_identity(conn, hdr).await {
+            Ok(i) => i,
+            Err(s) => return HandlerResponse::err(s),
+        };
         let tree = tree_arc.read().await;
         let backend = tree.share.backend.clone();
         drop(tree);
-        if let Err(e) = backend.unlink(&path).await {
+        if let Err(e) = backend.unlink(&identity, &path).await {
             debug!(error = %e, "delete-on-close unlink failed");
         }
     }

@@ -20,6 +20,7 @@ use yozist_core::{ActorId, FileId};
 use yozist_versioning::VersioningEngine;
 
 use crate::ShareDeps;
+use yozist_auth::{DbAuthorizer, Permission, PermissionMask, Subject, Target};
 use yozist_db::SharedMetaStore;
 
 /// 既存ファイル or 新規ファイル用の汎用 Handle。
@@ -27,6 +28,10 @@ pub struct YozistFileHandle {
     inner: Mutex<HandleState>,
     engine: Arc<VersioningEngine>,
     meta: Option<SharedMetaStore>,
+    /// 新規ファイル作成時、close 時にオーナー ACL を発行するための authorizer。
+    acl_admin: Option<Arc<DbAuthorizer>>,
+    /// 新規作成時のファイルオーナー（ADMIN権限の自動付与先）。
+    owner: Option<yozist_core::UserId>,
     actor: ActorId,
 }
 
@@ -77,6 +82,8 @@ impl YozistFileHandle {
             }),
             engine,
             meta: None,
+            acl_admin: None,
+            owner: None,
             actor: ActorId::new(),
         })
     }
@@ -100,6 +107,8 @@ impl YozistFileHandle {
             }),
             engine,
             meta: None,
+            acl_admin: None,
+            owner: None,
             actor: ActorId::new(),
         }
     }
@@ -125,6 +134,8 @@ impl YozistFileHandle {
             }),
             engine,
             meta: Some(meta),
+            acl_admin: None,
+            owner: None,
             actor: ActorId::new(),
         }
     }
@@ -151,6 +162,38 @@ impl YozistFileHandle {
             }),
             engine,
             meta: Some(meta),
+            acl_admin: None,
+            owner: None,
+            actor: ActorId::new(),
+        }
+    }
+
+    /// 新規ファイルを開き、close 時にオーナー ACL を発行する。
+    pub fn open_new_with_owner(
+        engine: Arc<VersioningEngine>,
+        meta: SharedMetaStore,
+        acl_admin: Arc<DbAuthorizer>,
+        display_name: String,
+        writable: bool,
+        owner: yozist_core::UserId,
+        pending_tags: Vec<yozist_core::TagId>,
+        pending_series: Option<(yozist_core::SeriesId, f64)>,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(HandleState {
+                file_id: None,
+                display_name,
+                buffer: Vec::new(),
+                dirty: false,
+                readable: true,
+                writable,
+                pending_tags,
+                pending_series,
+            }),
+            engine,
+            meta: Some(meta),
+            acl_admin: Some(acl_admin),
+            owner: Some(owner),
             actor: ActorId::new(),
         }
     }
@@ -286,6 +329,20 @@ impl Handle for YozistFileHandle {
                             smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
                         })?;
                     }
+                }
+                // オーナー ACL の自動付与（REST 経由の create_file と同じ挙動）
+                if let (Some(acl_admin), Some(owner_id)) = (&self.acl_admin, self.owner) {
+                    let owner_rule = Permission {
+                        subject: Subject::User(owner_id),
+                        target: Target::File(file.id),
+                        mask: PermissionMask::all(),
+                        allow: true,
+                        priority: i32::MAX,
+                        expires_at: None,
+                    };
+                    acl_admin.add_rule(&owner_rule).await.map_err(|e| {
+                        smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                    })?;
                 }
             }
         }

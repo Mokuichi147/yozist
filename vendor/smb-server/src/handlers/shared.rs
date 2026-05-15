@@ -25,6 +25,18 @@ pub async fn lookup_session_tree(
         .ok_or(ntstatus::STATUS_NETWORK_NAME_DELETED)
 }
 
+/// Convenience: return the authenticated identity (clone) for the session
+/// referenced by `hdr`. Backends receive this through `ShareBackend::open`
+/// etc. to enforce per-user authorization.
+pub async fn lookup_identity(
+    conn: &Arc<Connection>,
+    hdr: &Smb2Header,
+) -> Result<crate::proto::auth::ntlm::Identity, u32> {
+    let sess_arc = lookup_session(conn, hdr.session_id).await?;
+    let sess = sess_arc.read().await;
+    Ok(sess.identity.clone())
+}
+
 pub async fn lookup_session(conn: &Arc<Connection>, sid: u64) -> Result<Arc<RwLock<Session>>, u32> {
     if sid == 0 {
         return Err(ntstatus::STATUS_USER_SESSION_DELETED);

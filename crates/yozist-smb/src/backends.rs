@@ -7,8 +7,8 @@
 
 use async_trait::async_trait;
 use smb_server::{
-    BackendCapabilities, DirEntry, FileInfo, Handle, OpenIntent, OpenOptions, ShareBackend,
-    SmbError, SmbPath, SmbResult,
+    BackendCapabilities, DirEntry, FileInfo, Handle, Identity, OpenIntent, OpenOptions,
+    ShareBackend, SmbError, SmbPath, SmbResult,
 };
 
 use crate::handle::{file_meta_to_info, YozistDirHandle, YozistFileHandle};
@@ -62,6 +62,7 @@ impl AllBackend {
 impl ShareBackend for AllBackend {
     async fn open(
         &self,
+        identity: &Identity,
         path: &SmbPath,
         opts: OpenOptions,
     ) -> SmbResult<Box<dyn Handle>> {
@@ -96,10 +97,19 @@ impl ShareBackend for AllBackend {
         match (opts.intent, existing_meta) {
             (OpenIntent::Open | OpenIntent::Truncate, None) => Err(SmbError::NotFound),
             (OpenIntent::Create, Some(_)) => Err(SmbError::Exists),
-            (OpenIntent::Open, Some(meta)) => {
+            (OpenIntent::Open | OpenIntent::OpenOrCreate, Some(meta)) => {
                 if opts.directory {
                     return Err(SmbError::NotADirectory);
                 }
+                // 読み取りは READ、書き込みも想定する場合は WRITE を要求。
+                let mask = if opts.write {
+                    yozist_auth::PermissionMask::WRITE | yozist_auth::PermissionMask::READ
+                } else {
+                    yozist_auth::PermissionMask::READ
+                };
+                self.deps
+                    .require(identity, &yozist_auth::Target::File(meta.id), mask)
+                    .await?;
                 let h = YozistFileHandle::open_existing(
                     &self.deps,
                     self.deps.engine.clone(),
@@ -111,32 +121,14 @@ impl ShareBackend for AllBackend {
                 .await?;
                 Ok(Box::new(h))
             }
-            (OpenIntent::OpenOrCreate, Some(meta)) => {
-                let h = YozistFileHandle::open_existing(
-                    &self.deps,
-                    self.deps.engine.clone(),
-                    meta.id,
-                    meta.display_name.clone(),
-                    opts.read,
-                    opts.write,
-                )
-                .await?;
-                Ok(Box::new(h))
-            }
-            (OpenIntent::Truncate, Some(meta)) => {
-                let mut h = YozistFileHandle::open_existing(
-                    &self.deps,
-                    self.deps.engine.clone(),
-                    meta.id,
-                    meta.display_name.clone(),
-                    opts.read,
-                    true,
-                )
-                .await?;
-                h.set_truncated();
-                Ok(Box::new(h))
-            }
-            (OpenIntent::OverwriteOrCreate, Some(meta)) => {
+            (OpenIntent::Truncate | OpenIntent::OverwriteOrCreate, Some(meta)) => {
+                self.deps
+                    .require(
+                        identity,
+                        &yozist_auth::Target::File(meta.id),
+                        yozist_auth::PermissionMask::WRITE,
+                    )
+                    .await?;
                 let mut h = YozistFileHandle::open_existing(
                     &self.deps,
                     self.deps.engine.clone(),
@@ -151,25 +143,34 @@ impl ShareBackend for AllBackend {
             }
             (OpenIntent::Create | OpenIntent::OpenOrCreate | OpenIntent::OverwriteOrCreate, None) => {
                 if opts.directory {
-                    return Err(SmbError::NotSupported); // AllBackend にディレクトリ作成は不要
+                    return Err(SmbError::NotSupported);
                 }
-                // 新規ファイル: ID プレフィクスは閉じる時に確定するので、
-                // 入力名から `__` 部分を剥がしてユーザー指定の display_name を使う。
+                // 新規ファイル: 認証済みのみ許可。close 時にオーナー ACL を付与。
+                let ctx = self.deps.identity_to_context(identity).await;
+                let owner = match &ctx {
+                    yozist_auth::AuthContext::User { user, .. } => user.id,
+                    _ => return Err(SmbError::AccessDenied),
+                };
                 let display_name = match name.split_once(ID_SEP) {
                     Some((_, rest)) => rest.to_string(),
                     None => name.clone(),
                 };
-                let h = YozistFileHandle::open_new(
+                let h = YozistFileHandle::open_new_with_owner(
                     self.deps.engine.clone(),
+                    self.deps.meta.clone(),
+                    self.deps.acl_admin.clone(),
                     display_name,
                     true,
+                    owner,
+                    vec![],
+                    None,
                 );
                 Ok(Box::new(h))
             }
         }
     }
 
-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+    async fn unlink(&self, identity: &Identity, path: &SmbPath) -> SmbResult<()> {
         if path.is_root() {
             return Err(SmbError::AccessDenied);
         }
@@ -178,6 +179,13 @@ impl ShareBackend for AllBackend {
             return Err(SmbError::PathNotFound);
         }
         let (id, _) = Self::parse_filename(&components[0]).ok_or(SmbError::NotFound)?;
+        self.deps
+            .require(
+                identity,
+                &yozist_auth::Target::File(id),
+                yozist_auth::PermissionMask::WRITE,
+            )
+            .await?;
         let mut meta = self
             .deps
             .meta
@@ -195,13 +203,25 @@ impl ShareBackend for AllBackend {
         Ok(())
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(
+        &self,
+        identity: &Identity,
+        from: &SmbPath,
+        to: &SmbPath,
+    ) -> SmbResult<()> {
         let from_comp = from.components();
         let to_comp = to.components();
         if from_comp.len() != 1 || to_comp.len() != 1 {
             return Err(SmbError::PathNotFound);
         }
         let (id, _) = Self::parse_filename(&from_comp[0]).ok_or(SmbError::NotFound)?;
+        self.deps
+            .require(
+                identity,
+                &yozist_auth::Target::File(id),
+                yozist_auth::PermissionMask::WRITE,
+            )
+            .await?;
         let mut meta = self
             .deps
             .meta
@@ -351,7 +371,12 @@ impl TagsBackend {
 
 #[async_trait]
 impl ShareBackend for TagsBackend {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        identity: &Identity,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
         let comps = path.components();
 
         // ルート
@@ -466,7 +491,7 @@ impl ShareBackend for TagsBackend {
         }
     }
 
-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+    async fn unlink(&self, identity: &Identity, path: &SmbPath) -> SmbResult<()> {
         let comps = path.components();
         if comps.is_empty() {
             return Err(SmbError::AccessDenied);
@@ -507,7 +532,12 @@ impl ShareBackend for TagsBackend {
         }
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(
+        &self,
+        identity: &Identity,
+        from: &SmbPath,
+        to: &SmbPath,
+    ) -> SmbResult<()> {
         let (from_tags, from_file) = self.parse_path(from.components()).await?;
         let (to_tags, to_file) = self.parse_path(to.components()).await?;
         let (file_id, _) = match (from_file, to_file) {
@@ -652,7 +682,12 @@ impl SeriesBackend {
 
 #[async_trait]
 impl ShareBackend for SeriesBackend {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        identity: &Identity,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
         let comps = path.components();
 
         if comps.is_empty() {
@@ -776,7 +811,7 @@ impl ShareBackend for SeriesBackend {
         }
     }
 
-    async fn unlink(&self, path: &SmbPath) -> SmbResult<()> {
+    async fn unlink(&self, identity: &Identity, path: &SmbPath) -> SmbResult<()> {
         let comps = path.components();
         if comps.len() != 2 {
             return Err(SmbError::AccessDenied);
@@ -795,7 +830,12 @@ impl ShareBackend for SeriesBackend {
         Ok(())
     }
 
-    async fn rename(&self, from: &SmbPath, to: &SmbPath) -> SmbResult<()> {
+    async fn rename(
+        &self,
+        identity: &Identity,
+        from: &SmbPath,
+        to: &SmbPath,
+    ) -> SmbResult<()> {
         let from_comp = from.components();
         let to_comp = to.components();
         if from_comp.len() != 2 || to_comp.len() != 2 {
@@ -963,7 +1003,12 @@ impl QueriesBackend {
 
 #[async_trait]
 impl ShareBackend for QueriesBackend {
-    async fn open(&self, path: &SmbPath, opts: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        identity: &Identity,
+        path: &SmbPath,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
         let comps = path.components();
         if comps.is_empty() {
             if opts.non_directory {
@@ -1024,10 +1069,10 @@ impl ShareBackend for QueriesBackend {
             _ => Err(SmbError::PathNotFound),
         }
     }
-    async fn unlink(&self, _p: &SmbPath) -> SmbResult<()> {
+    async fn unlink(&self, _id: &Identity, _p: &SmbPath) -> SmbResult<()> {
         Err(SmbError::AccessDenied)
     }
-    async fn rename(&self, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, _id: &Identity, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
         Err(SmbError::AccessDenied)
     }
     fn capabilities(&self) -> BackendCapabilities {
@@ -1050,13 +1095,18 @@ impl RecentBackend {
 }
 #[async_trait]
 impl ShareBackend for RecentBackend {
-    async fn open(&self, _p: &SmbPath, _o: OpenOptions) -> SmbResult<Box<dyn Handle>> {
+    async fn open(
+        &self,
+        _id: &Identity,
+        _p: &SmbPath,
+        _o: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
         Err(SmbError::NotSupported)
     }
-    async fn unlink(&self, _p: &SmbPath) -> SmbResult<()> {
+    async fn unlink(&self, _id: &Identity, _p: &SmbPath) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
-    async fn rename(&self, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
+    async fn rename(&self, _id: &Identity, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
         Err(SmbError::NotSupported)
     }
     fn capabilities(&self) -> BackendCapabilities {
