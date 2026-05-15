@@ -399,13 +399,27 @@ async fn detach_tag(
         PermissionMask::WRITE,
     )
     .await?;
-    let tag_id = uuid::Uuid::parse_str(&tag_id)
+    let tag_uuid = uuid::Uuid::parse_str(&tag_id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag_id: {e}")))?;
-    s.meta
-        .detach_tag(&file_id, &tag_id)
+    let res = s
+        .meta
+        .detach_tag(&file_id, &tag_uuid)
         .await
-        .map_err(ApiError::from_db)?;
+        .map_err(ApiError::from_db);
+    let file_id_str = file_id.to_string();
+    let meta = format!("{{\"tag_id\":\"{tag_id}\"}}");
+    audit_event(
+        &s,
+        &ctx,
+        "detach_tag",
+        Some("file"),
+        Some(&file_id_str),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -453,13 +467,31 @@ async fn upsert_tag(
             return Err(ApiError::BadRequest(format!("unknown tag kind: {other}")))
         }
     };
+    let tag_name = input.name.clone();
     let tag = Tag {
         id: TagId::new(),
         name: input.name,
         kind,
         confidence: input.confidence,
     };
-    let id = s.meta.upsert_tag(&tag).await.map_err(ApiError::from_db)?;
+    let res = s.meta.upsert_tag(&tag).await.map_err(ApiError::from_db);
+    let id_for_audit = res.as_ref().ok().map(|t| t.to_string());
+    let meta = format!("{{\"name\":\"{}\",\"kind\":\"{}\"}}", tag_name, match kind {
+        TagKind::System => "system",
+        TagKind::Ai => "ai",
+        TagKind::Manual => "manual",
+    });
+    audit_event(
+        &s,
+        &ctx,
+        "upsert_tag",
+        Some("tag"),
+        id_for_audit.as_deref(),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let id = res?;
     Ok(Json(TagCreated { id }))
 }
 
@@ -485,10 +517,24 @@ async fn attach_tag(
     let tag_id = uuid::Uuid::parse_str(&input.tag_id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag_id: {e}")))?;
-    s.meta
+    let res = s
+        .meta
         .attach_tag(&file_id, &tag_id)
         .await
-        .map_err(ApiError::from_db)?;
+        .map_err(ApiError::from_db);
+    let file_str = file_id.to_string();
+    let meta = format!("{{\"tag_id\":\"{}\"}}", input.tag_id);
+    audit_event(
+        &s,
+        &ctx,
+        "attach_tag",
+        Some("file"),
+        Some(&file_str),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -513,14 +559,31 @@ async fn create_series(
     Json(input): Json<CreateSeriesInput>,
 ) -> Result<(StatusCode, Json<Series>), ApiError> {
     require_authenticated(&ctx).await?;
+    let name = input.name.clone();
     let series = Series {
         id: SeriesId::new(),
         name: input.name,
         description: input.description,
     };
-    let id = s.meta.upsert_series(&series).await.map_err(ApiError::from_db)?;
-    let saved = Series { id, ..series };
-    Ok((StatusCode::CREATED, Json(saved)))
+    let res = s
+        .meta
+        .upsert_series(&series)
+        .await
+        .map_err(ApiError::from_db);
+    let id_str = res.as_ref().ok().map(|i| i.to_string());
+    let meta = format!("{{\"name\":\"{}\"}}", name);
+    audit_event(
+        &s,
+        &ctx,
+        "create_series",
+        Some("series"),
+        id_str.as_deref(),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let id = res?;
+    Ok((StatusCode::CREATED, Json(Series { id, ..series })))
 }
 
 async fn get_series(
@@ -590,14 +653,31 @@ async fn add_series_member(
             existing.last().map(|m| m.order_index + 1.0).unwrap_or(10.0)
         }
     };
-    s.meta
+    let res = s
+        .meta
         .add_to_series(&SeriesMember {
             series_id,
             file_id,
             order_index,
         })
         .await
-        .map_err(ApiError::from_db)?;
+        .map_err(ApiError::from_db);
+    let sid = series_id.to_string();
+    let m = format!(
+        "{{\"file_id\":\"{}\",\"order_index\":{}}}",
+        file_id, order_index
+    );
+    audit_event(
+        &s,
+        &ctx,
+        "add_to_series",
+        Some("series"),
+        Some(&sid),
+        Some(&m),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -618,10 +698,24 @@ async fn remove_series_member(
         PermissionMask::WRITE,
     )
     .await?;
-    s.meta
+    let res = s
+        .meta
         .remove_from_series(&series_id, &file_id)
         .await
-        .map_err(ApiError::from_db)?;
+        .map_err(ApiError::from_db);
+    let sid = series_id.to_string();
+    let m = format!("{{\"file_id\":\"{}\"}}", file_id);
+    audit_event(
+        &s,
+        &ctx,
+        "remove_from_series",
+        Some("series"),
+        Some(&sid),
+        Some(&m),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -701,13 +795,25 @@ async fn delete_saved_query(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_authenticated(&ctx).await?;
-    let id = uuid::Uuid::parse_str(&id)
+    let qid = uuid::Uuid::parse_str(&id)
         .map(SavedQueryId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
-    s.meta
-        .delete_saved_query(&id)
+    let res = s
+        .meta
+        .delete_saved_query(&qid)
         .await
-        .map_err(ApiError::from_db)?;
+        .map_err(ApiError::from_db);
+    audit_event(
+        &s,
+        &ctx,
+        "delete_saved_query",
+        Some("query"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -816,6 +922,36 @@ async fn audit_record(audit: &SharedAuditLog, r: AuditRecord<'_>) {
     }
 }
 
+/// 短縮版ヘルパ: ctx と結果から AuditRecord を組み立てて書き込む。
+async fn audit_event(
+    s: &ApiState,
+    ctx: &AuthContext,
+    action: &str,
+    target_type: Option<&str>,
+    target_ref: Option<&str>,
+    metadata_json: Option<&str>,
+    result: &Result<(), String>,
+) {
+    let (actor_id, actor_label) = actor_info(ctx);
+    let result_str = match result {
+        Ok(()) => "ok".to_string(),
+        Err(e) => format!("error: {e}"),
+    };
+    audit_record(
+        &s.audit,
+        AuditRecord {
+            actor_id: actor_id.as_deref(),
+            actor_label: actor_label.as_deref(),
+            action,
+            target_type,
+            target_ref,
+            metadata_json,
+            result: &result_str,
+        },
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Shared URL (期限付きトークン)
 // ---------------------------------------------------------------------------
@@ -858,11 +994,23 @@ async fn issue_file_share(
         AuthContext::User { user, .. } => Some(user.username.as_str()),
         _ => None,
     };
-    let tok = s
+    let res = s
         .auth
         .issue_share_token("file", &id, input.ttl_secs, issuer)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let meta = format!("{{\"ttl_secs\":{}}}", input.ttl_secs);
+    audit_event(
+        &s,
+        &ctx,
+        "issue_file_share",
+        Some("file"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let tok = res?;
     Ok(Json(ShareTokenResponse {
         url: format!("/api/shared/{}", tok.0),
         token: tok.0,
@@ -881,11 +1029,23 @@ async fn issue_query_share(
         AuthContext::User { user, .. } => Some(user.username.as_str()),
         _ => None,
     };
-    let tok = s
+    let res = s
         .auth
         .issue_share_token("query", &id, input.ttl_secs, issuer)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let meta = format!("{{\"ttl_secs\":{}}}", input.ttl_secs);
+    audit_event(
+        &s,
+        &ctx,
+        "issue_query_share",
+        Some("query"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let tok = res?;
     Ok(Json(ShareTokenResponse {
         url: format!("/api/shared/{}/files", tok.0),
         token: tok.0,
@@ -998,11 +1158,26 @@ async fn add_acl_rule(
         expires_at: None,
     };
     // TODO: admin 権限の本実装（現状は authenticated を要求）。
-    let rule_id = s
+    let res = s
         .acl_admin
         .add_rule(&perm)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let meta = format!(
+        "{{\"subject\":\"{}\",\"target\":\"{}\",\"mask\":{},\"allow\":{}}}",
+        input.subject, input.target, input.mask, input.allow
+    );
+    audit_event(
+        &s,
+        &ctx,
+        "add_acl_rule",
+        Some("acl"),
+        res.as_ref().ok().map(|i| i.to_string()).as_deref(),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let rule_id = res?;
     Ok(Json(AclRuleCreated {
         id: rule_id.to_string(),
     }))
@@ -1137,6 +1312,19 @@ pub enum ApiError {
     Forbidden,
     Conflict,
     Internal(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::NotFound => write!(f, "not found"),
+            ApiError::BadRequest(m) => write!(f, "bad request: {m}"),
+            ApiError::Unauthorized => write!(f, "unauthorized"),
+            ApiError::Forbidden => write!(f, "forbidden"),
+            ApiError::Conflict => write!(f, "conflict"),
+            ApiError::Internal(m) => write!(f, "internal: {m}"),
+        }
+    }
 }
 
 impl ApiError {
