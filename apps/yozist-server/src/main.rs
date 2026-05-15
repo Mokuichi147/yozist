@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use yozist_api::ApiState;
-use yozist_auth::SqliteAuthService;
+use yozist_auth::{AuthService, Authorizer, DbAuthorizer, SqliteAuthService};
 use yozist_db::{SharedMetaStore, SqliteMetaStore};
 use yozist_storage::FsBlobStore;
 use yozist_versioning::{CrdtRegistry, VersioningEngine};
@@ -87,12 +87,18 @@ async fn main() -> anyhow::Result<()> {
 
             let secret_path = cli.data.join("jwt-secret.bin");
             let secret = load_or_create_secret(&secret_path).await?;
-            let auth = Arc::new(SqliteAuthService::new(pool, secret));
+            let auth: Arc<dyn AuthService> =
+                Arc::new(SqliteAuthService::new(pool.clone(), secret));
+
+            let db_authz = Arc::new(DbAuthorizer::new(pool));
+            let authz: Arc<dyn Authorizer> = db_authz.clone();
 
             let state = ApiState {
                 meta,
                 engine,
                 auth,
+                authz,
+                acl_admin: db_authz,
             };
             let app = yozist_api::router(state);
 

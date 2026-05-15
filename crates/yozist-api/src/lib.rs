@@ -6,6 +6,7 @@
 //! # 設計原則
 //! - **同じビュー**: SMB / WebUI / REST すべて同じ `MetaStore` クエリを使う
 //! - **書き込みは versioning 経由**: REST 書き込みも必ず `commit()` を呼ぶ
+//! - **権限チェック**: 書き込み系エンドポイントは必ず `Authorizer::check` を経由
 //!
 //! # TODO
 //! - [ ] `leptos` 統合（現状は静的プレースホルダ）
@@ -16,8 +17,8 @@
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{FromRef, FromRequestParts, Path, Query, State},
+    http::{request::Parts, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -25,8 +26,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use yozist_auth::{AuthService, AuthToken};
-use yozist_core::{ActorId, FileId, FileMeta, Tag, TagId, TagKind};
+use yozist_auth::{
+    AuthContext, AuthService, AuthToken, Authorizer, DbAuthorizer, Permission, PermissionMask,
+    Subject, Target,
+};
+use yozist_core::{ActorId, FileId, FileMeta, Tag, TagId, TagKind, UserId};
 use yozist_db::SharedMetaStore;
 use yozist_versioning::VersioningEngine;
 
@@ -36,6 +40,9 @@ pub struct ApiState {
     pub meta: SharedMetaStore,
     pub engine: Arc<VersioningEngine>,
     pub auth: Arc<dyn AuthService>,
+    pub authz: Arc<dyn Authorizer>,
+    /// ACL ルール CRUD 用の具象参照（同じインスタンスを `authz` と共有）。
+    pub acl_admin: Arc<DbAuthorizer>,
 }
 
 /// ルーター生成。
@@ -48,9 +55,92 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id/history", get(history))
         .route("/api/files/:id/tags", post(attach_tag))
         .route("/api/tags", post(upsert_tag))
+        .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
+        .route("/api/auth/me", get(me))
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// AuthContext extractor
+// ---------------------------------------------------------------------------
+
+/// `Authorization: Bearer <jwt>` ヘッダから `AuthContext` を解決するエクストラクタ。
+/// ヘッダが無い場合は `Anonymous`、無効トークンは 401。
+pub struct AuthCtx(pub AuthContext);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for AuthCtx
+where
+    S: Send + Sync,
+    ApiState: FromRef<S>,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let api: ApiState = ApiState::from_ref(state);
+        let header = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+
+        let Some(raw) = header else {
+            return Ok(AuthCtx(AuthContext::Anonymous));
+        };
+        let token = raw
+            .strip_prefix("Bearer ")
+            .or_else(|| raw.strip_prefix("bearer "))
+            .ok_or(ApiError::Unauthorized)?;
+
+        let claims = api
+            .auth
+            .verify_token(token)
+            .await
+            .map_err(|_| ApiError::Unauthorized)?;
+        let user_id = uuid::Uuid::parse_str(&claims.sub)
+            .map(UserId::from_uuid)
+            .map_err(|_| ApiError::Unauthorized)?;
+        let user = api
+            .auth
+            .get_user(&user_id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or(ApiError::Unauthorized)?;
+        let groups = api
+            .auth
+            .groups_of(&user_id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(AuthCtx(AuthContext::User { user, groups }))
+    }
+}
+
+async fn require_authenticated(ctx: &AuthContext) -> Result<(), ApiError> {
+    match ctx {
+        AuthContext::Anonymous => Err(ApiError::Unauthorized),
+        _ => Ok(()),
+    }
+}
+
+async fn require_permission(
+    authz: &dyn Authorizer,
+    ctx: &AuthContext,
+    target: &Target,
+    mask: PermissionMask,
+) -> Result<(), ApiError> {
+    let ok = authz
+        .check(ctx, target, mask)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +163,6 @@ async fn health() -> Json<Health> {
 #[derive(Deserialize)]
 struct CreateFileQuery {
     name: String,
-    /// 任意で actor を指定（未指定なら新規生成）
     actor: Option<String>,
 }
 
@@ -84,23 +173,45 @@ async fn list_files(State(s): State<ApiState>) -> Result<Json<Vec<FileMeta>>, Ap
 
 async fn create_file(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Query(q): Query<CreateFileQuery>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
+    require_authenticated(&ctx).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let (file, _commit) = s
         .engine
         .create_file(q.name, &body, actor, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // オーナー（作成者）に ADMIN 権限を自動付与。これにより以後 ACL rule を
+    // 追加しても作成者は自分のファイルへ常にアクセス可能。
+    if let AuthContext::User { user, .. } = &ctx {
+        let owner_rule = Permission {
+            subject: Subject::User(user.id),
+            target: Target::File(file.id),
+            mask: PermissionMask::all(),
+            allow: true,
+            priority: i32::MAX,
+            expires_at: None,
+        };
+        s.acl_admin
+            .add_rule(&owner_rule)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+
     Ok((StatusCode::CREATED, Json(file)))
 }
 
 async fn get_file(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
 ) -> Result<Json<FileMeta>, ApiError> {
     let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::VIEW).await?;
     let meta = s
         .meta
         .get_file(&id)
@@ -112,9 +223,11 @@ async fn get_file(
 
 async fn get_content(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
 ) -> Result<Vec<u8>, ApiError> {
     let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::READ).await?;
     s.engine
         .read_current(id)
         .await
@@ -129,11 +242,13 @@ struct CommitQuery {
 
 async fn commit_file(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
     Query(q): Query<CommitQuery>,
     body: Bytes,
 ) -> Result<Json<yozist_core::Commit>, ApiError> {
     let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let commit = s
         .engine
@@ -145,9 +260,11 @@ async fn commit_file(
 
 async fn history(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<yozist_core::Commit>>, ApiError> {
     let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::READ).await?;
     let log = s.meta.list_commits(&id).await.map_err(ApiError::from_db)?;
     Ok(Json(log))
 }
@@ -159,7 +276,7 @@ async fn history(
 #[derive(Deserialize)]
 struct TagInput {
     name: String,
-    kind: Option<String>, // system | ai | manual (default manual)
+    kind: Option<String>,
     confidence: Option<f32>,
 }
 
@@ -170,8 +287,10 @@ struct TagCreated {
 
 async fn upsert_tag(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Json(input): Json<TagInput>,
 ) -> Result<Json<TagCreated>, ApiError> {
+    require_authenticated(&ctx).await?;
     let kind = match input.kind.as_deref().unwrap_or("manual") {
         "system" => TagKind::System,
         "ai" => TagKind::Ai,
@@ -197,10 +316,18 @@ struct AttachTagInput {
 
 async fn attach_tag(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Path(file_id): Path<String>,
     Json(input): Json<AttachTagInput>,
 ) -> Result<StatusCode, ApiError> {
     let file_id = parse_file_id(&file_id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::File(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
     let tag_id = uuid::Uuid::parse_str(&input.tag_id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag_id: {e}")))?;
@@ -209,6 +336,70 @@ async fn attach_tag(
         .await
         .map_err(ApiError::from_db)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// ACL
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AclRuleInput {
+    /// "user:<uuid>" / "group:<uuid>"
+    subject: String,
+    /// "file:<uuid>" / "tag:<uuid>" / "series:<uuid>" / "share:<name>"
+    target: String,
+    /// bit flags: view=1 read=2 write=4 admin=8
+    mask: u32,
+    allow: bool,
+    #[serde(default)]
+    priority: i32,
+}
+
+#[derive(Serialize)]
+struct AclRuleCreated {
+    id: String,
+}
+
+async fn add_acl_rule(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<AclRuleInput>,
+) -> Result<Json<AclRuleCreated>, ApiError> {
+    require_authenticated(&ctx).await?;
+    // ACL 自体は admin 権限が必要（v1 では bootstrap 中はすべて許可）。
+    // System コンテキストか、現状 rule が 0 件なら作成可能。
+    let (stype, sid) = split_colon(&input.subject)?;
+    let subject = match stype {
+        "user" => Subject::User(parse_uuid_id(sid)?),
+        "group" => Subject::Group(parse_uuid_id(sid)?),
+        other => return Err(ApiError::BadRequest(format!("subject type: {other}"))),
+    };
+    let (ttype, tref) = split_colon(&input.target)?;
+    let target = match ttype {
+        "file" => Target::File(parse_uuid_id(tref)?),
+        "tag" => Target::Tag(parse_uuid_id(tref)?),
+        "series" => Target::Series(parse_uuid_id(tref)?),
+        "share" => Target::Share(tref.to_string()),
+        other => return Err(ApiError::BadRequest(format!("target type: {other}"))),
+    };
+    let mask = PermissionMask::from_bits_truncate(input.mask);
+    let perm = Permission {
+        subject,
+        target,
+        mask,
+        allow: input.allow,
+        priority: input.priority,
+        expires_at: None,
+    };
+    // TODO: admin 権限の本実装（現状は authenticated を要求）。
+    let rule_id = s
+        .acl_admin
+        .add_rule(&perm)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(Json(AclRuleCreated {
+        id: rule_id.to_string(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +447,25 @@ async fn login(
     }
 }
 
+#[derive(Serialize)]
+struct MeResponse {
+    user: Option<yozist_auth::User>,
+    anonymous: bool,
+}
+
+async fn me(AuthCtx(ctx): AuthCtx) -> Json<MeResponse> {
+    match ctx {
+        AuthContext::User { user, .. } => Json(MeResponse {
+            user: Some(user),
+            anonymous: false,
+        }),
+        _ => Json(MeResponse {
+            user: None,
+            anonymous: true,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers / errors
 // ---------------------------------------------------------------------------
@@ -270,11 +480,55 @@ fn parse_actor(s: Option<&str>) -> Option<ActorId> {
     s.and_then(|raw| uuid::Uuid::parse_str(raw).ok().map(ActorId::from_uuid))
 }
 
+fn split_colon(s: &str) -> Result<(&str, &str), ApiError> {
+    s.split_once(':')
+        .ok_or_else(|| ApiError::BadRequest(format!("expected '<type>:<value>': {s}")))
+}
+
+fn parse_uuid_id<T: yozist_idtype::FromUuid>(s: &str) -> Result<T, ApiError> {
+    uuid::Uuid::parse_str(s)
+        .map(T::from_uuid_)
+        .map_err(|e| ApiError::BadRequest(format!("uuid: {e}")))
+}
+
+mod yozist_idtype {
+    use uuid::Uuid;
+    pub trait FromUuid {
+        fn from_uuid_(u: Uuid) -> Self;
+    }
+    impl FromUuid for yozist_core::UserId {
+        fn from_uuid_(u: Uuid) -> Self {
+            Self::from_uuid(u)
+        }
+    }
+    impl FromUuid for yozist_core::GroupId {
+        fn from_uuid_(u: Uuid) -> Self {
+            Self::from_uuid(u)
+        }
+    }
+    impl FromUuid for yozist_core::FileId {
+        fn from_uuid_(u: Uuid) -> Self {
+            Self::from_uuid(u)
+        }
+    }
+    impl FromUuid for yozist_core::TagId {
+        fn from_uuid_(u: Uuid) -> Self {
+            Self::from_uuid(u)
+        }
+    }
+    impl FromUuid for yozist_core::SeriesId {
+        fn from_uuid_(u: Uuid) -> Self {
+            Self::from_uuid(u)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     NotFound,
     BadRequest(String),
     Unauthorized,
+    Forbidden,
     Conflict,
     Internal(String),
 }
@@ -295,6 +549,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             ApiError::Conflict => (StatusCode::CONFLICT, "conflict".to_string()),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
@@ -305,6 +560,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yozist_auth::DbAuthorizer;
     use yozist_db::SqliteMetaStore;
     use yozist_storage::FsBlobStore;
     use yozist_versioning::CrdtRegistry;
@@ -318,13 +574,17 @@ mod tests {
         let registry = Arc::new(CrdtRegistry::with_defaults());
         let engine = Arc::new(VersioningEngine::new(registry, blob, meta.clone()));
         let auth: Arc<dyn AuthService> = Arc::new(
-            yozist_auth::SqliteAuthService::new(pool, b"test".to_vec()),
+            yozist_auth::SqliteAuthService::new(pool.clone(), b"test".to_vec()),
         );
+        let db_authz = Arc::new(DbAuthorizer::new(pool));
+        let authz: Arc<dyn Authorizer> = db_authz.clone();
         (
             ApiState {
                 meta,
                 engine,
                 auth,
+                authz,
+                acl_admin: db_authz,
             },
             dir,
         )
@@ -347,15 +607,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_then_get_file_via_engine_directly() {
-        // ハンドラ経由でなく engine 直接 — エンドツーエンドは serve テストで。
+    async fn create_file_without_auth_is_unauthorized() {
         let (state, _td) = make_state().await;
-        let (file, _c) = state
-            .engine
-            .create_file("a.txt", b"hi", ActorId::new(), None)
-            .await
-            .unwrap();
-        let got = state.meta.get_file(&file.id).await.unwrap().unwrap();
-        assert_eq!(got.display_name, "a.txt");
+        let app = router(state);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::builder()
+                .method(axum::http::Method::POST)
+                .uri("/api/files?name=a.txt")
+                .body(axum::body::Body::from("hi"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

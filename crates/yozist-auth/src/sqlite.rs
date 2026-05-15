@@ -209,6 +209,20 @@ impl AuthService for SqliteAuthService {
         Ok(data.claims)
     }
 
+    async fn get_user(&self, id: &UserId) -> Result<Option<User>, AuthError> {
+        let row = sqlx::query(
+            "SELECT id, username, display_name, is_active, created_at FROM users WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_user).transpose()
+    }
+
+    async fn groups_of(&self, user: &UserId) -> Result<Vec<GroupId>, AuthError> {
+        self.user_groups(user).await
+    }
+
     async fn list_users(&self) -> Result<Vec<User>, AuthError> {
         let rows = sqlx::query(
             "SELECT id, username, display_name, is_active, created_at

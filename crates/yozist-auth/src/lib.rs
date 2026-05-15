@@ -25,8 +25,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use yozist_core::{GroupId, UserId};
 
+pub mod authorizer;
 pub mod permission;
 pub mod sqlite;
+pub use authorizer::DbAuthorizer;
 pub use permission::{Permission, PermissionMask, Subject, Target};
 pub use sqlite::SqliteAuthService;
 
@@ -79,6 +81,8 @@ pub trait AuthService: Send + Sync {
     ) -> Result<Option<AuthToken>, AuthError>;
     async fn verify_token(&self, token: &str) -> Result<TokenClaims, AuthError>;
     async fn list_users(&self) -> Result<Vec<User>, AuthError>;
+    async fn get_user(&self, id: &UserId) -> Result<Option<User>, AuthError>;
+    async fn groups_of(&self, user: &UserId) -> Result<Vec<GroupId>, AuthError>;
     async fn add_user_to_group(
         &self,
         user: UserId,
