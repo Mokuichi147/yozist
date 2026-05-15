@@ -2,7 +2,6 @@
 name = "yozist-storage"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 repository.workspace = true
 description = "yozist: pluggable blob storage abstraction (BlobStore trait + reference implementations)."
 

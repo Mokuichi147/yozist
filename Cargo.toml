@@ -17,7 +17,6 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
 repository = "https://github.com/mokuichi147/yozist"
 authors = ["mokuichi147 <mokuichi147@gmail.com>"]
 

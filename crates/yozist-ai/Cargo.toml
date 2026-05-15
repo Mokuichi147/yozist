@@ -2,7 +2,6 @@
 name = "yozist-ai"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 repository.workspace = true
 description = "yozist: AI analysis providers (tag suggestion, summarization)."
 

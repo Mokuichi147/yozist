@@ -77,4 +77,4 @@ cargo run -p yozist-server -- serve
 
 ## ライセンス
 
-MIT
+未定。
