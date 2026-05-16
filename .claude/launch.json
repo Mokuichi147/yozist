@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "yozist-server",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": [
+        "run", "-p", "yozist-server", "--",
+        "--smb-listen", "",
+        "serve"
+      ],
+      "port": 7878
+    }
+  ]
+}

@@ -2,153 +2,208 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>yozist</title>
+<script>
+  // OS のダーク設定に追従 (Tailwind/daisyUI が DOM を見る前に data-theme を確定させる)
+  document.documentElement.setAttribute(
+    'data-theme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  );
+</script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 <style>
-  :root { color-scheme: light dark; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "Hiragino Sans", sans-serif;
-    margin: 0; padding: 20px; max-width: 1100px; margin: 0 auto;
-    background: var(--bg, #fafafa); color: var(--fg, #222);
-  }
-  @media (prefers-color-scheme: dark) {
-    body { --bg: #1a1a1a; --fg: #eee; }
-    .card { background: #242424; border-color: #333; }
-    .row:hover { background: #2c2c2c; }
-    input, button { background: #2a2a2a; color: #eee; border-color: #444; }
-  }
-  header { display: flex; align-items: baseline; gap: 20px; margin-bottom: 20px; }
-  h1 { font-size: 22px; margin: 0; }
-  .me { font-size: 13px; opacity: 0.7; }
-  .grid { display: grid; grid-template-columns: 220px 1fr; gap: 20px; }
-  .card {
-    background: #fff; border: 1px solid #ddd; border-radius: 8px;
-    padding: 12px; margin-bottom: 14px;
-  }
-  .card h2 { font-size: 13px; text-transform: uppercase; margin: 0 0 8px;
-             color: #888; letter-spacing: 0.05em; }
-  ul.list { list-style: none; margin: 0; padding: 0; max-height: 70vh; overflow-y: auto; }
-  ul.list li {
-    padding: 6px 8px; border-radius: 4px; cursor: pointer; font-size: 13px;
-  }
-  ul.list li:hover { background: rgba(0,123,255,0.1); }
-  ul.list li.active { background: rgba(0,123,255,0.2); font-weight: 600; }
-  .row { padding: 6px 8px; border-radius: 4px; }
-  .row:hover { background: #f0f0f0; }
-  .tag-chip {
-    display: inline-block; padding: 2px 8px; margin: 2px;
-    border-radius: 10px; background: rgba(0,123,255,0.15); font-size: 12px;
-  }
-  .tag-chip.system { background: rgba(128,128,128,0.2); }
-  .tag-chip.ai { background: rgba(255,140,0,0.2); }
-  pre {
-    background: rgba(127,127,127,0.1); padding: 10px; border-radius: 4px;
-    overflow-x: auto; font-size: 12px; max-height: 400px;
-  }
-  input, button {
-    font-size: 13px; padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc;
-    background: #fff; color: inherit;
-  }
-  button { cursor: pointer; }
-  button.primary { background: #0070f3; color: white; border-color: #0070f3; }
-  .login { max-width: 320px; margin: 100px auto; }
-  .empty { color: #999; font-size: 13px; padding: 8px; }
-  .small { font-size: 11px; color: #888; }
-  details summary { cursor: pointer; padding: 4px 0; font-weight: 600; font-size: 13px; }
+  /* CDN ロード完了前のフラッシュ防止 */
+  .hidden { display: none !important; }
+  /* row-compact: Tailwind 拡張に頼らず純 CSS で */
+  .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
+  .row-compact:hover { background: rgba(127,127,127,0.12); }
 </style>
 </head>
-<body>
-<header>
-  <h1>yozist</h1>
-  <div class="me" id="me">…</div>
-  <div style="margin-left:auto"><button id="logout">logout</button></div>
-</header>
+<body class="min-h-screen bg-base-200 text-base-content">
 
-<div id="login-form" class="card login" style="display:none">
-  <h2>login</h2>
-  <p style="font-size:13px">未ログインです。アカウント名とパスワードを入力してください。</p>
-  <input id="lf-user" placeholder="username" style="width:100%; margin-bottom:8px"><br>
-  <input id="lf-pw" type="password" placeholder="password" style="width:100%; margin-bottom:8px"><br>
-  <button class="primary" onclick="doLogin()">login</button>
-  <button onclick="doRegister()">register</button>
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
+  <div class="flex-1 px-2">
+    <span class="text-xl font-bold">yozist</span>
+  </div>
+  <div class="flex-none flex items-center gap-3 px-2">
+    <span id="me" class="text-sm opacity-70">…</span>
+    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  </div>
 </div>
 
-<div id="main" style="display:none">
-<div class="grid">
-  <div>
-    <div class="card">
-      <h2>tags</h2>
-      <ul class="list" id="tag-list"></ul>
-    </div>
-    <div class="card">
-      <h2>series</h2>
-      <ul class="list" id="series-list"></ul>
+<!-- ログインフォーム -->
+<div id="login-form" class="hidden">
+  <div class="card bg-base-100 shadow-md max-w-sm mx-auto mt-24">
+    <div class="card-body">
+      <h2 class="card-title text-sm uppercase tracking-wider opacity-70">ログイン</h2>
+      <p class="text-sm opacity-70">未ログインです。アカウント名とパスワードを入力してください。</p>
+      <input id="lf-user" class="input input-bordered w-full" placeholder="username">
+      <input id="lf-pw" type="password" class="input input-bordered w-full" placeholder="password">
+      <div class="card-actions mt-2 flex justify-between items-center">
+        <button class="btn btn-primary btn-sm" onclick="doLogin()">ログイン</button>
+        <button class="btn btn-sm btn-ghost btn-link" onclick="doRegister()">アカウント作成</button>
+      </div>
     </div>
   </div>
-  <div>
-    <div class="card">
-      <h2>files <span class="small" id="files-count"></span></h2>
-      <div style="display:flex; gap:6px; margin-bottom:8px">
-        <input id="search-input" placeholder="全文検索 (FTS5)" style="flex:1" onkeydown="if(event.key==='Enter')doSearch()">
-        <button onclick="doSearch()">検索</button>
-        <button onclick="clearSearch()" class="small">×</button>
-      </div>
-      <div id="file-filter" class="small" style="margin-bottom:8px"></div>
-      <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center">
-        <input id="upload-name" placeholder="新規ファイル名 (例: memo.md)" style="flex:1">
-        <textarea id="upload-content" placeholder="本文 (省略可)" style="width:100%; min-height:60px; flex-basis:100%"></textarea>
-        <input type="file" id="upload-file" style="font-size:11px">
-        <button class="primary" onclick="doUpload()">登録</button>
-      </div>
-      <ul class="list" id="file-list"></ul>
-    </div>
-    <div class="card" id="file-detail" style="display:none">
-      <h2 id="fd-name">…</h2>
-      <div id="fd-meta" class="small"></div>
-      <div id="fd-tags" style="margin: 8px 0"></div>
-      <div style="display:flex; gap:6px; margin:6px 0">
-        <input id="fd-add-tag" placeholder="タグ名を入力して追加" style="flex:1">
-        <button onclick="addTagToCurrent()">+ タグ</button>
-      </div>
-      <div style="display:flex; gap:6px; margin:6px 0">
-        <select id="fd-add-series" style="flex:1"><option value="">シリーズ選択…</option></select>
-        <button onclick="addToSeries()">+ シリーズ</button>
-      </div>
-      <div style="display:flex; gap:6px; margin: 6px 0">
-        <button onclick="issueShare()">共有URLを発行</button>
-        <button onclick="grantPermission()">権限付与</button>
-        <button onclick="toggleEdit()">編集</button>
-        <button style="color:#c00; border-color:#c00" onclick="deleteCurrentFile()">削除</button>
-      </div>
-      <div id="fd-share" class="small" style="word-break:break-all; margin:6px 0"></div>
-      <div id="fd-editor" style="display:none; margin:6px 0">
-        <textarea id="fd-edit-textarea" style="width:100%; min-height:200px; font-family:monospace; font-size:12px"></textarea>
-        <div style="display:flex; gap:6px; margin-top:6px">
-          <input id="fd-edit-message" placeholder="コミットメッセージ (任意)" style="flex:1">
-          <button class="primary" onclick="saveEdit()">保存</button>
-          <button onclick="toggleEdit()">キャンセル</button>
+</div>
+
+<!-- メイン -->
+<div id="main" class="hidden max-w-7xl mx-auto p-4">
+  <div class="grid grid-cols-1 md:grid-cols-[240px_1fr] gap-4">
+
+    <!-- 左カラム: tags / series -->
+    <div class="space-y-4">
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold mb-2">tags</h2>
+          <ul class="menu menu-sm p-0 max-h-[60vh] overflow-y-auto w-full" id="tag-list"></ul>
         </div>
       </div>
-      <details><summary>content</summary><pre id="fd-content">…</pre></details>
-      <details><summary>history</summary><div id="fd-history">…</div></details>
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold mb-2">series</h2>
+          <ul class="menu menu-sm p-0 max-h-[60vh] overflow-y-auto w-full" id="series-list"></ul>
+        </div>
+      </div>
     </div>
-    <div class="card">
-      <h2>groups <button onclick="createGroup()" style="float:right; font-size:11px">+ 新規</button></h2>
-      <div id="group-list" class="small">…</div>
-    </div>
-    <div class="card">
-      <h2>saved queries <button onclick="createQuery()" style="float:right; font-size:11px">+ 新規</button></h2>
-      <div id="query-list" class="small">…</div>
-    </div>
-    <div class="card">
-      <h2>active shares <button onclick="loadShares()" style="float:right; font-size:11px">refresh</button></h2>
-      <div id="share-list" class="small">…</div>
-    </div>
-    <div class="card">
-      <h2>audit log <button onclick="loadAudit()" style="float:right; font-size:11px">refresh</button></h2>
-      <div id="audit-list" class="small">…</div>
+
+    <!-- 右カラム: files / detail / groups / queries / shares / audit -->
+    <div class="space-y-4">
+
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold mb-2">
+            files <span class="opacity-60 normal-case" id="files-count"></span>
+          </h2>
+
+          <div class="join w-full mb-2">
+            <input id="search-input" class="input input-bordered input-sm join-item w-full"
+                   placeholder="全文検索 (FTS5)"
+                   onkeydown="if(event.key==='Enter')doSearch()">
+            <button class="btn btn-sm join-item" onclick="doSearch()">検索</button>
+            <button class="btn btn-sm join-item btn-ghost" onclick="clearSearch()" title="クリア">×</button>
+          </div>
+          <div id="file-filter" class="text-xs opacity-60 mb-2"></div>
+
+          <div class="border border-base-300 rounded-lg p-3 mb-3 space-y-2 bg-base-200/40">
+            <input id="upload-name" class="input input-bordered input-sm w-full"
+                   placeholder="新規ファイル名 (例: memo.md)">
+            <textarea id="upload-content" class="textarea textarea-bordered w-full text-sm"
+                      placeholder="本文 (省略可)" rows="3"></textarea>
+            <div class="flex flex-wrap items-center gap-2">
+              <input type="file" id="upload-file" class="file-input file-input-bordered file-input-xs flex-1 min-w-[160px]">
+              <button class="btn btn-primary btn-sm" onclick="doUpload()">登録</button>
+            </div>
+          </div>
+
+          <ul class="divide-y divide-base-300 max-h-[50vh] overflow-y-auto" id="file-list"></ul>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 shadow-sm hidden" id="file-detail">
+        <div class="card-body p-4">
+          <h2 id="fd-name" class="card-title text-base">…</h2>
+          <div id="fd-meta" class="text-xs opacity-60 break-all"></div>
+          <div id="fd-tags" class="my-2 flex flex-wrap gap-1"></div>
+
+          <div class="join w-full">
+            <input id="fd-add-tag" class="input input-bordered input-sm join-item w-full"
+                   placeholder="タグ名を入力して追加">
+            <button class="btn btn-sm join-item" onclick="addTagToCurrent()">+ タグ</button>
+          </div>
+
+          <div class="join w-full mt-2">
+            <select id="fd-add-series" class="select select-bordered select-sm join-item w-full">
+              <option value="">シリーズ選択…</option>
+            </select>
+            <button class="btn btn-sm join-item" onclick="addToSeries()">+ シリーズ</button>
+          </div>
+
+          <div class="flex flex-wrap gap-2 mt-3">
+            <button class="btn btn-sm" onclick="issueShare()">共有URLを発行</button>
+            <button class="btn btn-sm" onclick="grantPermission()">権限付与</button>
+            <button class="btn btn-sm" onclick="toggleEdit()">編集</button>
+            <button class="btn btn-sm btn-error btn-outline" onclick="deleteCurrentFile()">削除</button>
+          </div>
+
+          <div id="fd-share" class="text-xs break-all my-2"></div>
+
+          <div id="fd-editor" class="hidden my-2 space-y-2">
+            <textarea id="fd-edit-textarea"
+                      class="textarea textarea-bordered w-full font-mono text-xs"
+                      rows="12"></textarea>
+            <div class="join w-full">
+              <input id="fd-edit-message" class="input input-bordered input-sm join-item w-full"
+                     placeholder="コミットメッセージ (任意)">
+              <button class="btn btn-primary btn-sm join-item" onclick="saveEdit()">保存</button>
+              <button class="btn btn-sm join-item" onclick="toggleEdit()">キャンセル</button>
+            </div>
+          </div>
+
+          <div class="collapse collapse-arrow bg-base-200 mt-2">
+            <input type="checkbox">
+            <div class="collapse-title text-sm font-semibold py-2 min-h-0">content</div>
+            <div class="collapse-content">
+              <pre id="fd-content"
+                   class="bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-96 whitespace-pre-wrap break-words">…</pre>
+            </div>
+          </div>
+
+          <div class="collapse collapse-arrow bg-base-200 mt-2">
+            <input type="checkbox">
+            <div class="collapse-title text-sm font-semibold py-2 min-h-0">history</div>
+            <div class="collapse-content">
+              <div id="fd-history" class="space-y-1">…</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">groups</h2>
+            <button class="btn btn-xs" onclick="createGroup()">+ 新規</button>
+          </div>
+          <div id="group-list" class="text-sm space-y-1">…</div>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">saved queries</h2>
+            <button class="btn btn-xs" onclick="createQuery()">+ 新規</button>
+          </div>
+          <div id="query-list" class="text-sm space-y-1">…</div>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">active shares</h2>
+            <button class="btn btn-xs btn-ghost" onclick="loadShares()">refresh</button>
+          </div>
+          <div id="share-list" class="text-sm space-y-1">…</div>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">audit log</h2>
+            <button class="btn btn-xs btn-ghost" onclick="loadAudit()">refresh</button>
+          </div>
+          <div id="audit-list" class="text-sm space-y-1">…</div>
+        </div>
+      </div>
+
     </div>
   </div>
-</div>
 </div>
 
 <script>
@@ -163,11 +218,16 @@ function api(path, opts = {}) {
 }
 function json(path, opts) {
   opts = opts || {};
-  if (opts.body && typeof opts.body === 'object') {
+  if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof ArrayBuffer)) {
     opts.body = JSON.stringify(opts.body);
     opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
   }
-  return api(path, opts).then(r => r.ok ? r.json() : Promise.reject(r));
+  return api(path, opts).then(async r => {
+    if (!r.ok) return Promise.reject(r);
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
 }
 
 async function doLogin() {
@@ -201,8 +261,14 @@ function logout() {
   showLogin();
 }
 
-function showLogin() { $('login-form').style.display = 'block'; $('main').style.display = 'none'; }
-function showMain() { $('login-form').style.display = 'none'; $('main').style.display = 'block'; }
+function showLogin() {
+  $('login-form').classList.remove('hidden');
+  $('main').classList.add('hidden');
+}
+function showMain() {
+  $('login-form').classList.add('hidden');
+  $('main').classList.remove('hidden');
+}
 
 async function init() {
   if (!token) { showLogin(); return; }
@@ -224,15 +290,15 @@ async function loadGroups() {
   try {
     const list = await json('/api/groups');
     const byId = Object.fromEntries(list.map(g => [g.id, g]));
-    if (list.length === 0) { el.innerHTML = '<div class="empty">グループなし</div>'; return; }
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">グループなし</div>'; return; }
     el.innerHTML = list.map(g => {
-      const parent = g.parent_id ? ` <span class="small">⊂ ${escape(byId[g.parent_id]?.name || '?')}</span>` : '';
-      return `<div class="row">
-        <strong>${escape(g.name)}</strong>${parent}
-        <button style="float:right;font-size:10px;margin-left:4px" onclick="manageGroupMembers('${g.id}','${escape(g.name)}')">メンバー</button>
+      const parent = g.parent_id ? ` <span class="text-xs opacity-60">⊂ ${escapeHtml(byId[g.parent_id]?.name || '?')}</span>` : '';
+      return `<div class="flex items-center justify-between row-compact">
+        <div><span class="font-semibold">${escapeHtml(g.name)}</span>${parent}</div>
+        <button class="btn btn-xs" onclick="manageGroupMembers('${g.id}','${escapeHtml(g.name)}')">メンバー</button>
       </div>`;
     }).join('');
-  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
 async function createGroup() {
@@ -289,18 +355,23 @@ async function loadQueries() {
   const el = $('query-list');
   try {
     const list = await fetch('/api/queries').then(r => r.json());
-    if (list.length === 0) { el.innerHTML = '<div class="empty">保存クエリなし</div>'; return; }
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">保存クエリなし</div>'; return; }
     el.innerHTML = list.map(q => {
       const cond = [];
       if (q.query.tags_and && q.query.tags_and.length) cond.push('AND: ' + q.query.tags_and.join(','));
       if (q.query.tags_not && q.query.tags_not.length) cond.push('NOT: ' + q.query.tags_not.join(','));
-      return `<div class="row">
-        <strong>${escape(q.name)}</strong> <span class="small">${cond.join(' / ') || '全件'}</span>
-        <button style="float:right;font-size:10px;margin-left:4px" onclick="deleteQuery('${q.id}')">削除</button>
-        <button style="float:right;font-size:10px;margin-left:4px" onclick="shareQuery('${q.id}','${escape(q.name)}')">共有</button>
+      return `<div class="flex items-center justify-between row-compact">
+        <div>
+          <span class="font-semibold">${escapeHtml(q.name)}</span>
+          <span class="text-xs opacity-60 ml-1">${cond.join(' / ') || '全件'}</span>
+        </div>
+        <div class="flex gap-1">
+          <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
+          <button class="btn btn-xs btn-error btn-outline" onclick="deleteQuery('${q.id}')">削除</button>
+        </div>
       </div>`;
     }).join('');
-  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
 async function createQuery() {
@@ -373,19 +444,25 @@ async function loadTags() {
   const tags = await fetch('/api/tags').then(r => r.json());
   const el = $('tag-list');
   el.innerHTML = '';
-  if (tags.length === 0) { el.innerHTML = '<div class="empty">タグなし</div>'; return; }
+  if (tags.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs px-2 py-1">タグなし</div>'; return; }
   tags.forEach(t => {
     const li = document.createElement('li');
-    li.className = filterTags.includes(t.name) ? 'active' : '';
+    const active = filterTags.includes(t.name);
     const icon = t.kind === 'system' ? '⚙' : t.kind === 'ai' ? '🤖' : '';
-    li.innerHTML = `<span style="flex:1">${escape(t.name)} ${icon}</span>` +
-      `<a href="#" style="margin-left:4px; color:#888" title="リネーム">✎</a>` +
-      `<a href="#" style="margin-left:4px; color:#c00" title="削除">×</a>`;
-    li.style.display = 'flex';
-    li.style.alignItems = 'center';
-    const [_, renameLink, deleteLink] = li.querySelectorAll('span, a, a');
-    const links = li.querySelectorAll('a');
-    links[0].onclick = async (e) => {
+    const a = document.createElement('a');
+    a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded ' +
+      (active ? 'bg-primary/20 font-semibold' : 'hover:bg-base-200');
+    a.innerHTML = `<span class="flex-1 truncate">${escapeHtml(t.name)} ${icon}</span>`;
+    const renameBtn = document.createElement('button');
+    renameBtn.className = 'btn btn-xs btn-ghost px-1';
+    renameBtn.title = 'リネーム';
+    renameBtn.textContent = '✎';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-xs btn-ghost px-1 text-error';
+    delBtn.title = '削除';
+    delBtn.textContent = '×';
+    a.append(renameBtn, delBtn);
+    renameBtn.onclick = async (e) => {
       e.stopPropagation(); e.preventDefault();
       const name = prompt('新しいタグ名', t.name);
       if (!name || name === t.name) return;
@@ -396,18 +473,20 @@ async function loadTags() {
       });
       await refresh();
     };
-    links[1].onclick = async (e) => {
+    delBtn.onclick = async (e) => {
       e.stopPropagation(); e.preventDefault();
       if (!confirm(`タグ "${t.name}" を削除しますか？\n(ファイル本体は残りますが、このタグの紐付けは全て解除されます)`)) return;
       await api(`/api/tags/${t.id}`, { method: 'DELETE' });
       filterTags = filterTags.filter(x => x !== t.name);
       await refresh();
     };
-    li.onclick = () => {
+    a.onclick = (e) => {
+      if (e.target === renameBtn || e.target === delBtn) return;
       const idx = filterTags.indexOf(t.name);
       if (idx >= 0) filterTags.splice(idx, 1); else filterTags.push(t.name);
       refresh();
     };
+    li.appendChild(a);
     el.appendChild(li);
   });
 }
@@ -417,18 +496,24 @@ async function loadSeries() {
   const el = $('series-list');
   el.innerHTML = '';
   if (list.length === 0) {
-    el.innerHTML = '<div class="empty">シリーズなし</div>';
+    el.innerHTML = '<div class="opacity-50 text-xs px-2 py-1">シリーズなし</div>';
   } else {
     list.forEach(s => {
       const li = document.createElement('li');
-      li.style.display = 'flex';
-      li.style.alignItems = 'center';
-      li.innerHTML = `<span style="flex:1">${escape(s.name)}</span>` +
-        `<a href="#" style="margin-left:4px; color:#888" title="リネーム">✎</a>` +
-        `<a href="#" style="margin-left:4px; color:#c00" title="削除">×</a>`;
-      li.title = s.description || '';
-      const links = li.querySelectorAll('a');
-      links[0].onclick = async (e) => {
+      const a = document.createElement('a');
+      a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded hover:bg-base-200';
+      a.title = s.description || '';
+      a.innerHTML = `<span class="flex-1 truncate">${escapeHtml(s.name)}</span>`;
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'btn btn-xs btn-ghost px-1';
+      renameBtn.title = 'リネーム';
+      renameBtn.textContent = '✎';
+      const delBtn = document.createElement('button');
+      delBtn.className = 'btn btn-xs btn-ghost px-1 text-error';
+      delBtn.title = '削除';
+      delBtn.textContent = '×';
+      a.append(renameBtn, delBtn);
+      renameBtn.onclick = async (e) => {
         e.stopPropagation(); e.preventDefault();
         const name = prompt('新しいシリーズ名', s.name);
         if (!name) return;
@@ -440,38 +525,43 @@ async function loadSeries() {
         });
         await refresh();
       };
-      links[1].onclick = async (e) => {
+      delBtn.onclick = async (e) => {
         e.stopPropagation(); e.preventDefault();
         if (!confirm(`シリーズ "${s.name}" を削除しますか？\n(ファイル本体は残ります)`)) return;
         await api(`/api/series/${s.id}`, { method: 'DELETE' });
         await refresh();
       };
-      li.onclick = async () => {
+      a.onclick = async (e) => {
+        if (e.target === renameBtn || e.target === delBtn) return;
         const members = await fetch('/api/series/' + s.id + '/members').then(r => r.json());
         alert(`series "${s.name}"\nメンバー: ${members.length}件\n` + members.map(m =>
           `[${m.order_index}] ${m.file_id.slice(0,8)}…`).join('\n'));
       };
+      li.appendChild(a);
       el.appendChild(li);
     });
   }
-  // 「+ 新規シリーズ」ボタンを末尾に追加
+  // 「+ 新規シリーズ」リンク
   const add = document.createElement('li');
-  add.style.fontSize = '11px';
-  add.innerHTML = '<a href="#" style="color:#0070f3">+ 新規シリーズ</a>';
-  add.onclick = async (e) => {
+  const addLink = document.createElement('a');
+  addLink.className = 'text-xs text-primary px-2 py-1';
+  addLink.href = '#';
+  addLink.textContent = '+ 新規シリーズ';
+  addLink.onclick = async (e) => {
     e.preventDefault();
     const name = prompt('シリーズ名');
     if (!name) return;
     await json('/api/series', { method: 'POST', body: { name } });
     await refresh();
   };
+  add.appendChild(addLink);
   el.appendChild(add);
 
   // file-detail の select 更新
   const sel = $('fd-add-series');
   if (sel) {
     sel.innerHTML = '<option value="">シリーズ選択…</option>' +
-      list.map(s => `<option value="${s.id}">${escape(s.name)}</option>`).join('');
+      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
   }
 }
 
@@ -479,17 +569,17 @@ async function loadShares() {
   const el = $('share-list');
   try {
     const list = await json('/api/shares');
-    if (list.length === 0) { el.innerHTML = '<div class="empty">発行済み共有なし</div>'; return; }
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">発行済み共有なし</div>'; return; }
     el.innerHTML = list.map(s => {
-      const revoked = s.revoked_at ? ' <span style="color:#c00">[失効]</span>' : '';
+      const revoked = s.revoked_at ? ' <span class="badge badge-error badge-sm">失効</span>' : '';
       const fullJti = s.jti;
-      return `<div class="row">
-        ${s.kind} / ${s.target_id.slice(0,8)}…
-        ${revoked}
-        ${!s.revoked_at ? `<button style="float:right;font-size:10px" onclick="revokeShare('${fullJti}')">失効</button>` : ''}
+      return `<div class="flex items-center justify-between row-compact">
+        <span><span class="badge badge-ghost badge-sm">${escapeHtml(s.kind)}</span>
+          <span class="opacity-70">${s.target_id.slice(0,8)}…</span>${revoked}</span>
+        ${!s.revoked_at ? `<button class="btn btn-xs btn-error btn-outline" onclick="revokeShare('${fullJti}')">失効</button>` : ''}
       </div>`;
     }).join('');
-  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
 async function revokeShare(jti) {
@@ -503,13 +593,21 @@ async function loadAudit() {
   const el = $('audit-list');
   try {
     const list = await json('/api/audit?limit=15');
-    if (list.length === 0) { el.innerHTML = '<div class="empty">監査記録なし</div>'; return; }
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">監査記録なし</div>'; return; }
     el.innerHTML = list.map(a => {
-      const status = a.result.startsWith('ok') ? '✓' : '✗';
-      const time = a.timestamp.replace('T',' ').slice(0,19);
-      return `<div class="row">${status} ${time} ${a.actor_label || '-'} ${a.action} ${a.target_type || ''} ${a.target_ref ? a.target_ref.slice(0,8)+'…' : ''}</div>`;
+      const ok = a.result.startsWith('ok');
+      const status = ok
+        ? '<span class="text-success">✓</span>'
+        : '<span class="text-error">✗</span>';
+      const time = fmtTs(a.timestamp);
+      return `<div class="row-compact text-xs">
+        ${status} <span class="opacity-70">${time}</span>
+        <span class="font-semibold">${escapeHtml(a.actor_label || '-')}</span>
+        ${escapeHtml(a.action)} ${escapeHtml(a.target_type || '')}
+        ${a.target_ref ? '<span class="opacity-60">'+a.target_ref.slice(0,8)+'…</span>' : ''}
+      </div>`;
     }).join('');
-  } catch (e) { el.innerHTML = '<div class="empty">取得失敗</div>'; }
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
 async function loadFiles() {
@@ -529,8 +627,9 @@ async function loadFiles() {
   el.innerHTML = '';
   files.forEach(f => {
     const li = document.createElement('li');
-    li.className = 'row';
-    li.innerHTML = `<strong>${escape(f.display_name)}</strong> <span class="small">${f.size}B</span>`;
+    li.className = 'px-2 py-2 rounded hover:bg-base-200 cursor-pointer flex items-center justify-between gap-2';
+    li.innerHTML = `<span class="font-semibold truncate">${escapeHtml(f.display_name)}</span>
+      <span class="text-xs opacity-60 shrink-0">${f.size}B</span>`;
     li.onclick = () => showFile(f);
     el.appendChild(li);
   });
@@ -541,38 +640,48 @@ let currentContent = '';
 
 async function showFile(f) {
   currentFile = f;
-  $('file-detail').style.display = 'block';
+  $('file-detail').classList.remove('hidden');
   $('fd-name').textContent = f.display_name;
   $('fd-meta').textContent = `id=${f.id}, size=${f.size}B, current_commit=${f.current_commit}`;
   $('fd-share').textContent = '';
-  $('fd-editor').style.display = 'none';
+  $('fd-editor').classList.add('hidden');
   const [tags, content, history] = await Promise.all([
     json(`/api/files/${f.id}/tags`),
     api(`/api/files/${f.id}/content`).then(r => r.text()),
     json(`/api/files/${f.id}/history`),
   ]);
   currentContent = content;
-  $('fd-tags').innerHTML = tags.map(t =>
-    `<span class="tag-chip ${t.kind}">${escape(t.name)}
-      <a href="#" style="color:#c00; margin-left:4px" onclick="event.preventDefault(); detachTagFromCurrent('${t.id}')">×</a>
-    </span>`
-  ).join('') || '<span class="small empty">タグなし</span>';
+  $('fd-tags').innerHTML = tags.length === 0
+    ? '<span class="opacity-50 text-xs">タグなし</span>'
+    : tags.map(t => {
+        const variant = t.kind === 'system' ? 'badge-neutral'
+                      : t.kind === 'ai' ? 'badge-warning'
+                      : 'badge-primary';
+        return `<span class="badge ${variant} badge-outline gap-1">
+          ${escapeHtml(t.name)}
+          <a href="#" class="text-error" onclick="event.preventDefault(); detachTagFromCurrent('${t.id}')">×</a>
+        </span>`;
+      }).join('');
   $('fd-content').textContent = content.length > 5000 ? content.slice(0, 5000) + '\n…' : content;
   const currentCommitId = f.current_commit;
   $('fd-history').innerHTML = history.length === 0
-    ? '<div class="empty">履歴なし</div>'
+    ? '<div class="opacity-50 text-xs">履歴なし</div>'
     : history.map(c => {
         const isCurrent = c.id === currentCommitId;
-        const time = c.timestamp.replace('T', ' ').slice(0, 19);
-        return `<div class="row" style="font-size:11px">
-          ${isCurrent ? '<strong>★</strong> ' : ''}
-          ${time} ${c.format_id} ${escape(c.message || '')}
-          <button style="float:right;font-size:10px;margin-left:4px"
-            onclick="diffCommit('${c.id}','${time}')">Δ</button>
-          <button style="float:right;font-size:10px;margin-left:4px"
-            onclick="previewCommit('${c.id}')">表示</button>
-          ${isCurrent ? '' : `<button style="float:right;font-size:10px;margin-left:4px"
-            onclick="rollbackToCommit('${c.id}','${time}')">戻す</button>`}
+        const time = fmtTs(c.timestamp);
+        return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
+          <div class="truncate">
+            ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
+            <span class="opacity-70">${time}</span>
+            <span class="opacity-60">${escapeHtml(c.format_id)}</span>
+            ${escapeHtml(c.message || '')}
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button class="btn btn-xs" onclick="diffCommit('${c.id}','${time}')">Δ</button>
+            <button class="btn btn-xs" onclick="previewCommit('${c.id}')">表示</button>
+            ${isCurrent ? '' : `<button class="btn btn-xs btn-warning btn-outline"
+              onclick="rollbackToCommit('${c.id}','${time}')">戻す</button>`}
+          </div>
         </div>`;
       }).join('');
 }
@@ -586,7 +695,6 @@ async function diffCommit(commitId, time) {
   if (!oldR.ok || !newR.ok) return alert('diff取得失敗');
   const oldText = await oldR.text();
   const newText = await newR.text();
-  // 簡易行diff
   const oldLines = oldText.split('\n');
   const newLines = newText.split('\n');
   const max = Math.max(oldLines.length, newLines.length);
@@ -653,12 +761,12 @@ async function doUpload() {
 
 function toggleEdit() {
   const ed = $('fd-editor');
-  if (ed.style.display === 'none') {
+  if (ed.classList.contains('hidden')) {
     $('fd-edit-textarea').value = currentContent;
     $('fd-edit-message').value = '';
-    ed.style.display = 'block';
+    ed.classList.remove('hidden');
   } else {
-    ed.style.display = 'none';
+    ed.classList.add('hidden');
   }
 }
 
@@ -681,7 +789,6 @@ async function addTagToCurrent() {
   if (!currentFile) return;
   const name = $('fd-add-tag').value.trim();
   if (!name) return;
-  // 既存タグなら upsert で同じID返る、新規でも作成される
   const created = await json('/api/tags', { method: 'POST', body: { name } });
   const r = await api(`/api/files/${currentFile.id}/tags`, {
     method: 'POST', body: JSON.stringify({ tag_id: created.id }),
@@ -727,7 +834,7 @@ async function deleteCurrentFile() {
   if (!confirm(`"${currentFile.display_name}" を削除しますか？`)) return;
   const r = await api(`/api/files/${currentFile.id}`, { method: 'DELETE' });
   if (!r.ok) return alert('削除失敗: ' + await r.text());
-  $('file-detail').style.display = 'none';
+  $('file-detail').classList.add('hidden');
   currentFile = null;
   await refresh();
 }
@@ -741,10 +848,25 @@ async function issueShare() {
     body: { ttl_secs: parseInt(ttl, 10) },
   });
   const fullUrl = location.origin + r.url;
-  $('fd-share').innerHTML = `共有URL (${ttl}秒): <a href="${fullUrl}" target="_blank">${fullUrl}</a>`;
+  $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${fullUrl}</a>`;
 }
 
-function escape(s) {
+// API は timestamp を ISO 文字列で返す場合と
+// time::OffsetDateTime のシリアライズ形式 ([year, day_of_year, h, m, s, ns, ...]) で返す場合がある
+function fmtTs(ts) {
+  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
+  if (Array.isArray(ts) && ts.length >= 5) {
+    const [y, doy, h, m, s] = ts;
+    const d = new Date(Date.UTC(y, 0, doy));
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const pad = n => String(n).padStart(2, '0');
+    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
+  }
+  return String(ts ?? '');
+}
+
+function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[c]);
