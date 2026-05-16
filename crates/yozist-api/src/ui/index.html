@@ -377,7 +377,32 @@ async function loadTags() {
   tags.forEach(t => {
     const li = document.createElement('li');
     li.className = filterTags.includes(t.name) ? 'active' : '';
-    li.textContent = t.name + ' ' + (t.kind === 'system' ? '⚙' : t.kind === 'ai' ? '🤖' : '');
+    const icon = t.kind === 'system' ? '⚙' : t.kind === 'ai' ? '🤖' : '';
+    li.innerHTML = `<span style="flex:1">${escape(t.name)} ${icon}</span>` +
+      `<a href="#" style="margin-left:4px; color:#888" title="リネーム">✎</a>` +
+      `<a href="#" style="margin-left:4px; color:#c00" title="削除">×</a>`;
+    li.style.display = 'flex';
+    li.style.alignItems = 'center';
+    const [_, renameLink, deleteLink] = li.querySelectorAll('span, a, a');
+    const links = li.querySelectorAll('a');
+    links[0].onclick = async (e) => {
+      e.stopPropagation(); e.preventDefault();
+      const name = prompt('新しいタグ名', t.name);
+      if (!name || name === t.name) return;
+      await api(`/api/tags/${t.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+        headers: { 'content-type': 'application/json' },
+      });
+      await refresh();
+    };
+    links[1].onclick = async (e) => {
+      e.stopPropagation(); e.preventDefault();
+      if (!confirm(`タグ "${t.name}" を削除しますか？\n(ファイル本体は残りますが、このタグの紐付けは全て解除されます)`)) return;
+      await api(`/api/tags/${t.id}`, { method: 'DELETE' });
+      filterTags = filterTags.filter(x => x !== t.name);
+      await refresh();
+    };
     li.onclick = () => {
       const idx = filterTags.indexOf(t.name);
       if (idx >= 0) filterTags.splice(idx, 1); else filterTags.push(t.name);
@@ -396,8 +421,31 @@ async function loadSeries() {
   } else {
     list.forEach(s => {
       const li = document.createElement('li');
-      li.textContent = s.name;
+      li.style.display = 'flex';
+      li.style.alignItems = 'center';
+      li.innerHTML = `<span style="flex:1">${escape(s.name)}</span>` +
+        `<a href="#" style="margin-left:4px; color:#888" title="リネーム">✎</a>` +
+        `<a href="#" style="margin-left:4px; color:#c00" title="削除">×</a>`;
       li.title = s.description || '';
+      const links = li.querySelectorAll('a');
+      links[0].onclick = async (e) => {
+        e.stopPropagation(); e.preventDefault();
+        const name = prompt('新しいシリーズ名', s.name);
+        if (!name) return;
+        const description = prompt('説明 (空可)', s.description || '');
+        await api(`/api/series/${s.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ name, description: description || null }),
+          headers: { 'content-type': 'application/json' },
+        });
+        await refresh();
+      };
+      links[1].onclick = async (e) => {
+        e.stopPropagation(); e.preventDefault();
+        if (!confirm(`シリーズ "${s.name}" を削除しますか？\n(ファイル本体は残ります)`)) return;
+        await api(`/api/series/${s.id}`, { method: 'DELETE' });
+        await refresh();
+      };
       li.onclick = async () => {
         const members = await fetch('/api/series/' + s.id + '/members').then(r => r.json());
         alert(`series "${s.name}"\nメンバー: ${members.length}件\n` + members.map(m =>
@@ -520,11 +568,42 @@ async function showFile(f) {
           ${isCurrent ? '<strong>★</strong> ' : ''}
           ${time} ${c.format_id} ${escape(c.message || '')}
           <button style="float:right;font-size:10px;margin-left:4px"
+            onclick="diffCommit('${c.id}','${time}')">Δ</button>
+          <button style="float:right;font-size:10px;margin-left:4px"
             onclick="previewCommit('${c.id}')">表示</button>
           ${isCurrent ? '' : `<button style="float:right;font-size:10px;margin-left:4px"
             onclick="rollbackToCommit('${c.id}','${time}')">戻す</button>`}
         </div>`;
       }).join('');
+}
+
+async function diffCommit(commitId, time) {
+  if (!currentFile) return;
+  const [oldR, newR] = await Promise.all([
+    api(`/api/files/${currentFile.id}/commits/${commitId}`),
+    api(`/api/files/${currentFile.id}/content`),
+  ]);
+  if (!oldR.ok || !newR.ok) return alert('diff取得失敗');
+  const oldText = await oldR.text();
+  const newText = await newR.text();
+  // 簡易行diff
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+  const max = Math.max(oldLines.length, newLines.length);
+  let out = `=== diff ===\n旧 (${time}) → 現在\n\n`;
+  const oldSet = new Set(oldLines);
+  const newSet = new Set(newLines);
+  for (let i = 0; i < max; i++) {
+    const a = oldLines[i] ?? '';
+    const b = newLines[i] ?? '';
+    if (a === b) out += `  ${a}\n`;
+    else {
+      if (a && !newSet.has(a)) out += `- ${a}\n`;
+      if (b && !oldSet.has(b)) out += `+ ${b}\n`;
+      if (a && newSet.has(a) && b && oldSet.has(b)) out += `~ ${a} → ${b}\n`;
+    }
+  }
+  alert(out.length > 3000 ? out.slice(0, 3000) + '\n…' : out);
 }
 
 async function previewCommit(commitId) {
