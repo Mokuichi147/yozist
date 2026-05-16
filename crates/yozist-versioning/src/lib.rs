@@ -242,6 +242,36 @@ impl VersioningEngine {
         Ok(commit)
     }
 
+    /// 指定したコミットの内容を取得する（履歴閲覧用）。
+    pub async fn read_at_commit(
+        &self,
+        file_id: FileId,
+        commit_id: CommitId,
+    ) -> Result<Vec<u8>, VersioningError> {
+        let _ = self
+            .meta
+            .get_file(&file_id)
+            .await?
+            .ok_or(VersioningError::NotFound(file_id))?;
+        let blob_id = self.find_blob(&file_id, commit_id).await?;
+        Ok(self.blob.get(&blob_id).await?.to_vec())
+    }
+
+    /// `commit_id` 時点の内容を新規コミットとして再投入する (= rollback)。
+    /// `commit()` を内部で呼ぶので CRDT/LWW フォーマットの正規化が行われ、
+    /// 新しい履歴 1 件として残る（履歴を破壊的に切り詰めない）。
+    pub async fn rollback_to(
+        &self,
+        file_id: FileId,
+        commit_id: CommitId,
+        actor: ActorId,
+        message: Option<String>,
+    ) -> Result<Commit, VersioningError> {
+        let bytes = self.read_at_commit(file_id, commit_id).await?;
+        let msg = message.unwrap_or_else(|| format!("rollback to {commit_id}"));
+        self.commit(file_id, &bytes, actor, Some(msg)).await
+    }
+
     /// 現在の内容を取得する。
     pub async fn read_current(&self, file_id: FileId) -> Result<Vec<u8>, VersioningError> {
         let file = self

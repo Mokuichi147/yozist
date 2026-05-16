@@ -65,6 +65,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id", get(get_file).delete(delete_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
+        .route("/api/files/:id/commits/:cid", get(read_commit))
+        .route("/api/files/:id/rollback/:cid", post(rollback))
         .route(
             "/api/files/:id/tags",
             get(list_file_tags).post(attach_tag),
@@ -408,6 +410,65 @@ async fn history(
     require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::READ).await?;
     let log = s.meta.list_commits(&id).await.map_err(ApiError::from_db)?;
     Ok(Json(log))
+}
+
+async fn read_commit(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((id, cid)): Path<(String, String)>,
+) -> Result<Vec<u8>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(file_id), PermissionMask::READ).await?;
+    let commit_id = uuid::Uuid::parse_str(&cid)
+        .map(yozist_core::CommitId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("commit id: {e}")))?;
+    s.engine
+        .read_at_commit(file_id, commit_id)
+        .await
+        .map_err(|e| match e {
+            yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
+            other => ApiError::Internal(other.to_string()),
+        })
+}
+
+#[derive(Deserialize)]
+struct RollbackQuery {
+    actor: Option<String>,
+    message: Option<String>,
+}
+
+async fn rollback(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((id, cid)): Path<(String, String)>,
+    Query(q): Query<RollbackQuery>,
+) -> Result<Json<yozist_core::Commit>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::File(file_id), PermissionMask::WRITE).await?;
+    let commit_id = uuid::Uuid::parse_str(&cid)
+        .map(yozist_core::CommitId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("commit id: {e}")))?;
+    let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
+    let res = s
+        .engine
+        .rollback_to(file_id, commit_id, actor, q.message)
+        .await
+        .map_err(|e| match e {
+            yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
+            other => ApiError::Internal(other.to_string()),
+        });
+    let meta = format!("{{\"to_commit\":\"{}\"}}", cid);
+    audit_event(
+        &s,
+        &ctx,
+        "rollback",
+        Some("file"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    Ok(Json(res?))
 }
 
 // ---------------------------------------------------------------------------

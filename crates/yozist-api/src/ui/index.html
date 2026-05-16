@@ -129,7 +129,7 @@
         </div>
       </div>
       <details><summary>content</summary><pre id="fd-content">…</pre></details>
-      <details><summary>history</summary><pre id="fd-history">…</pre></details>
+      <details><summary>history</summary><div id="fd-history">…</div></details>
     </div>
     <div class="card">
       <h2>groups <button onclick="createGroup()" style="float:right; font-size:11px">+ 新規</button></h2>
@@ -510,9 +510,42 @@ async function showFile(f) {
     </span>`
   ).join('') || '<span class="small empty">タグなし</span>';
   $('fd-content').textContent = content.length > 5000 ? content.slice(0, 5000) + '\n…' : content;
-  $('fd-history').textContent = history.map(c =>
-    `${c.timestamp} ${c.format_id} blob=${c.blob.slice(0, 12)}… message=${c.message || ''}`
-  ).join('\n');
+  const currentCommitId = f.current_commit;
+  $('fd-history').innerHTML = history.length === 0
+    ? '<div class="empty">履歴なし</div>'
+    : history.map(c => {
+        const isCurrent = c.id === currentCommitId;
+        const time = c.timestamp.replace('T', ' ').slice(0, 19);
+        return `<div class="row" style="font-size:11px">
+          ${isCurrent ? '<strong>★</strong> ' : ''}
+          ${time} ${c.format_id} ${escape(c.message || '')}
+          <button style="float:right;font-size:10px;margin-left:4px"
+            onclick="previewCommit('${c.id}')">表示</button>
+          ${isCurrent ? '' : `<button style="float:right;font-size:10px;margin-left:4px"
+            onclick="rollbackToCommit('${c.id}','${time}')">戻す</button>`}
+        </div>`;
+      }).join('');
+}
+
+async function previewCommit(commitId) {
+  if (!currentFile) return;
+  const r = await api(`/api/files/${currentFile.id}/commits/${commitId}`);
+  if (!r.ok) return alert('取得失敗');
+  const text = await r.text();
+  alert(`commit ${commitId.slice(0, 8)}…\n\n${text.length > 1500 ? text.slice(0, 1500) + '…' : text}`);
+}
+
+async function rollbackToCommit(commitId, time) {
+  if (!currentFile) return;
+  if (!confirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(履歴は破壊されず、新しいコミットとして記録されます)`)) return;
+  const r = await api(
+    `/api/files/${currentFile.id}/rollback/${commitId}?message=` +
+      encodeURIComponent(`rollback to ${time}`),
+    { method: 'POST' }
+  );
+  if (!r.ok) return alert('rollback失敗: ' + await r.text());
+  await showFile(currentFile);
+  await loadFiles();
 }
 
 async function doUpload() {
