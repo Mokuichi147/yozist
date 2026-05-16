@@ -320,6 +320,30 @@ impl MetaStore for SqliteMetaStore {
         rows.into_iter().map(row_to_tag).collect()
     }
 
+    async fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<(), DbError> {
+        let res = sqlx::query("UPDATE tags SET name = ? WHERE id = ?")
+            .bind(new_name)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn delete_tag(&self, id: &TagId) -> Result<(), DbError> {
+        // file_tags は CASCADE で自動削除される
+        let res = sqlx::query("DELETE FROM tags WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn list_tags_of(&self, file: &FileId) -> Result<Vec<Tag>, DbError> {
         let rows = sqlx::query(
             r#"SELECT t.id, t.name, t.kind, t.confidence
@@ -414,6 +438,36 @@ impl MetaStore for SqliteMetaStore {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_to_series).collect()
+    }
+
+    async fn rename_series(
+        &self,
+        id: &SeriesId,
+        new_name: &str,
+        description: Option<&str>,
+    ) -> Result<(), DbError> {
+        let res = sqlx::query("UPDATE series SET name = ?, description = ? WHERE id = ?")
+            .bind(new_name)
+            .bind(description)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn delete_series(&self, id: &SeriesId) -> Result<(), DbError> {
+        // series_members は CASCADE で自動削除される
+        let res = sqlx::query("DELETE FROM series WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
     }
 
     async fn remove_from_series(

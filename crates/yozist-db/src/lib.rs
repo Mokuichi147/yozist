@@ -38,6 +38,8 @@ pub trait MetaStore: Send + Sync {
     async fn get_tag(&self, id: &TagId) -> Result<Option<Tag>, DbError>;
     async fn get_tag_by_name(&self, name: &str) -> Result<Option<Tag>, DbError>;
     async fn list_tags(&self) -> Result<Vec<Tag>, DbError>;
+    async fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<(), DbError>;
+    async fn delete_tag(&self, id: &TagId) -> Result<(), DbError>;
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn detach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn list_tags_of(&self, file: &FileId) -> Result<Vec<Tag>, DbError>;
@@ -47,6 +49,13 @@ pub trait MetaStore: Send + Sync {
     async fn upsert_series(&self, series: &Series) -> Result<SeriesId, DbError>;
     async fn get_series(&self, id: &SeriesId) -> Result<Option<Series>, DbError>;
     async fn list_series(&self) -> Result<Vec<Series>, DbError>;
+    async fn rename_series(
+        &self,
+        id: &SeriesId,
+        new_name: &str,
+        description: Option<&str>,
+    ) -> Result<(), DbError>;
+    async fn delete_series(&self, id: &SeriesId) -> Result<(), DbError>;
     async fn add_to_series(&self, member: &SeriesMember) -> Result<(), DbError>;
     async fn remove_from_series(
         &self,

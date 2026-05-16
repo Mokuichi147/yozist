@@ -73,10 +73,19 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
         .route("/api/tags", get(list_tags).post(upsert_tag))
+        .route(
+            "/api/tags/:id",
+            axum::routing::patch(rename_tag).delete(delete_tag),
+        )
         .route("/api/files/by-tags", get(list_files_by_tags))
         .route("/api/search", get(search_files))
         .route("/api/series", get(list_series).post(create_series))
-        .route("/api/series/:id", get(get_series))
+        .route(
+            "/api/series/:id",
+            get(get_series)
+                .patch(rename_series)
+                .delete(delete_series),
+        )
         .route(
             "/api/series/:id/members",
             get(list_series_members).post(add_series_member),
@@ -492,6 +501,66 @@ async fn list_tags(State(s): State<ApiState>) -> Result<Json<Vec<Tag>>, ApiError
     Ok(Json(tags))
 }
 
+#[derive(Deserialize)]
+struct RenameTagInput {
+    name: String,
+}
+
+async fn rename_tag(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<RenameTagInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let tag_id = uuid::Uuid::parse_str(&id)
+        .map(TagId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("tag id: {e}")))?;
+    let new_name = input.name.clone();
+    let res = s
+        .meta
+        .rename_tag(&tag_id, &input.name)
+        .await
+        .map_err(ApiError::from_db);
+    let meta = format!("{{\"name\":\"{}\"}}", new_name);
+    audit_event(
+        &s,
+        &ctx,
+        "rename_tag",
+        Some("tag"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_tag(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let tag_id = uuid::Uuid::parse_str(&id)
+        .map(TagId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("tag id: {e}")))?;
+    let res = s.meta.delete_tag(&tag_id).await.map_err(ApiError::from_db);
+    audit_event(
+        &s,
+        &ctx,
+        "delete_tag",
+        Some("tag"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_file_tags(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
@@ -756,6 +825,71 @@ async fn create_series(
     .await;
     let id = res?;
     Ok((StatusCode::CREATED, Json(Series { id, ..series })))
+}
+
+#[derive(Deserialize)]
+struct RenameSeriesInput {
+    name: String,
+    description: Option<String>,
+}
+
+async fn rename_series(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<RenameSeriesInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let series_id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let new_name = input.name.clone();
+    let res = s
+        .meta
+        .rename_series(&series_id, &input.name, input.description.as_deref())
+        .await
+        .map_err(ApiError::from_db);
+    let meta = format!("{{\"name\":\"{}\"}}", new_name);
+    audit_event(
+        &s,
+        &ctx,
+        "rename_series",
+        Some("series"),
+        Some(&id),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_series(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let series_id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let res = s
+        .meta
+        .delete_series(&series_id)
+        .await
+        .map_err(ApiError::from_db);
+    audit_event(
+        &s,
+        &ctx,
+        "delete_series",
+        Some("series"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_series(
