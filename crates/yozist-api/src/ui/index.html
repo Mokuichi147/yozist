@@ -222,7 +222,12 @@ function json(path, opts) {
     opts.body = JSON.stringify(opts.body);
     opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
   }
-  return api(path, opts).then(r => r.ok ? r.json() : Promise.reject(r));
+  return api(path, opts).then(async r => {
+    if (!r.ok) return Promise.reject(r);
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
 }
 
 async function doLogin() {
@@ -594,7 +599,7 @@ async function loadAudit() {
       const status = ok
         ? '<span class="text-success">✓</span>'
         : '<span class="text-error">✗</span>';
-      const time = a.timestamp.replace('T',' ').slice(0,19);
+      const time = fmtTs(a.timestamp);
       return `<div class="row-compact text-xs">
         ${status} <span class="opacity-70">${time}</span>
         <span class="font-semibold">${escapeHtml(a.actor_label || '-')}</span>
@@ -663,7 +668,7 @@ async function showFile(f) {
     ? '<div class="opacity-50 text-xs">履歴なし</div>'
     : history.map(c => {
         const isCurrent = c.id === currentCommitId;
-        const time = c.timestamp.replace('T', ' ').slice(0, 19);
+        const time = fmtTs(c.timestamp);
         return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
           <div class="truncate">
             ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
@@ -844,6 +849,21 @@ async function issueShare() {
   });
   const fullUrl = location.origin + r.url;
   $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${fullUrl}</a>`;
+}
+
+// API は timestamp を ISO 文字列で返す場合と
+// time::OffsetDateTime のシリアライズ形式 ([year, day_of_year, h, m, s, ns, ...]) で返す場合がある
+function fmtTs(ts) {
+  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
+  if (Array.isArray(ts) && ts.length >= 5) {
+    const [y, doy, h, m, s] = ts;
+    const d = new Date(Date.UTC(y, 0, doy));
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const pad = n => String(n).padStart(2, '0');
+    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
+  }
+  return String(ts ?? '');
 }
 
 function escapeHtml(s) {
