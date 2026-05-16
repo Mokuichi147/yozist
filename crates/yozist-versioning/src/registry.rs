@@ -220,7 +220,7 @@ impl CrdtFormat for PlainTextCrdt {
             txn.encode_state_as_update_v1(&StateVector::default())
         };
 
-        let merged = yrs::Doc::new();
+        let merged = new_doc();
         // "content" Text を事前に作成（両更新内の Text と key が一致する必要がある）
         let _ = merged.get_or_insert_text("content");
         {
@@ -242,13 +242,24 @@ impl CrdtFormat for PlainTextCrdt {
 
 fn make_doc_with_text(text: &str) -> yrs::Doc {
     use yrs::{Text, Transact};
-    let doc = yrs::Doc::new();
+    let doc = new_doc();
     let t = doc.get_or_insert_text("content");
     if !text.is_empty() {
         let mut txn = doc.transact_mut();
         t.insert(&mut txn, 0, text);
     }
     doc
+}
+
+/// yrs Doc のデフォルト `OffsetKind` は `Bytes` だが、本クレートでは
+/// `apply_diff_to_text` が UTF-16 単位でオフセットを計算しているため、
+/// `Utf16` を指定しないと非 ASCII を含むテキストで `remove_range` 等が
+/// 文字境界を割って panic する (yrs 内部 `block_offset` のアンダーフロー)。
+fn new_doc() -> yrs::Doc {
+    use yrs::{OffsetKind, Options};
+    let mut opts = Options::default();
+    opts.offset_kind = OffsetKind::Utf16;
+    yrs::Doc::with_options(opts)
 }
 
 /// 現在のテキスト `cur` と目標テキスト `new_text` の差分を yrs Text 操作に翻訳。
@@ -346,6 +357,23 @@ mod tests {
         .unwrap();
         let bytes = f.serialize(&s).await.unwrap();
         assert_eq!(bytes, b"hello rust world");
+    }
+
+    #[tokio::test]
+    async fn plain_text_apply_diff_handles_multibyte() {
+        let f = PlainTextCrdt;
+        let mut s = f.load("こんにちは世界".as_bytes()).await.unwrap();
+        f.apply_ops(
+            &mut s,
+            &[CrdtOp {
+                actor: ActorId::new(),
+                bytes: bytes::Bytes::from_static("こんにちは、世界🎉".as_bytes()),
+            }],
+        )
+        .await
+        .unwrap();
+        let bytes = f.serialize(&s).await.unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "こんにちは、世界🎉");
     }
 
     #[tokio::test]
