@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yozist - files</title>
+<script>
+  document.documentElement.setAttribute(
+    'data-theme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  );
+</script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  .hidden { display: none !important; }
+  .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
+  .row-compact:hover { background: rgba(127,127,127,0.12); }
+</style>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
+  <div class="flex-1 px-2 flex items-center gap-3">
+    <a href="/ui" class="text-xl font-bold">yozist</a>
+    <div class="tabs tabs-boxed tabs-sm">
+      <a href="/ui/files" class="tab tab-active">files</a>
+    </div>
+  </div>
+  <div class="flex-none flex items-center gap-3 px-2">
+    <span id="me" class="text-sm opacity-70">…</span>
+    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  </div>
+</div>
+
+<div id="login-warn" class="hidden max-w-md mx-auto mt-24">
+  <div class="alert alert-warning">
+    <span>未ログインです。<a href="/ui" class="link">/ui</a> からログインしてください。</span>
+  </div>
+</div>
+
+<div id="main" class="hidden max-w-7xl mx-auto p-4">
+  <div class="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4">
+
+    <!-- 左カラム: フィルター -->
+    <div class="space-y-4">
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4 space-y-3">
+          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">フィルター</h2>
+
+          <div>
+            <label class="text-xs opacity-70 block mb-1">全文検索 (FTS5)</label>
+            <div class="join w-full">
+              <input id="f-search" class="input input-bordered input-sm join-item w-full"
+                     placeholder="本文・名前を検索"
+                     onkeydown="if(event.key==='Enter')applyFilters()">
+              <button class="btn btn-sm join-item btn-ghost" onclick="$('f-search').value='';applyFilters()" title="クリア">×</button>
+            </div>
+          </div>
+
+          <div>
+            <label class="text-xs opacity-70 block mb-1">ファイル名 (部分一致)</label>
+            <input id="f-name" class="input input-bordered input-sm w-full"
+                   placeholder="例: memo"
+                   oninput="applyFiltersDebounced()">
+          </div>
+
+          <div>
+            <label class="text-xs opacity-70 block mb-1">シリーズ</label>
+            <select id="f-series" class="select select-bordered select-sm w-full" onchange="applyFilters()">
+              <option value="">(指定なし)</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="text-xs opacity-70 block mb-1">タグ (AND)</label>
+            <div id="f-tags" class="flex flex-wrap gap-1 max-h-60 overflow-y-auto"></div>
+          </div>
+
+          <button class="btn btn-sm w-full" onclick="resetFilters()">すべてクリア</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右カラム: 結果 -->
+    <div class="space-y-4">
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-sm font-semibold">
+              files <span class="opacity-60" id="files-count"></span>
+            </h2>
+            <div id="filter-summary" class="text-xs opacity-60"></div>
+          </div>
+          <ul class="divide-y divide-base-300" id="file-list">
+            <li class="px-2 py-2 opacity-50 text-sm">読み込み中…</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem('yozist_token') || '';
+let allTags = [];
+let selectedTags = new Set();
+let allFiles = [];
+
+function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
+  return fetch(path, opts);
+}
+function json(path, opts) {
+  return api(path, opts).then(async r => {
+    if (!r.ok) return Promise.reject(r);
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+function logout() {
+  localStorage.removeItem('yozist_token');
+  location.href = '/ui';
+}
+$('logout').onclick = logout;
+
+async function init() {
+  if (!token) { $('login-warn').classList.remove('hidden'); return; }
+  try {
+    const me = await json('/api/auth/me');
+    if (me.anonymous) { logout(); return; }
+    $('me').textContent = me.user.username;
+    $('main').classList.remove('hidden');
+    await Promise.all([loadTags(), loadSeries()]);
+    restoreFiltersFromUrl();
+    await applyFilters();
+  } catch (e) {
+    $('login-warn').classList.remove('hidden');
+  }
+}
+
+async function loadTags() {
+  try {
+    allTags = await json('/api/tags');
+    renderTags();
+  } catch (e) { allTags = []; }
+}
+
+function renderTags() {
+  const el = $('f-tags');
+  if (allTags.length === 0) {
+    el.innerHTML = '<span class="text-xs opacity-50">タグなし</span>';
+    return;
+  }
+  el.innerHTML = '';
+  allTags.forEach(t => {
+    const active = selectedTags.has(t.name);
+    const btn = document.createElement('button');
+    btn.className = 'badge badge-sm cursor-pointer ' +
+      (active ? 'badge-primary' : 'badge-outline');
+    const icon = t.kind === 'system' ? ' ⚙' : t.kind === 'ai' ? ' 🤖' : '';
+    btn.textContent = t.name + icon;
+    btn.onclick = () => {
+      if (selectedTags.has(t.name)) selectedTags.delete(t.name);
+      else selectedTags.add(t.name);
+      renderTags();
+      applyFilters();
+    };
+    el.appendChild(btn);
+  });
+}
+
+async function loadSeries() {
+  try {
+    const list = await json('/api/series');
+    const sel = $('f-series');
+    sel.innerHTML = '<option value="">(指定なし)</option>' +
+      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+  } catch (e) {}
+}
+
+let debounceTimer = null;
+function applyFiltersDebounced() {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(applyFilters, 250);
+}
+
+function resetFilters() {
+  $('f-search').value = '';
+  $('f-name').value = '';
+  $('f-series').value = '';
+  selectedTags.clear();
+  renderTags();
+  applyFilters();
+}
+
+function saveFiltersToUrl() {
+  const params = new URLSearchParams();
+  const q = $('f-search').value.trim();
+  const name = $('f-name').value.trim();
+  const series = $('f-series').value;
+  if (q) params.set('q', q);
+  if (name) params.set('name', name);
+  if (series) params.set('series', series);
+  if (selectedTags.size) params.set('tags', [...selectedTags].join(','));
+  const qs = params.toString();
+  history.replaceState(null, '', qs ? '?' + qs : location.pathname);
+}
+
+function restoreFiltersFromUrl() {
+  const p = new URLSearchParams(location.search);
+  if (p.get('q')) $('f-search').value = p.get('q');
+  if (p.get('name')) $('f-name').value = p.get('name');
+  if (p.get('series')) $('f-series').value = p.get('series');
+  if (p.get('tags')) p.get('tags').split(',').filter(Boolean).forEach(t => selectedTags.add(t));
+  renderTags();
+}
+
+async function applyFilters() {
+  saveFiltersToUrl();
+  const q = $('f-search').value.trim();
+  const name = $('f-name').value.trim();
+  const seriesId = $('f-series').value;
+  const tags = [...selectedTags];
+
+  let url = '/api/files';
+  if (q) {
+    url = '/api/search?q=' + encodeURIComponent(q);
+  } else if (tags.length > 0) {
+    url = '/api/files/by-tags?tags=' + encodeURIComponent(tags.join(','));
+  }
+
+  let files;
+  try {
+    files = await json(url);
+  } catch (e) {
+    $('file-list').innerHTML = '<li class="px-2 py-2 text-error text-sm">取得失敗</li>';
+    return;
+  }
+
+  // 全文検索 + タグ AND の組み合わせはサーバ未対応のためクライアントで AND
+  if (q && tags.length > 0) {
+    const tagged = await json('/api/files/by-tags?tags=' + encodeURIComponent(tags.join(','))).catch(() => []);
+    const allowed = new Set(tagged.map(f => f.id));
+    files = files.filter(f => allowed.has(f.id));
+  }
+
+  if (seriesId) {
+    const members = await json('/api/series/' + seriesId + '/members').catch(() => []);
+    const allowed = new Set(members.map(m => m.file_id));
+    files = files.filter(f => allowed.has(f.id));
+  }
+
+  if (name) {
+    const lower = name.toLowerCase();
+    files = files.filter(f => f.display_name.toLowerCase().includes(lower));
+  }
+
+  allFiles = files;
+  renderFiles();
+}
+
+function renderFiles() {
+  $('files-count').textContent = `(${allFiles.length})`;
+  const parts = [];
+  if ($('f-search').value.trim()) parts.push(`検索: "${$('f-search').value.trim()}"`);
+  if (selectedTags.size) parts.push('タグ: ' + [...selectedTags].join(' AND '));
+  if ($('f-series').value) {
+    const sel = $('f-series');
+    parts.push('シリーズ: ' + sel.options[sel.selectedIndex].text);
+  }
+  if ($('f-name').value.trim()) parts.push(`名前: "${$('f-name').value.trim()}"`);
+  $('filter-summary').textContent = parts.join(' / ');
+
+  const el = $('file-list');
+  if (allFiles.length === 0) {
+    el.innerHTML = '<li class="px-2 py-4 opacity-60 text-sm text-center">該当ファイルなし</li>';
+    return;
+  }
+  el.innerHTML = allFiles.map(f => `
+    <li>
+      <a href="/ui/files/${f.id}" class="px-2 py-2 rounded hover:bg-base-200 flex items-center justify-between gap-2">
+        <span class="font-semibold truncate">${escapeHtml(f.display_name)}</span>
+        <span class="text-xs opacity-60 shrink-0">${f.size}B</span>
+      </a>
+    </li>
+  `).join('');
+}
+
+init();
+</script>
+</body>
+</html>

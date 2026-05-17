@@ -16,11 +16,30 @@ use axum::{
 };
 
 pub fn router() -> Router<crate::ApiState> {
-    Router::new().route("/", get(index))
+    Router::new()
+        .route("/", get(index))
+        .route("/files", get(files_page))
+        .route("/files/:id", get(file_detail_page))
+        .route("/files/:id/histories/:cid", get(file_commit_page))
 }
 
 async fn index() -> Response {
     Html(INDEX_HTML).into_response()
 }
 
+async fn files_page() -> Response {
+    Html(FILES_HTML).into_response()
+}
+
+async fn file_detail_page() -> Response {
+    Html(FILE_DETAIL_HTML).into_response()
+}
+
+async fn file_commit_page() -> Response {
+    Html(FILE_COMMIT_HTML).into_response()
+}
+
 const INDEX_HTML: &str = include_str!("ui/index.html");
+const FILES_HTML: &str = include_str!("ui/files.html");
+const FILE_DETAIL_HTML: &str = include_str!("ui/file_detail.html");
+const FILE_COMMIT_HTML: &str = include_str!("ui/file_commit.html");

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yozist - commit</title>
+<script>
+  document.documentElement.setAttribute(
+    'data-theme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  );
+</script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  .hidden { display: none !important; }
+</style>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
+  <div class="flex-1 px-2 flex items-center gap-3">
+    <a href="/ui" class="text-xl font-bold">yozist</a>
+    <div class="tabs tabs-boxed tabs-sm">
+      <a href="/ui/files" class="tab">files</a>
+      <a id="back-detail" href="#" class="tab">detail</a>
+      <span class="tab tab-active">commit</span>
+    </div>
+  </div>
+  <div class="flex-none flex items-center gap-3 px-2">
+    <span id="me" class="text-sm opacity-70">…</span>
+    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  </div>
+</div>
+
+<div id="login-warn" class="hidden max-w-md mx-auto mt-24">
+  <div class="alert alert-warning">
+    <span>未ログインです。<a href="/ui" class="link">/ui</a> からログインしてください。</span>
+  </div>
+</div>
+
+<div id="not-found" class="hidden max-w-md mx-auto mt-24">
+  <div class="alert alert-error">
+    <span id="not-found-msg">コミットが見つかりません。</span>
+  </div>
+</div>
+
+<div id="main" class="hidden max-w-5xl mx-auto p-4">
+  <div class="mb-3 text-sm">
+    <a id="back-link" href="#" class="link link-hover">← ファイル詳細へ戻る</a>
+  </div>
+
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex items-start justify-between gap-2 flex-wrap">
+        <div>
+          <h2 id="fc-name" class="card-title text-lg break-all">…</h2>
+          <div id="fc-meta" class="text-xs opacity-60 break-all mt-1"></div>
+        </div>
+        <div class="flex flex-wrap gap-2 shrink-0">
+          <button id="fc-rollback" class="btn btn-sm btn-warning btn-outline hidden">このバージョンに戻す</button>
+          <a id="fc-raw" href="#" class="btn btn-sm" target="_blank">生データ</a>
+        </div>
+      </div>
+
+      <div class="divider my-2"></div>
+
+      <pre id="fc-content"
+           class="bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[75vh] whitespace-pre-wrap break-words">…</pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem('yozist_token') || '';
+
+const parts = location.pathname.split('/').filter(Boolean);
+// /ui/files/:id/histories/:cid → ['ui','files',':id','histories',':cid']
+const fileId = parts[2];
+const commitId = parts[4];
+
+function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
+  return fetch(path, opts);
+}
+function json(path, opts) {
+  return api(path, opts).then(async r => {
+    if (!r.ok) return Promise.reject(r);
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+function fmtTs(ts) {
+  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
+  if (Array.isArray(ts) && ts.length >= 5) {
+    const [y, doy, h, m, s] = ts;
+    const d = new Date(Date.UTC(y, 0, doy));
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const pad = n => String(n).padStart(2, '0');
+    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
+  }
+  return String(ts ?? '');
+}
+function logout() {
+  localStorage.removeItem('yozist_token');
+  location.href = '/ui';
+}
+$('logout').onclick = logout;
+
+const detailUrl = '/ui/files/' + fileId;
+$('back-detail').href = detailUrl;
+$('back-link').href = detailUrl;
+$('fc-raw').href = `/api/files/${fileId}/commits/${commitId}`;
+
+async function init() {
+  if (!token) { $('login-warn').classList.remove('hidden'); return; }
+  try {
+    const me = await json('/api/auth/me');
+    if (me.anonymous) { logout(); return; }
+    $('me').textContent = me.user.username;
+  } catch (e) { $('login-warn').classList.remove('hidden'); return; }
+
+  let file, history, content;
+  try {
+    [file, history] = await Promise.all([
+      json('/api/files/' + fileId),
+      json(`/api/files/${fileId}/history`),
+    ]);
+  } catch (e) {
+    $('not-found-msg').textContent = 'ファイルが見つかりません、または閲覧権限がありません。';
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+  const commit = history.find(c => c.id === commitId);
+  if (!commit) {
+    $('not-found-msg').textContent = 'このファイルにそのコミットは存在しません。';
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+  try {
+    const r = await api(`/api/files/${fileId}/commits/${commitId}`);
+    if (!r.ok) throw r;
+    content = await r.text();
+  } catch (e) {
+    $('not-found-msg').textContent = 'コミット内容の取得に失敗しました。';
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+
+  document.title = `yozist - ${file.display_name} @${commitId.slice(0, 8)}`;
+  $('main').classList.remove('hidden');
+  $('fc-name').textContent = file.display_name;
+
+  const isCurrent = file.current_commit === commitId;
+  const time = fmtTs(commit.timestamp);
+  const badge = isCurrent
+    ? '<span class="badge badge-warning badge-sm ml-1">★ current</span>'
+    : '';
+  $('fc-meta').innerHTML =
+    `commit <span class="font-mono">${escapeHtml(commit.format_id || commitId.slice(0, 8))}</span> ${badge}<br>
+     <span class="opacity-70">${time}</span>
+     ${commit.message ? ' — ' + escapeHtml(commit.message) : ''}`;
+
+  $('fc-content').textContent = content;
+
+  if (!isCurrent) {
+    const btn = $('fc-rollback');
+    btn.classList.remove('hidden');
+    btn.onclick = async () => {
+      if (!confirm(`"${file.display_name}" をこのバージョン (${time}) に戻しますか？\n(新しいコミットとして記録されます)`)) return;
+      const r = await api(
+        `/api/files/${fileId}/rollback/${commitId}?message=` +
+          encodeURIComponent(`rollback to ${time}`),
+        { method: 'POST' }
+      );
+      if (!r.ok) return alert('rollback失敗: ' + await r.text());
+      location.href = detailUrl;
+    };
+  }
+}
+
+init();
+</script>
+</body>
+</html>

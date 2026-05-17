@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yozist - file</title>
+<script>
+  document.documentElement.setAttribute(
+    'data-theme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  );
+</script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  .hidden { display: none !important; }
+  .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
+  .row-compact:hover { background: rgba(127,127,127,0.12); }
+</style>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
+  <div class="flex-1 px-2 flex items-center gap-3">
+    <a href="/ui" class="text-xl font-bold">yozist</a>
+    <div class="tabs tabs-boxed tabs-sm">
+      <a href="/ui/files" class="tab">files</a>
+      <span class="tab tab-active">detail</span>
+    </div>
+  </div>
+  <div class="flex-none flex items-center gap-3 px-2">
+    <span id="me" class="text-sm opacity-70">…</span>
+    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  </div>
+</div>
+
+<div id="login-warn" class="hidden max-w-md mx-auto mt-24">
+  <div class="alert alert-warning">
+    <span>未ログインです。<a href="/ui" class="link">/ui</a> からログインしてください。</span>
+  </div>
+</div>
+
+<div id="not-found" class="hidden max-w-md mx-auto mt-24">
+  <div class="alert alert-error">
+    <span>ファイルが見つかりません。<a href="/ui/files" class="link">一覧へ戻る</a></span>
+  </div>
+</div>
+
+<div id="main" class="hidden max-w-5xl mx-auto p-4">
+  <div class="mb-3 text-sm">
+    <a href="/ui/files" class="link link-hover">← ファイル一覧</a>
+  </div>
+
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex items-start justify-between gap-2">
+        <h2 id="fd-name" class="card-title text-lg break-all">…</h2>
+        <div class="flex flex-wrap gap-2 shrink-0">
+          <button class="btn btn-sm" onclick="toggleEdit()">編集</button>
+          <button class="btn btn-sm" onclick="issueShare()">共有URL</button>
+          <button class="btn btn-sm" onclick="grantPermission()">権限付与</button>
+          <button class="btn btn-sm btn-error btn-outline" onclick="deleteFile()">削除</button>
+        </div>
+      </div>
+      <div id="fd-meta" class="text-xs opacity-60 break-all"></div>
+
+      <div class="divider my-2"></div>
+
+      <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">タグ</h3>
+      <div id="fd-tags" class="flex flex-wrap gap-1"></div>
+      <div class="join w-full mt-1">
+        <input id="fd-add-tag" class="input input-bordered input-sm join-item w-full"
+               placeholder="タグ名を入力して追加">
+        <button class="btn btn-sm join-item" onclick="addTag()">+ タグ</button>
+      </div>
+
+      <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold mt-3">シリーズ</h3>
+      <div class="join w-full">
+        <select id="fd-add-series" class="select select-bordered select-sm join-item w-full">
+          <option value="">シリーズ選択…</option>
+        </select>
+        <button class="btn btn-sm join-item" onclick="addToSeries()">+ シリーズ</button>
+      </div>
+
+      <div id="fd-share" class="text-xs break-all my-2"></div>
+
+      <div id="fd-editor" class="hidden my-2 space-y-2">
+        <textarea id="fd-edit-textarea"
+                  class="textarea textarea-bordered w-full font-mono text-xs"
+                  rows="14"></textarea>
+        <div class="join w-full">
+          <input id="fd-edit-message" class="input input-bordered input-sm join-item w-full"
+                 placeholder="コミットメッセージ (任意)">
+          <button class="btn btn-primary btn-sm join-item" onclick="saveEdit()">保存</button>
+          <button class="btn btn-sm join-item" onclick="toggleEdit()">キャンセル</button>
+        </div>
+      </div>
+
+      <div class="collapse collapse-arrow bg-base-200 mt-3" id="content-collapse">
+        <input type="checkbox" checked>
+        <div class="collapse-title text-sm font-semibold py-2 min-h-0">content</div>
+        <div class="collapse-content">
+          <pre id="fd-content"
+               class="bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[60vh] whitespace-pre-wrap break-words">…</pre>
+        </div>
+      </div>
+
+      <div class="collapse collapse-arrow bg-base-200 mt-2">
+        <input type="checkbox">
+        <div class="collapse-title text-sm font-semibold py-2 min-h-0">history</div>
+        <div class="collapse-content">
+          <div id="fd-history" class="space-y-1">…</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem('yozist_token') || '';
+const fileId = location.pathname.split('/').pop();
+let currentFile = null;
+let currentContent = '';
+
+function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
+  return fetch(path, opts);
+}
+function json(path, opts) {
+  opts = opts || {};
+  if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof ArrayBuffer)) {
+    opts.body = JSON.stringify(opts.body);
+    opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
+  }
+  return api(path, opts).then(async r => {
+    if (!r.ok) return Promise.reject(r);
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+function fmtTs(ts) {
+  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
+  if (Array.isArray(ts) && ts.length >= 5) {
+    const [y, doy, h, m, s] = ts;
+    const d = new Date(Date.UTC(y, 0, doy));
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const pad = n => String(n).padStart(2, '0');
+    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
+  }
+  return String(ts ?? '');
+}
+function logout() {
+  localStorage.removeItem('yozist_token');
+  location.href = '/ui';
+}
+$('logout').onclick = logout;
+
+async function init() {
+  if (!token) { $('login-warn').classList.remove('hidden'); return; }
+  try {
+    const me = await json('/api/auth/me');
+    if (me.anonymous) { logout(); return; }
+    $('me').textContent = me.user.username;
+  } catch (e) { $('login-warn').classList.remove('hidden'); return; }
+
+  try {
+    currentFile = await json('/api/files/' + fileId);
+  } catch (e) {
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+  $('main').classList.remove('hidden');
+  document.title = 'yozist - ' + currentFile.display_name;
+  await Promise.all([loadSeriesOptions(), loadDetail()]);
+}
+
+async function loadSeriesOptions() {
+  try {
+    const list = await json('/api/series');
+    $('fd-add-series').innerHTML = '<option value="">シリーズ選択…</option>' +
+      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+  } catch (e) {}
+}
+
+async function loadDetail() {
+  $('fd-name').textContent = currentFile.display_name;
+  $('fd-meta').textContent = `id=${currentFile.id}, size=${currentFile.size}B, current_commit=${currentFile.current_commit}`;
+  $('fd-share').textContent = '';
+
+  const [tags, content, history] = await Promise.all([
+    json(`/api/files/${fileId}/tags`),
+    api(`/api/files/${fileId}/content`).then(r => r.text()),
+    json(`/api/files/${fileId}/history`),
+  ]);
+  currentContent = content;
+  $('fd-tags').innerHTML = tags.length === 0
+    ? '<span class="opacity-50 text-xs">タグなし</span>'
+    : tags.map(t => {
+        const variant = t.kind === 'system' ? 'badge-neutral'
+                      : t.kind === 'ai' ? 'badge-warning'
+                      : 'badge-primary';
+        return `<span class="badge ${variant} badge-outline gap-1">
+          ${escapeHtml(t.name)}
+          <a href="#" class="text-error" onclick="event.preventDefault(); detachTag('${t.id}')">×</a>
+        </span>`;
+      }).join('');
+  $('fd-content').textContent = content.length > 20000 ? content.slice(0, 20000) + '\n…' : content;
+
+  const currentCommitId = currentFile.current_commit;
+  $('fd-history').innerHTML = history.length === 0
+    ? '<div class="opacity-50 text-xs">履歴なし</div>'
+    : history.map(c => {
+        const isCurrent = c.id === currentCommitId;
+        const time = fmtTs(c.timestamp);
+        return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
+          <div class="truncate">
+            ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
+            <span class="opacity-70">${time}</span>
+            <span class="opacity-60">${escapeHtml(c.format_id)}</span>
+            ${escapeHtml(c.message || '')}
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <button class="btn btn-xs" onclick="diffCommit('${c.id}','${time}')">Δ</button>
+            <a class="btn btn-xs" href="/ui/files/${fileId}/histories/${c.id}">表示</a>
+            ${isCurrent ? '' : `<button class="btn btn-xs btn-warning btn-outline"
+              onclick="rollback('${c.id}','${time}')">戻す</button>`}
+          </div>
+        </div>`;
+      }).join('');
+}
+
+async function diffCommit(commitId, time) {
+  const [oldR, newR] = await Promise.all([
+    api(`/api/files/${fileId}/commits/${commitId}`),
+    api(`/api/files/${fileId}/content`),
+  ]);
+  if (!oldR.ok || !newR.ok) return alert('diff取得失敗');
+  const oldText = await oldR.text();
+  const newText = await newR.text();
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+  const max = Math.max(oldLines.length, newLines.length);
+  let out = `=== diff ===\n旧 (${time}) → 現在\n\n`;
+  const oldSet = new Set(oldLines);
+  const newSet = new Set(newLines);
+  for (let i = 0; i < max; i++) {
+    const a = oldLines[i] ?? '';
+    const b = newLines[i] ?? '';
+    if (a === b) out += `  ${a}\n`;
+    else {
+      if (a && !newSet.has(a)) out += `- ${a}\n`;
+      if (b && !oldSet.has(b)) out += `+ ${b}\n`;
+      if (a && newSet.has(a) && b && oldSet.has(b)) out += `~ ${a} → ${b}\n`;
+    }
+  }
+  alert(out.length > 3000 ? out.slice(0, 3000) + '\n…' : out);
+}
+
+async function rollback(commitId, time) {
+  if (!confirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(新しいコミットとして記録されます)`)) return;
+  const r = await api(
+    `/api/files/${fileId}/rollback/${commitId}?message=` +
+      encodeURIComponent(`rollback to ${time}`),
+    { method: 'POST' }
+  );
+  if (!r.ok) return alert('rollback失敗: ' + await r.text());
+  currentFile = await json('/api/files/' + fileId);
+  await loadDetail();
+}
+
+function toggleEdit() {
+  const ed = $('fd-editor');
+  if (ed.classList.contains('hidden')) {
+    $('fd-edit-textarea').value = currentContent;
+    $('fd-edit-message').value = '';
+    ed.classList.remove('hidden');
+  } else {
+    ed.classList.add('hidden');
+  }
+}
+
+async function saveEdit() {
+  const newContent = $('fd-edit-textarea').value;
+  const msg = $('fd-edit-message').value;
+  const url = `/api/files/${fileId}/content` + (msg ? `?message=${encodeURIComponent(msg)}` : '');
+  const r = await api(url, {
+    method: 'POST',
+    body: new TextEncoder().encode(newContent).buffer,
+    headers: { 'content-type': 'application/octet-stream' },
+  });
+  if (!r.ok) return alert('保存失敗: ' + await r.text());
+  currentFile = await json('/api/files/' + fileId);
+  $('fd-editor').classList.add('hidden');
+  await loadDetail();
+}
+
+async function addTag() {
+  const name = $('fd-add-tag').value.trim();
+  if (!name) return;
+  const created = await json('/api/tags', { method: 'POST', body: { name } });
+  const r = await api(`/api/files/${fileId}/tags`, {
+    method: 'POST', body: JSON.stringify({ tag_id: created.id }),
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!r.ok) return alert('タグ追加失敗: ' + await r.text());
+  $('fd-add-tag').value = '';
+  await loadDetail();
+}
+
+async function detachTag(tagId) {
+  const r = await api(`/api/files/${fileId}/tags/${tagId}`, { method: 'DELETE' });
+  if (!r.ok) return alert('タグ取り外し失敗');
+  await loadDetail();
+}
+
+async function addToSeries() {
+  const sid = $('fd-add-series').value;
+  if (!sid) return alert('シリーズを選択してください');
+  await json(`/api/series/${sid}/members`, {
+    method: 'POST',
+    body: { file_id: fileId },
+  });
+  alert('追加しました');
+}
+
+async function issueShare() {
+  const ttl = prompt('有効秒数を入力してください', '3600');
+  if (!ttl) return;
+  const r = await json(`/api/files/${fileId}/share`, {
+    method: 'POST',
+    body: { ttl_secs: parseInt(ttl, 10) },
+  });
+  const fullUrl = location.origin + r.url;
+  $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${fullUrl}</a>`;
+}
+
+async function grantPermission() {
+  const users = await json('/api/users');
+  if (users.length === 0) return alert('ユーザーが存在しません');
+  const userListStr = users.map((u, i) => `${i + 1}: ${u.username}`).join('\n');
+  const sel = prompt(`権限を付与するユーザー番号:\n${userListStr}`, '1');
+  if (!sel) return;
+  const idx = parseInt(sel, 10) - 1;
+  if (isNaN(idx) || idx < 0 || idx >= users.length) return alert('無効な選択');
+  const target = users[idx];
+  const maskStr = prompt(
+    '権限マスク (VIEW=1 READ=2 WRITE=4 ADMIN=8 を合算):\nread=3, write=7, admin=15',
+    '3'
+  );
+  if (!maskStr) return;
+  const mask = parseInt(maskStr, 10);
+  if (isNaN(mask)) return alert('無効なマスク');
+  const allow = confirm('OK=allow / Cancel=deny');
+  await json('/api/acl', {
+    method: 'POST',
+    body: {
+      subject: `user:${target.id}`,
+      target: `file:${fileId}`,
+      mask, allow, priority: 10,
+    },
+  });
+  alert(`付与しました: ${target.username} に ${allow ? 'allow' : 'deny'} mask=${mask}`);
+}
+
+async function deleteFile() {
+  if (!confirm(`"${currentFile.display_name}" を削除しますか？`)) return;
+  const r = await api(`/api/files/${fileId}`, { method: 'DELETE' });
+  if (!r.ok) return alert('削除失敗: ' + await r.text());
+  location.href = '/ui/files';
+}
+
+init();
+</script>
+</body>
+</html>

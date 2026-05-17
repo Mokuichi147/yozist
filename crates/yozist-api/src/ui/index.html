@@ -25,8 +25,11 @@
 <body class="min-h-screen bg-base-200 text-base-content">
 
 <div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2">
-    <span class="text-xl font-bold">yozist</span>
+  <div class="flex-1 px-2 flex items-center gap-3">
+    <a href="/ui" class="text-xl font-bold">yozist</a>
+    <div class="tabs tabs-boxed tabs-sm">
+      <a href="/ui/files" class="tab">files</a>
+    </div>
   </div>
   <div class="flex-none flex items-center gap-3 px-2">
     <span id="me" class="text-sm opacity-70">…</span>
@@ -70,25 +73,16 @@
       </div>
     </div>
 
-    <!-- 右カラム: files / detail / groups / queries / shares / audit -->
+    <!-- 右カラム: upload / groups / queries / shares / audit -->
     <div class="space-y-4">
 
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
-          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold mb-2">
-            files <span class="opacity-60 normal-case" id="files-count"></span>
-          </h2>
-
-          <div class="join w-full mb-2">
-            <input id="search-input" class="input input-bordered input-sm join-item w-full"
-                   placeholder="全文検索 (FTS5)"
-                   onkeydown="if(event.key==='Enter')doSearch()">
-            <button class="btn btn-sm join-item" onclick="doSearch()">検索</button>
-            <button class="btn btn-sm join-item btn-ghost" onclick="clearSearch()" title="クリア">×</button>
+          <div class="flex items-center justify-between mb-2">
+            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">upload</h2>
+            <a href="/ui/files" class="text-xs link link-primary">ファイル一覧へ →</a>
           </div>
-          <div id="file-filter" class="text-xs opacity-60 mb-2"></div>
-
-          <div class="border border-base-300 rounded-lg p-3 mb-3 space-y-2 bg-base-200/40">
+          <div class="space-y-2">
             <input id="upload-name" class="input input-bordered input-sm w-full"
                    placeholder="新規ファイル名 (例: memo.md)">
             <textarea id="upload-content" class="textarea textarea-bordered w-full text-sm"
@@ -97,67 +91,7 @@
               <input type="file" id="upload-file" class="file-input file-input-bordered file-input-xs flex-1 min-w-[160px]">
               <button class="btn btn-primary btn-sm" onclick="doUpload()">登録</button>
             </div>
-          </div>
-
-          <ul class="divide-y divide-base-300 max-h-[50vh] overflow-y-auto" id="file-list"></ul>
-        </div>
-      </div>
-
-      <div class="card bg-base-100 shadow-sm hidden" id="file-detail">
-        <div class="card-body p-4">
-          <h2 id="fd-name" class="card-title text-base">…</h2>
-          <div id="fd-meta" class="text-xs opacity-60 break-all"></div>
-          <div id="fd-tags" class="my-2 flex flex-wrap gap-1"></div>
-
-          <div class="join w-full">
-            <input id="fd-add-tag" class="input input-bordered input-sm join-item w-full"
-                   placeholder="タグ名を入力して追加">
-            <button class="btn btn-sm join-item" onclick="addTagToCurrent()">+ タグ</button>
-          </div>
-
-          <div class="join w-full mt-2">
-            <select id="fd-add-series" class="select select-bordered select-sm join-item w-full">
-              <option value="">シリーズ選択…</option>
-            </select>
-            <button class="btn btn-sm join-item" onclick="addToSeries()">+ シリーズ</button>
-          </div>
-
-          <div class="flex flex-wrap gap-2 mt-3">
-            <button class="btn btn-sm" onclick="issueShare()">共有URLを発行</button>
-            <button class="btn btn-sm" onclick="grantPermission()">権限付与</button>
-            <button class="btn btn-sm" onclick="toggleEdit()">編集</button>
-            <button class="btn btn-sm btn-error btn-outline" onclick="deleteCurrentFile()">削除</button>
-          </div>
-
-          <div id="fd-share" class="text-xs break-all my-2"></div>
-
-          <div id="fd-editor" class="hidden my-2 space-y-2">
-            <textarea id="fd-edit-textarea"
-                      class="textarea textarea-bordered w-full font-mono text-xs"
-                      rows="12"></textarea>
-            <div class="join w-full">
-              <input id="fd-edit-message" class="input input-bordered input-sm join-item w-full"
-                     placeholder="コミットメッセージ (任意)">
-              <button class="btn btn-primary btn-sm join-item" onclick="saveEdit()">保存</button>
-              <button class="btn btn-sm join-item" onclick="toggleEdit()">キャンセル</button>
-            </div>
-          </div>
-
-          <div class="collapse collapse-arrow bg-base-200 mt-2">
-            <input type="checkbox">
-            <div class="collapse-title text-sm font-semibold py-2 min-h-0">content</div>
-            <div class="collapse-content">
-              <pre id="fd-content"
-                   class="bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-96 whitespace-pre-wrap break-words">…</pre>
-            </div>
-          </div>
-
-          <div class="collapse collapse-arrow bg-base-200 mt-2">
-            <input type="checkbox">
-            <div class="collapse-title text-sm font-semibold py-2 min-h-0">history</div>
-            <div class="collapse-content">
-              <div id="fd-history" class="space-y-1">…</div>
-            </div>
+            <div id="upload-result" class="text-xs"></div>
           </div>
         </div>
       </div>
@@ -209,8 +143,6 @@
 <script>
 const $ = id => document.getElementById(id);
 let token = localStorage.getItem('yozist_token') || '';
-let filterTags = []; // 選択中のタグ名（AND）
-let searchQuery = '';
 
 function api(path, opts = {}) {
   opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
@@ -257,7 +189,6 @@ async function doRegister() {
 function logout() {
   localStorage.removeItem('yozist_token');
   token = '';
-  filterTags = [];
   showLogin();
 }
 
@@ -282,7 +213,7 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadTags(), loadSeries(), loadFiles(), loadShares(), loadAudit(), loadQueries(), loadGroups()]);
+  await Promise.all([loadTags(), loadSeries(), loadShares(), loadAudit(), loadQueries(), loadGroups()]);
 }
 
 async function loadGroups() {
@@ -406,39 +337,6 @@ async function shareQuery(id, name) {
   await loadShares();
 }
 
-async function grantPermission() {
-  if (!currentFile) return;
-  const users = await json('/api/users');
-  if (users.length === 0) return alert('ユーザーが存在しません');
-  const userListStr = users.map((u, i) => `${i + 1}: ${u.username}`).join('\n');
-  const sel = prompt(`権限を付与するユーザー番号:\n${userListStr}`, '1');
-  if (!sel) return;
-  const idx = parseInt(sel, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= users.length) return alert('無効な選択');
-  const target = users[idx];
-
-  const maskStr = prompt(
-    '権限マスク (VIEW=1 READ=2 WRITE=4 ADMIN=8 を合算):\nread=3, write=7, admin=15',
-    '3'
-  );
-  if (!maskStr) return;
-  const mask = parseInt(maskStr, 10);
-  if (isNaN(mask)) return alert('無効なマスク');
-
-  const allow = confirm('OK=allow / Cancel=deny');
-
-  await json('/api/acl', {
-    method: 'POST',
-    body: {
-      subject: `user:${target.id}`,
-      target: `file:${currentFile.id}`,
-      mask,
-      allow,
-      priority: 10,
-    },
-  });
-  alert(`付与しました: ${target.username} に ${allow ? 'allow' : 'deny'} mask=${mask}`);
-}
 
 async function loadTags() {
   const tags = await fetch('/api/tags').then(r => r.json());
@@ -447,11 +345,11 @@ async function loadTags() {
   if (tags.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs px-2 py-1">タグなし</div>'; return; }
   tags.forEach(t => {
     const li = document.createElement('li');
-    const active = filterTags.includes(t.name);
     const icon = t.kind === 'system' ? '⚙' : t.kind === 'ai' ? '🤖' : '';
     const a = document.createElement('a');
-    a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded ' +
-      (active ? 'bg-primary/20 font-semibold' : 'hover:bg-base-200');
+    a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded hover:bg-base-200';
+    a.href = '/ui/files?tags=' + encodeURIComponent(t.name);
+    a.title = 'このタグでファイル一覧を絞り込む';
     a.innerHTML = `<span class="flex-1 truncate">${escapeHtml(t.name)} ${icon}</span>`;
     const renameBtn = document.createElement('button');
     renameBtn.className = 'btn btn-xs btn-ghost px-1';
@@ -477,14 +375,7 @@ async function loadTags() {
       e.stopPropagation(); e.preventDefault();
       if (!confirm(`タグ "${t.name}" を削除しますか？\n(ファイル本体は残りますが、このタグの紐付けは全て解除されます)`)) return;
       await api(`/api/tags/${t.id}`, { method: 'DELETE' });
-      filterTags = filterTags.filter(x => x !== t.name);
       await refresh();
-    };
-    a.onclick = (e) => {
-      if (e.target === renameBtn || e.target === delBtn) return;
-      const idx = filterTags.indexOf(t.name);
-      if (idx >= 0) filterTags.splice(idx, 1); else filterTags.push(t.name);
-      refresh();
     };
     li.appendChild(a);
     el.appendChild(li);
@@ -556,13 +447,6 @@ async function loadSeries() {
   };
   add.appendChild(addLink);
   el.appendChild(add);
-
-  // file-detail の select 更新
-  const sel = $('fd-add-series');
-  if (sel) {
-    sel.innerHTML = '<option value="">シリーズ選択…</option>' +
-      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
-  }
 }
 
 async function loadShares() {
@@ -610,131 +494,6 @@ async function loadAudit() {
   } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
-async function loadFiles() {
-  let url = '/api/files';
-  if (searchQuery) {
-    url = '/api/search?q=' + encodeURIComponent(searchQuery);
-  } else if (filterTags.length > 0) {
-    url = '/api/files/by-tags?tags=' + encodeURIComponent(filterTags.join(','));
-  }
-  const files = await fetch(url).then(r => r.json());
-  $('files-count').textContent = `(${files.length})`;
-  const filterParts = [];
-  if (searchQuery) filterParts.push(`検索: "${searchQuery}"`);
-  if (filterTags.length) filterParts.push('タグ: ' + filterTags.join(' AND '));
-  $('file-filter').textContent = filterParts.join(' / ');
-  const el = $('file-list');
-  el.innerHTML = '';
-  files.forEach(f => {
-    const li = document.createElement('li');
-    li.className = 'px-2 py-2 rounded hover:bg-base-200 cursor-pointer flex items-center justify-between gap-2';
-    li.innerHTML = `<span class="font-semibold truncate">${escapeHtml(f.display_name)}</span>
-      <span class="text-xs opacity-60 shrink-0">${f.size}B</span>`;
-    li.onclick = () => showFile(f);
-    el.appendChild(li);
-  });
-}
-
-let currentFile = null;
-let currentContent = '';
-
-async function showFile(f) {
-  currentFile = f;
-  $('file-detail').classList.remove('hidden');
-  $('fd-name').textContent = f.display_name;
-  $('fd-meta').textContent = `id=${f.id}, size=${f.size}B, current_commit=${f.current_commit}`;
-  $('fd-share').textContent = '';
-  $('fd-editor').classList.add('hidden');
-  const [tags, content, history] = await Promise.all([
-    json(`/api/files/${f.id}/tags`),
-    api(`/api/files/${f.id}/content`).then(r => r.text()),
-    json(`/api/files/${f.id}/history`),
-  ]);
-  currentContent = content;
-  $('fd-tags').innerHTML = tags.length === 0
-    ? '<span class="opacity-50 text-xs">タグなし</span>'
-    : tags.map(t => {
-        const variant = t.kind === 'system' ? 'badge-neutral'
-                      : t.kind === 'ai' ? 'badge-warning'
-                      : 'badge-primary';
-        return `<span class="badge ${variant} badge-outline gap-1">
-          ${escapeHtml(t.name)}
-          <a href="#" class="text-error" onclick="event.preventDefault(); detachTagFromCurrent('${t.id}')">×</a>
-        </span>`;
-      }).join('');
-  $('fd-content').textContent = content.length > 5000 ? content.slice(0, 5000) + '\n…' : content;
-  const currentCommitId = f.current_commit;
-  $('fd-history').innerHTML = history.length === 0
-    ? '<div class="opacity-50 text-xs">履歴なし</div>'
-    : history.map(c => {
-        const isCurrent = c.id === currentCommitId;
-        const time = fmtTs(c.timestamp);
-        return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
-          <div class="truncate">
-            ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
-            <span class="opacity-70">${time}</span>
-            <span class="opacity-60">${escapeHtml(c.format_id)}</span>
-            ${escapeHtml(c.message || '')}
-          </div>
-          <div class="flex gap-1 shrink-0">
-            <button class="btn btn-xs" onclick="diffCommit('${c.id}','${time}')">Δ</button>
-            <button class="btn btn-xs" onclick="previewCommit('${c.id}')">表示</button>
-            ${isCurrent ? '' : `<button class="btn btn-xs btn-warning btn-outline"
-              onclick="rollbackToCommit('${c.id}','${time}')">戻す</button>`}
-          </div>
-        </div>`;
-      }).join('');
-}
-
-async function diffCommit(commitId, time) {
-  if (!currentFile) return;
-  const [oldR, newR] = await Promise.all([
-    api(`/api/files/${currentFile.id}/commits/${commitId}`),
-    api(`/api/files/${currentFile.id}/content`),
-  ]);
-  if (!oldR.ok || !newR.ok) return alert('diff取得失敗');
-  const oldText = await oldR.text();
-  const newText = await newR.text();
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  const max = Math.max(oldLines.length, newLines.length);
-  let out = `=== diff ===\n旧 (${time}) → 現在\n\n`;
-  const oldSet = new Set(oldLines);
-  const newSet = new Set(newLines);
-  for (let i = 0; i < max; i++) {
-    const a = oldLines[i] ?? '';
-    const b = newLines[i] ?? '';
-    if (a === b) out += `  ${a}\n`;
-    else {
-      if (a && !newSet.has(a)) out += `- ${a}\n`;
-      if (b && !oldSet.has(b)) out += `+ ${b}\n`;
-      if (a && newSet.has(a) && b && oldSet.has(b)) out += `~ ${a} → ${b}\n`;
-    }
-  }
-  alert(out.length > 3000 ? out.slice(0, 3000) + '\n…' : out);
-}
-
-async function previewCommit(commitId) {
-  if (!currentFile) return;
-  const r = await api(`/api/files/${currentFile.id}/commits/${commitId}`);
-  if (!r.ok) return alert('取得失敗');
-  const text = await r.text();
-  alert(`commit ${commitId.slice(0, 8)}…\n\n${text.length > 1500 ? text.slice(0, 1500) + '…' : text}`);
-}
-
-async function rollbackToCommit(commitId, time) {
-  if (!currentFile) return;
-  if (!confirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(履歴は破壊されず、新しいコミットとして記録されます)`)) return;
-  const r = await api(
-    `/api/files/${currentFile.id}/rollback/${commitId}?message=` +
-      encodeURIComponent(`rollback to ${time}`),
-    { method: 'POST' }
-  );
-  if (!r.ok) return alert('rollback失敗: ' + await r.text());
-  await showFile(currentFile);
-  await loadFiles();
-}
-
 async function doUpload() {
   const fileInput = $('upload-file');
   let name = $('upload-name').value.trim();
@@ -753,102 +512,13 @@ async function doUpload() {
     headers: { 'content-type': 'application/octet-stream' },
   });
   if (!r.ok) return alert('登録失敗: ' + await r.text());
+  const meta = await r.json();
   $('upload-name').value = '';
   $('upload-content').value = '';
   fileInput.value = '';
+  $('upload-result').innerHTML =
+    `登録しました: <a class="link link-primary" href="/ui/files/${meta.id}">${escapeHtml(meta.display_name)}</a>`;
   await refresh();
-}
-
-function toggleEdit() {
-  const ed = $('fd-editor');
-  if (ed.classList.contains('hidden')) {
-    $('fd-edit-textarea').value = currentContent;
-    $('fd-edit-message').value = '';
-    ed.classList.remove('hidden');
-  } else {
-    ed.classList.add('hidden');
-  }
-}
-
-async function saveEdit() {
-  if (!currentFile) return;
-  const newContent = $('fd-edit-textarea').value;
-  const msg = $('fd-edit-message').value;
-  const url = `/api/files/${currentFile.id}/content` + (msg ? `?message=${encodeURIComponent(msg)}` : '');
-  const r = await api(url, {
-    method: 'POST',
-    body: new TextEncoder().encode(newContent).buffer,
-    headers: { 'content-type': 'application/octet-stream' },
-  });
-  if (!r.ok) return alert('保存失敗: ' + await r.text());
-  await showFile(currentFile);
-  await refresh();
-}
-
-async function addTagToCurrent() {
-  if (!currentFile) return;
-  const name = $('fd-add-tag').value.trim();
-  if (!name) return;
-  const created = await json('/api/tags', { method: 'POST', body: { name } });
-  const r = await api(`/api/files/${currentFile.id}/tags`, {
-    method: 'POST', body: JSON.stringify({ tag_id: created.id }),
-    headers: { 'content-type': 'application/json' },
-  });
-  if (!r.ok) return alert('タグ追加失敗: ' + await r.text());
-  $('fd-add-tag').value = '';
-  await showFile(currentFile);
-  await loadTags();
-}
-
-async function detachTagFromCurrent(tagId) {
-  if (!currentFile) return;
-  const r = await api(`/api/files/${currentFile.id}/tags/${tagId}`, { method: 'DELETE' });
-  if (!r.ok) return alert('タグ取り外し失敗');
-  await showFile(currentFile);
-  await loadTags();
-}
-
-async function addToSeries() {
-  if (!currentFile) return;
-  const sid = $('fd-add-series').value;
-  if (!sid) return alert('シリーズを選択してください');
-  await json(`/api/series/${sid}/members`, {
-    method: 'POST',
-    body: { file_id: currentFile.id },
-  });
-  alert('追加しました');
-}
-
-function doSearch() {
-  searchQuery = $('search-input').value.trim();
-  loadFiles();
-}
-function clearSearch() {
-  searchQuery = '';
-  $('search-input').value = '';
-  loadFiles();
-}
-
-async function deleteCurrentFile() {
-  if (!currentFile) return;
-  if (!confirm(`"${currentFile.display_name}" を削除しますか？`)) return;
-  const r = await api(`/api/files/${currentFile.id}`, { method: 'DELETE' });
-  if (!r.ok) return alert('削除失敗: ' + await r.text());
-  $('file-detail').classList.add('hidden');
-  currentFile = null;
-  await refresh();
-}
-
-async function issueShare() {
-  if (!currentFile) return;
-  const ttl = prompt('有効秒数を入力してください', '3600');
-  if (!ttl) return;
-  const r = await json(`/api/files/${currentFile.id}/share`, {
-    method: 'POST',
-    body: { ttl_secs: parseInt(ttl, 10) },
-  });
-  const fullUrl = location.origin + r.url;
-  $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${fullUrl}</a>`;
 }
 
 // API は timestamp を ISO 文字列で返す場合と
