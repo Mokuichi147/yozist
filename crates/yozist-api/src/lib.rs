@@ -205,6 +205,27 @@ async fn require_permission(
     }
 }
 
+/// `files` から呼び出し元 `ctx` が VIEW 権限を持つものだけを残す。
+/// 一覧系 API は権限チェックをここに集約し、詳細 API (`/api/files/:id`) との
+/// 整合性を保つ（一覧に出るが開けない、を避ける）。
+async fn filter_visible_files(
+    authz: &dyn Authorizer,
+    ctx: &AuthContext,
+    files: Vec<FileMeta>,
+) -> Result<Vec<FileMeta>, ApiError> {
+    let mut out = Vec::with_capacity(files.len());
+    for f in files {
+        let ok = authz
+            .check(ctx, &Target::File(f.id), PermissionMask::VIEW)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if ok {
+            out.push(f);
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
@@ -232,9 +253,13 @@ struct CreateFileQuery {
     actor: Option<String>,
 }
 
-async fn list_files(State(s): State<ApiState>) -> Result<Json<Vec<FileMeta>>, ApiError> {
+async fn list_files(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<Vec<FileMeta>>, ApiError> {
     let files = s.meta.list_files(100, 0).await.map_err(ApiError::from_db)?;
-    Ok(Json(files))
+    let visible = filter_visible_files(&*s.authz, &ctx, files).await?;
+    Ok(Json(visible))
 }
 
 async fn create_file(
@@ -618,6 +643,7 @@ struct ByTagsQuery {
 
 async fn list_files_by_tags(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Query(q): Query<ByTagsQuery>,
 ) -> Result<Json<Vec<FileMeta>>, ApiError> {
     let mut tag_ids = Vec::new();
@@ -637,7 +663,8 @@ async fn list_files_by_tags(
         .list_files_by_tags(&tag_ids)
         .await
         .map_err(ApiError::from_db)?;
-    Ok(Json(files))
+    let visible = filter_visible_files(&*s.authz, &ctx, files).await?;
+    Ok(Json(visible))
 }
 
 #[derive(Deserialize)]
@@ -653,6 +680,7 @@ fn default_search_limit() -> u32 {
 
 async fn search_files(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Vec<FileMeta>>, ApiError> {
     let ids = s
@@ -668,7 +696,8 @@ async fn search_files(
             }
         }
     }
-    Ok(Json(out))
+    let visible = filter_visible_files(&*s.authz, &ctx, out).await?;
+    Ok(Json(visible))
 }
 
 /// タグ変更時に FTS の tags 列を再構築するヘルパ。失敗は無視。
