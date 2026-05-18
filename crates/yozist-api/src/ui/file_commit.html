@@ -34,12 +34,6 @@
   </div>
 </div>
 
-<div id="login-warn" class="hidden max-w-md mx-auto mt-24">
-  <div class="alert alert-warning">
-    <span>未ログインです。<a href="/ui" class="link">/ui</a> からログインしてください。</span>
-  </div>
-</div>
-
 <div id="not-found" class="hidden max-w-md mx-auto mt-24">
   <div class="alert alert-error">
     <span id="not-found-msg">コミットが見つかりません。</span>
@@ -110,9 +104,13 @@ function fmtTs(ts) {
   }
   return String(ts ?? '');
 }
+function redirectToLogin() {
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.href = '/ui/login?next=' + next;
+}
 function logout() {
   localStorage.removeItem('yozist_token');
-  location.href = '/ui';
+  redirectToLogin();
 }
 $('logout').onclick = logout;
 
@@ -122,12 +120,12 @@ $('back-link').href = detailUrl;
 $('fc-raw').href = `/api/files/${fileId}/commits/${commitId}`;
 
 async function init() {
-  if (!token) { $('login-warn').classList.remove('hidden'); return; }
+  if (!token) { redirectToLogin(); return; }
   try {
     const me = await json('/api/auth/me');
     if (me.anonymous) { logout(); return; }
     $('me').textContent = me.user.username;
-  } catch (e) { $('login-warn').classList.remove('hidden'); return; }
+  } catch (e) { redirectToLogin(); return; }
 
   let file, history, content;
   try {
