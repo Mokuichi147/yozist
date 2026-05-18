@@ -34,12 +34,6 @@
   </div>
 </div>
 
-<div id="login-warn" class="hidden max-w-md mx-auto mt-24">
-  <div class="alert alert-warning">
-    <span>未ログインです。<a href="/ui" class="link">/ui</a> からログインしてください。</span>
-  </div>
-</div>
-
 <div id="main" class="hidden max-w-7xl mx-auto p-4">
   <div class="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-4">
 
@@ -127,14 +121,18 @@ function escapeHtml(s) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[c]);
 }
+function redirectToLogin() {
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.href = '/ui/login?next=' + next;
+}
 function logout() {
   localStorage.removeItem('yozist_token');
-  location.href = '/ui';
+  redirectToLogin();
 }
 $('logout').onclick = logout;
 
 async function init() {
-  if (!token) { $('login-warn').classList.remove('hidden'); return; }
+  if (!token) { redirectToLogin(); return; }
   try {
     const me = await json('/api/auth/me');
     if (me.anonymous) { logout(); return; }
@@ -144,7 +142,7 @@ async function init() {
     restoreFiltersFromUrl();
     await applyFilters();
   } catch (e) {
-    $('login-warn').classList.remove('hidden');
+    redirectToLogin();
   }
 }
 
