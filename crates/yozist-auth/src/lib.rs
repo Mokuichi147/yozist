@@ -17,8 +17,6 @@
 //! # TODO
 //! - [ ] 元 `UserPermission` の API カバレッジ 100%（更新・削除・グループ一覧 等）
 //! - [ ] `smb-server::ConfigHandle` 連携で SMB ユーザーを動的同期
-//! - [ ] グループ階層（ネスト）対応
-//! - [ ] Authorizer の本実装（ACL ルール評価エンジン）
 //! - [ ] 監査ログ（誰がいつ何にアクセス）
 
 use async_trait::async_trait;
@@ -46,8 +44,6 @@ pub struct Group {
     pub id: GroupId,
     pub name: String,
     pub description: Option<String>,
-    /// 親グループ。階層的所属の表現に使う。
-    pub parent_id: Option<GroupId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

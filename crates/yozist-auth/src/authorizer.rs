@@ -1,35 +1,22 @@
 //! ACL ルールの永続化と認可判定（`Authorizer` 実装）。
 //!
-//! # 評価ロジック（v1）
+//! # 評価ロジック
 //! 1. `AuthContext::System` → 常に allow
 //! 2. `AuthContext::Anonymous` → `Read`/`View` のみ allow（公開リソース）
 //! 3. `AuthContext::User { user, groups }`:
 //!    a. subject が user または所属 group の rule を取得
-//!    b. 対象が target と一致するものを抽出
-//!       - `Target::File(id)` → `target_type='file' AND target_ref=id`
-//!       - `Target::Tag(id)` → `target_type='tag' AND target_ref=id`
-//!       - `Target::Series(id)` → `target_type='series' AND target_ref=id`
-//!       - `Target::Share(name)` → `target_type='share' AND target_ref=name`
-//!       - `Target::Query(_)` → 未対応（TODO）
+//!    b. `target.kind` / `target.ref_` が一致するものを抽出
 //!    c. `priority DESC` でソート、最初にマッチした rule の effect を返す
 //!    d. マッチ無し:
 //!       - rule が一切無い場合は **default allow**（単一ユーザー bootstrap 用）
 //!       - 1 つでも rule があれば **default deny**
-//!
-//! # TODO
-//! - [ ] `Target::Query` の評価（saved query → 対象ファイル展開）
-//! - [ ] Tag/Series rule とファイルの間接マッチ（ファイル経由のチェック）
-//! - [ ] 期限切れ rule の自動除外
-//! - [ ] 結果キャッシュ（rule リスト変更時に invalidation）
 
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 use yozist_core::{GroupId, UserId};
 
-use crate::{
-    AuthContext, AuthError, Authorizer, Permission, PermissionMask, Subject, Target,
-};
+use crate::{AuthContext, AuthError, Authorizer, Permission, PermissionMask, Subject, Target};
 
 /// SQLite ベースの ACL ストア + 認可判定器。
 ///
@@ -50,31 +37,23 @@ impl DbAuthorizer {
             Subject::User(u) => ("user", u.to_string()),
             Subject::Group(g) => ("group", g.to_string()),
         };
-        let (tt, tref) = target_to_db(&p.target)?;
         let mask = p.mask.bits() as i64;
         let effect = if p.allow { "allow" } else { "deny" };
-        let expires = p
-            .expires_at
-            .map(|d| {
-                d.format(&time::format_description::well_known::Rfc3339)
-                    .unwrap_or_default()
-            });
 
         sqlx::query(
             r#"INSERT INTO acl_rules
                (id, subject_type, subject_id, target_type, target_ref,
-                permission_mask, effect, priority, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                permission_mask, effect, priority)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(id.to_string())
         .bind(st)
         .bind(&sid)
-        .bind(tt)
-        .bind(&tref)
+        .bind(&p.target.kind)
+        .bind(&p.target.ref_)
         .bind(mask)
         .bind(effect)
         .bind(p.priority as i64)
-        .bind(expires)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -104,8 +83,6 @@ impl DbAuthorizer {
         groups: &[GroupId],
         target: &Target,
     ) -> Result<Vec<RuleRow>, AuthError> {
-        let (tt, tref) = target_to_db(target)?;
-
         // subject 条件を動的に組み立てる。
         let mut subject_clauses = vec!["(subject_type = 'user' AND subject_id = ?)".to_string()];
         let mut binds: Vec<String> = vec![user.to_string()];
@@ -121,14 +98,13 @@ impl DbAuthorizer {
                WHERE ({subject_sql})
                  AND target_type = ?
                  AND target_ref = ?
-                 AND (expires_at IS NULL OR expires_at > datetime('now'))
                ORDER BY priority DESC, effect ASC"#
         );
         let mut q = sqlx::query(&sql);
         for b in &binds {
             q = q.bind(b);
         }
-        q = q.bind(tt).bind(tref);
+        q = q.bind(&target.kind).bind(&target.ref_);
         let rows = q.fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| {
@@ -150,20 +126,6 @@ struct RuleRow {
     allow: bool,
     #[allow(dead_code)]
     priority: i32,
-}
-
-fn target_to_db(t: &Target) -> Result<(&'static str, String), AuthError> {
-    Ok(match t {
-        Target::Share(name) => ("share", name.clone()),
-        Target::Tag(id) => ("tag", id.to_string()),
-        Target::Series(id) => ("series", id.to_string()),
-        Target::File(id) => ("file", id.to_string()),
-        Target::Query(_) => {
-            return Err(AuthError::Other(
-                "query target evaluation not yet supported".into(),
-            ));
-        }
-    })
 }
 
 #[async_trait]
@@ -227,11 +189,7 @@ mod tests {
             groups: vec![],
         };
         let allowed = authz
-            .check(
-                &ctx,
-                &Target::File(FileId::new()),
-                PermissionMask::WRITE,
-            )
+            .check(&ctx, &Target::file(FileId::new()), PermissionMask::WRITE)
             .await
             .unwrap();
         assert!(allowed, "bootstrap mode should allow write");
@@ -241,7 +199,7 @@ mod tests {
     async fn anonymous_can_read_not_write() {
         let (authz, _auth) = fixtures().await;
         let ctx = AuthContext::Anonymous;
-        let target = Target::File(FileId::new());
+        let target = Target::file(FileId::new());
         assert!(authz
             .check(&ctx, &target, PermissionMask::READ)
             .await
@@ -262,11 +220,10 @@ mod tests {
         authz
             .add_rule(&Permission {
                 subject: Subject::User(user.id),
-                target: Target::File(file),
+                target: Target::file(file),
                 mask: PermissionMask::WRITE,
                 allow: false,
                 priority: 10,
-                expires_at: None,
             })
             .await
             .unwrap();
@@ -276,13 +233,13 @@ mod tests {
             groups: vec![],
         };
         let allowed = authz
-            .check(&ctx, &Target::File(file), PermissionMask::WRITE)
+            .check(&ctx, &Target::file(file), PermissionMask::WRITE)
             .await
             .unwrap();
         assert!(!allowed);
         // 同一 file の READ も rule に書かれていないので deny
         let read = authz
-            .check(&ctx, &Target::File(file), PermissionMask::READ)
+            .check(&ctx, &Target::file(file), PermissionMask::READ)
             .await
             .unwrap();
         assert!(!read);
@@ -297,11 +254,10 @@ mod tests {
         authz
             .add_rule(&Permission {
                 subject: Subject::User(user.id),
-                target: Target::File(file),
+                target: Target::file(file),
                 mask: PermissionMask::WRITE,
                 allow: false,
                 priority: 1,
-                expires_at: None,
             })
             .await
             .unwrap();
@@ -309,11 +265,10 @@ mod tests {
         authz
             .add_rule(&Permission {
                 subject: Subject::User(user.id),
-                target: Target::File(file),
+                target: Target::file(file),
                 mask: PermissionMask::WRITE | PermissionMask::READ,
                 allow: true,
                 priority: 50,
-                expires_at: None,
             })
             .await
             .unwrap();
@@ -322,7 +277,7 @@ mod tests {
             groups: vec![],
         };
         assert!(authz
-            .check(&ctx, &Target::File(file), PermissionMask::WRITE)
+            .check(&ctx, &Target::file(file), PermissionMask::WRITE)
             .await
             .unwrap());
     }
@@ -338,11 +293,10 @@ mod tests {
         authz
             .add_rule(&Permission {
                 subject: Subject::Group(group.id),
-                target: Target::File(file),
+                target: Target::file(file),
                 mask: PermissionMask::WRITE,
                 allow: true,
                 priority: 5,
-                expires_at: None,
             })
             .await
             .unwrap();
@@ -352,7 +306,7 @@ mod tests {
             groups: vec![group.id],
         };
         assert!(authz
-            .check(&ctx, &Target::File(file), PermissionMask::WRITE)
+            .check(&ctx, &Target::file(file), PermissionMask::WRITE)
             .await
             .unwrap());
     }

@@ -190,16 +190,7 @@ async function loadGroups() {
 async function createGroup() {
   const name = prompt('グループ名');
   if (!name) return;
-  const groups = await json('/api/groups');
-  const parentPrompt = groups.length === 0
-    ? null
-    : prompt(`親グループ番号 (0=なし):\n0: (なし)\n` + groups.map((g, i) => `${i + 1}: ${g.name}`).join('\n'), '0');
-  const parentIdx = parseInt(parentPrompt || '0', 10);
-  const body = { name };
-  if (parentIdx > 0 && parentIdx <= groups.length) {
-    body.parent_id = groups[parentIdx - 1].id;
-  }
-  await json('/api/groups', { method: 'POST', body });
+  await json('/api/groups', { method: 'POST', body: { name } });
   await loadGroups();
 }
 

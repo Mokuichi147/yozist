@@ -216,7 +216,7 @@ async fn filter_visible_files(
     let mut out = Vec::with_capacity(files.len());
     for f in files {
         let ok = authz
-            .check(ctx, &Target::File(f.id), PermissionMask::VIEW)
+            .check(ctx, &Target::file(f.id), PermissionMask::VIEW)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
         if ok {
@@ -305,11 +305,10 @@ async fn create_file(
     if let AuthContext::User { user, .. } = &ctx {
         let owner_rule = Permission {
             subject: Subject::User(user.id),
-            target: Target::File(file.id),
+            target: Target::file(file.id),
             mask: PermissionMask::all(),
             allow: true,
             priority: i32::MAX,
-            expires_at: None,
         };
         s.acl_admin
             .add_rule(&owner_rule)
@@ -326,7 +325,7 @@ async fn get_file(
     Path(id): Path<String>,
 ) -> Result<Json<FileMeta>, ApiError> {
     let id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::VIEW).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::VIEW).await?;
     let meta = s
         .meta
         .get_file(&id)
@@ -345,7 +344,7 @@ async fn delete_file(
     require_permission(
         &*s.authz,
         &ctx,
-        &Target::File(file_id),
+        &Target::file(file_id),
         PermissionMask::WRITE,
     )
     .await?;
@@ -383,7 +382,7 @@ async fn get_content(
     Path(id): Path<String>,
 ) -> Result<Vec<u8>, ApiError> {
     let id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::READ).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
     s.engine
         .read_current(id)
         .await
@@ -404,7 +403,7 @@ async fn commit_file(
     body: Bytes,
 ) -> Result<Json<yozist_core::Commit>, ApiError> {
     let id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::WRITE).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let result = s
         .engine
@@ -441,7 +440,7 @@ async fn history(
     Path(id): Path<String>,
 ) -> Result<Json<Vec<yozist_core::Commit>>, ApiError> {
     let id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(id), PermissionMask::READ).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
     let log = s.meta.list_commits(&id).await.map_err(ApiError::from_db)?;
     Ok(Json(log))
 }
@@ -452,7 +451,7 @@ async fn read_commit(
     Path((id, cid)): Path<(String, String)>,
 ) -> Result<Vec<u8>, ApiError> {
     let file_id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(file_id), PermissionMask::READ).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(file_id), PermissionMask::READ).await?;
     let commit_id = uuid::Uuid::parse_str(&cid)
         .map(yozist_core::CommitId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("commit id: {e}")))?;
@@ -478,7 +477,7 @@ async fn rollback(
     Query(q): Query<RollbackQuery>,
 ) -> Result<Json<yozist_core::Commit>, ApiError> {
     let file_id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(file_id), PermissionMask::WRITE).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(file_id), PermissionMask::WRITE).await?;
     let commit_id = uuid::Uuid::parse_str(&cid)
         .map(yozist_core::CommitId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("commit id: {e}")))?;
@@ -592,7 +591,7 @@ async fn list_file_tags(
     Path(file_id): Path<String>,
 ) -> Result<Json<Vec<Tag>>, ApiError> {
     let file_id = parse_file_id(&file_id)?;
-    require_permission(&*s.authz, &ctx, &Target::File(file_id), PermissionMask::VIEW).await?;
+    require_permission(&*s.authz, &ctx, &Target::file(file_id), PermissionMask::VIEW).await?;
     let tags = s.meta.list_tags_of(&file_id).await.map_err(ApiError::from_db)?;
     Ok(Json(tags))
 }
@@ -606,7 +605,7 @@ async fn detach_tag(
     require_permission(
         &*s.authz,
         &ctx,
-        &Target::File(file_id),
+        &Target::file(file_id),
         PermissionMask::WRITE,
     )
     .await?;
@@ -779,7 +778,7 @@ async fn attach_tag(
     require_permission(
         &*s.authz,
         &ctx,
-        &Target::File(file_id),
+        &Target::file(file_id),
         PermissionMask::WRITE,
     )
     .await?;
@@ -973,7 +972,7 @@ async fn add_series_member(
     require_permission(
         &*s.authz,
         &ctx,
-        &Target::File(file_id),
+        &Target::file(file_id),
         PermissionMask::WRITE,
     )
     .await?;
@@ -1029,7 +1028,7 @@ async fn remove_series_member(
     require_permission(
         &*s.authz,
         &ctx,
-        &Target::File(file_id),
+        &Target::file(file_id),
         PermissionMask::WRITE,
     )
     .await?;
@@ -1321,7 +1320,7 @@ async fn issue_file_share(
     require_permission(
         &*s.authz,
         &ctx,
-        &Target::File(file_id),
+        &Target::file(file_id),
         PermissionMask::ADMIN,
     )
     .await?;
@@ -1531,10 +1530,8 @@ async fn add_acl_rule(
     };
     let (ttype, tref) = split_colon(&input.target)?;
     let target = match ttype {
-        "file" => Target::File(parse_uuid_id(tref)?),
-        "tag" => Target::Tag(parse_uuid_id(tref)?),
-        "series" => Target::Series(parse_uuid_id(tref)?),
-        "share" => Target::Share(tref.to_string()),
+        "file" => Target::file(parse_uuid_id::<FileId>(tref)?),
+        "share" => Target::share(tref),
         other => return Err(ApiError::BadRequest(format!("target type: {other}"))),
     };
     let mask = PermissionMask::from_bits_truncate(input.mask);
@@ -1544,7 +1541,6 @@ async fn add_acl_rule(
         mask,
         allow: input.allow,
         priority: input.priority,
-        expires_at: None,
     };
     // TODO: admin 権限の本実装（現状は authenticated を要求）。
     let res = s
@@ -1640,7 +1636,6 @@ async fn list_users(
 struct CreateGroupInput {
     name: String,
     description: Option<String>,
-    parent_id: Option<String>,
 }
 
 async fn list_groups(
@@ -1749,28 +1744,13 @@ async fn create_group(
     Json(input): Json<CreateGroupInput>,
 ) -> Result<(StatusCode, Json<yozist_auth::Group>), ApiError> {
     require_authenticated(&ctx).await?;
-    let parent = input
-        .parent_id
-        .map(|s| {
-            uuid::Uuid::parse_str(&s)
-                .map(yozist_core::GroupId::from_uuid)
-                .map_err(|e| ApiError::BadRequest(format!("parent_id: {e}")))
-        })
-        .transpose()?;
     let res = s
         .share_admin
-        .create_group_with_parent(&input.name, input.description.as_deref(), parent)
+        .create_group(&input.name, input.description.as_deref())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
     let id_str = res.as_ref().ok().map(|g| g.id.to_string());
-    let meta = format!(
-        "{{\"name\":\"{}\",\"parent\":{}}}",
-        input.name,
-        match &parent {
-            Some(p) => format!("\"{p}\""),
-            None => "null".into(),
-        }
-    );
+    let meta = format!("{{\"name\":\"{}\"}}", input.name);
     audit_event(
         &s,
         &ctx,

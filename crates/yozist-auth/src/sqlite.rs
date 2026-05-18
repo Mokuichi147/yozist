@@ -50,45 +50,28 @@ impl SqliteAuthService {
         name: &str,
         description: Option<&str>,
     ) -> Result<Group, AuthError> {
-        self.create_group_with_parent(name, description, None).await
-    }
-
-    /// 親グループを指定してグループを作成。
-    pub async fn create_group_with_parent(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        parent: Option<GroupId>,
-    ) -> Result<Group, AuthError> {
         let id = GroupId::new();
-        sqlx::query(
-            "INSERT INTO groups (id, name, description, parent_group_id) VALUES (?, ?, ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(name)
-        .bind(description)
-        .bind(parent.map(|g| g.to_string()))
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO groups (id, name, description) VALUES (?, ?, ?)")
+            .bind(id.to_string())
+            .bind(name)
+            .bind(description)
+            .execute(&self.pool)
+            .await?;
         Ok(Group {
             id,
             name: name.into(),
             description: description.map(str::to_string),
-            parent_id: parent,
         })
     }
 
-    /// 全グループ一覧（親子関係を含む）。
+    /// 全グループ一覧。
     pub async fn list_groups(&self) -> Result<Vec<Group>, AuthError> {
-        let rows = sqlx::query(
-            "SELECT id, name, description, parent_group_id FROM groups ORDER BY name ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT id, name, description FROM groups ORDER BY name ASC")
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter()
             .map(|r| {
                 let id: String = r.try_get("id")?;
-                let parent: Option<String> = r.try_get("parent_group_id")?;
                 Ok(Group {
                     id: GroupId::from_uuid(
                         Uuid::parse_str(&id)
@@ -96,13 +79,6 @@ impl SqliteAuthService {
                     ),
                     name: r.try_get("name")?,
                     description: r.try_get("description")?,
-                    parent_id: parent
-                        .map(|s| {
-                            Uuid::parse_str(&s)
-                                .map(GroupId::from_uuid)
-                                .map_err(|e| AuthError::Other(format!("uuid: {e}")))
-                        })
-                        .transpose()?,
                 })
             })
             .collect()
@@ -122,25 +98,15 @@ impl SqliteAuthService {
         row.map(row_to_user).transpose()
     }
 
-    /// グループ ID 一覧（ユーザーが所属する + 親グループへの推移閉包）。
+    /// ユーザーが所属するグループ ID 一覧。
     pub async fn user_groups(&self, user: &UserId) -> Result<Vec<GroupId>, AuthError> {
-        // SQLite の再帰 CTE で親グループを辿る
-        let rows = sqlx::query(
-            "WITH RECURSIVE ancestor(id) AS (
-                SELECT group_id FROM user_groups WHERE user_id = ?
-                UNION
-                SELECT g.parent_group_id FROM groups g
-                JOIN ancestor a ON g.id = a.id
-                WHERE g.parent_group_id IS NOT NULL
-             )
-             SELECT id FROM ancestor",
-        )
-        .bind(user.to_string())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT group_id FROM user_groups WHERE user_id = ?")
+            .bind(user.to_string())
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter()
             .map(|r| {
-                let s: String = r.try_get("id")?;
+                let s: String = r.try_get("group_id")?;
                 Uuid::parse_str(&s)
                     .map(GroupId::from_uuid)
                     .map_err(|e| AuthError::Other(format!("uuid: {e}")))

@@ -108,7 +108,7 @@ impl ShareBackend for AllBackend {
                     yozist_auth::PermissionMask::READ
                 };
                 self.deps
-                    .require(identity, &yozist_auth::Target::File(meta.id), mask)
+                    .require(identity, &yozist_auth::Target::file(meta.id), mask)
                     .await?;
                 let h = YozistFileHandle::open_existing(
                     &self.deps,
@@ -125,7 +125,7 @@ impl ShareBackend for AllBackend {
                 self.deps
                     .require(
                         identity,
-                        &yozist_auth::Target::File(meta.id),
+                        &yozist_auth::Target::file(meta.id),
                         yozist_auth::PermissionMask::WRITE,
                     )
                     .await?;
@@ -182,7 +182,7 @@ impl ShareBackend for AllBackend {
         self.deps
             .require(
                 identity,
-                &yozist_auth::Target::File(id),
+                &yozist_auth::Target::file(id),
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
@@ -226,7 +226,7 @@ impl ShareBackend for AllBackend {
         self.deps
             .require(
                 identity,
-                &yozist_auth::Target::File(id),
+                &yozist_auth::Target::file(id),
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
@@ -502,7 +502,7 @@ impl ShareBackend for TagsBackend {
                     yozist_auth::PermissionMask::READ
                 };
                 self.deps
-                    .require(identity, &yozist_auth::Target::File(meta.id), mask)
+                    .require(identity, &yozist_auth::Target::file(meta.id), mask)
                     .await?;
                 let mut h = YozistFileHandle::open_existing(
                     &self.deps,
@@ -533,7 +533,7 @@ impl ShareBackend for TagsBackend {
                 self.deps
                     .require(
                         identity,
-                        &yozist_auth::Target::File(file_id),
+                        &yozist_auth::Target::file(file_id),
                         yozist_auth::PermissionMask::WRITE,
                     )
                     .await?;
@@ -592,7 +592,7 @@ impl ShareBackend for TagsBackend {
         self.deps
             .require(
                 identity,
-                &yozist_auth::Target::File(file_id),
+                &yozist_auth::Target::file(file_id),
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
@@ -818,7 +818,7 @@ impl ShareBackend for SeriesBackend {
                             yozist_auth::PermissionMask::READ
                         };
                         self.deps
-                            .require(identity, &yozist_auth::Target::File(meta.id), mask)
+                            .require(identity, &yozist_auth::Target::file(meta.id), mask)
                             .await?;
                         let mut h = YozistFileHandle::open_existing(
                             &self.deps,
@@ -899,7 +899,7 @@ impl ShareBackend for SeriesBackend {
         self.deps
             .require(
                 identity,
-                &yozist_auth::Target::File(file_id),
+                &yozist_auth::Target::file(file_id),
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
@@ -948,7 +948,7 @@ impl ShareBackend for SeriesBackend {
         self.deps
             .require(
                 identity,
-                &yozist_auth::Target::File(file_id),
+                &yozist_auth::Target::file(file_id),
                 yozist_auth::PermissionMask::WRITE,
             )
             .await?;
@@ -1160,7 +1160,7 @@ impl ShareBackend for QueriesBackend {
                 self.deps
                     .require(
                         identity,
-                        &yozist_auth::Target::File(file_id),
+                        &yozist_auth::Target::file(file_id),
                         yozist_auth::PermissionMask::READ,
                     )
                     .await?;

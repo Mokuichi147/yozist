@@ -371,11 +371,10 @@ impl Handle for YozistFileHandle {
                     {
                         let owner_rule = Permission {
                             subject: Subject::User(owner_id),
-                            target: Target::File(file.id),
+                            target: Target::file(file.id),
                             mask: PermissionMask::all(),
                             allow: true,
                             priority: i32::MAX,
-                            expires_at: None,
                         };
                         acl_admin.add_rule(&owner_rule).await.map_err(|e| {
                             smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
