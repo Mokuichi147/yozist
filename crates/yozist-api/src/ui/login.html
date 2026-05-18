@@ -27,16 +27,17 @@
 
 <div class="card bg-base-100 shadow-md max-w-sm mx-auto mt-24">
   <div class="card-body">
-    <h2 class="card-title text-sm uppercase tracking-wider opacity-70">ログイン</h2>
-    <p class="text-sm opacity-70">アカウント名とパスワードを入力してください。</p>
+    <h2 class="text-2xl font-bold mb-4">ログイン</h2>
     <form id="lf-form" action="/api/auth/login" method="post" autocomplete="on">
+      <label for="lf-user" class="block text-sm mb-1">ユーザー名</label>
       <input id="lf-user" name="username" autocomplete="username"
-             class="input input-bordered w-full" placeholder="username" required>
+             class="input input-bordered w-full" required>
+      <label for="lf-pw" class="block text-sm mt-3 mb-1">パスワード</label>
       <input id="lf-pw" name="password" type="password" autocomplete="current-password"
-             class="input input-bordered w-full mt-2" placeholder="password" required>
-      <button type="submit" class="btn btn-primary w-full mt-3">ログイン</button>
-      <div class="text-center mt-2">
-        <a href="#" id="register-btn" class="link link-primary text-sm">アカウントを新規作成する</a>
+             class="input input-bordered w-full" required>
+      <button type="submit" class="btn btn-primary w-full mt-5">ログイン</button>
+      <div class="text-center text-sm mt-3">
+        アカウントがない場合は <a href="#" id="register-btn" class="link link-primary">登録</a>
       </div>
       <div id="lf-error" class="text-xs text-error mt-2 hidden"></div>
     </form>
