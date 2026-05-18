@@ -34,9 +34,9 @@
              class="input input-bordered w-full" placeholder="username" required>
       <input id="lf-pw" name="password" type="password" autocomplete="current-password"
              class="input input-bordered w-full mt-2" placeholder="password" required>
-      <div class="card-actions mt-3 flex justify-between items-center">
-        <button type="submit" class="btn btn-primary btn-sm">ログイン</button>
-        <button type="button" id="register-btn" class="btn btn-sm btn-ghost btn-link">アカウント作成</button>
+      <button type="submit" class="btn btn-primary w-full mt-3">ログイン</button>
+      <div class="text-center mt-2">
+        <a href="#" id="register-btn" class="link link-primary text-sm">アカウントを新規作成する</a>
       </div>
       <div id="lf-error" class="text-xs text-error mt-2 hidden"></div>
     </form>
@@ -104,7 +104,7 @@ async function doRegister() {
 }
 
 $('lf-form').addEventListener('submit', (e) => { e.preventDefault(); doLogin(); });
-$('register-btn').addEventListener('click', doRegister);
+$('register-btn').addEventListener('click', (e) => { e.preventDefault(); doRegister(); });
 
 // 既にログイン済みなら遷移先に戻す
 (async () => {
