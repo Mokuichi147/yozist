@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use yozist_core::{GroupId, UserId};
 
-/// 権限の主体。
+/// 権限の主体。ID は user-permission の i64 を直接使う。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Subject {
     User(UserId),
@@ -14,9 +14,6 @@ pub enum Subject {
 }
 
 /// 権限の対象。kind/ref_ は任意文字列。
-///
-/// 現在 yozist で利用される kind は `"file"` と `"share"` のみだが、
-/// `Target` 自体はドメイン非依存。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
     pub kind: String,

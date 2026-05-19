@@ -26,14 +26,15 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use user_permission_core::Database as AuthDb;
 use yozist_auth::{
-    AuthContext, AuthService, AuthToken, Authorizer, DbAuthorizer, Permission, PermissionMask,
-    Subject, Target,
+    AuthContext, Authorizer, DbAuthorizer, Permission, PermissionMask, ShareTokenStore, Subject,
+    Target,
 };
 
 pub mod ui;
 use yozist_core::{
-    ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
+    ActorId, FileId, FileMeta, GroupId, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -42,17 +43,15 @@ use yozist_versioning::VersioningEngine;
 /// API ハンドラが共有する状態。
 #[derive(Clone)]
 pub struct ApiState {
-    // フィールドは Clone なのでこの struct も Arc 越しに自由に clone できる。
     pub meta: SharedMetaStore,
     pub engine: Arc<VersioningEngine>,
-    pub auth: Arc<dyn AuthService>,
+    /// ユーザー / グループ / JWT 認証は upstream user-permission に委譲。
+    pub auth_db: Arc<AuthDb>,
     pub authz: Arc<dyn Authorizer>,
-    /// ACL ルール CRUD 用の具象参照（同じインスタンスを `authz` と共有）。
     pub acl_admin: Arc<DbAuthorizer>,
-    /// 監査ログ（REST/SMB/WebUI 全経路から書き込まれる）。
     pub audit: SharedAuditLog,
-    /// 共有トークンの失効リスト管理用に保持する具象参照。
-    pub share_admin: Arc<yozist_auth::SqliteAuthService>,
+    /// 共有トークン (`share_tokens` テーブル) の操作。
+    pub share_admin: Arc<ShareTokenStore>,
 }
 
 /// ルーター生成。
@@ -158,25 +157,33 @@ where
             .or_else(|| raw.strip_prefix("bearer "))
             .ok_or(ApiError::Unauthorized)?;
 
-        let claims = api
-            .auth
+        let tm = api
+            .auth_db
+            .token_manager()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let claims = tm
             .verify_token(token)
-            .await
             .map_err(|_| ApiError::Unauthorized)?;
-        let user_id = uuid::Uuid::parse_str(&claims.sub)
-            .map(UserId::from_uuid)
-            .map_err(|_| ApiError::Unauthorized)?;
+        let sub = claims
+            .get("sub")
+            .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))
+            .ok_or(ApiError::Unauthorized)?;
         let user = api
-            .auth
-            .get_user(&user_id)
+            .auth_db
+            .users()
+            .get_by_id(sub, None)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .ok_or(ApiError::Unauthorized)?;
-        let groups = api
-            .auth
-            .groups_of(&user_id)
+        let groups: Vec<GroupId> = api
+            .auth_db
+            .groups()
+            .get_user_groups(user.id, None)
             .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
         Ok(AuthCtx(AuthContext::User { user, groups }))
     }
 }
@@ -1329,7 +1336,7 @@ async fn issue_file_share(
         _ => None,
     };
     let res = s
-        .auth
+        .share_admin
         .issue_share_token("file", &id, input.ttl_secs, issuer)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
@@ -1364,7 +1371,7 @@ async fn issue_query_share(
         _ => None,
     };
     let res = s
-        .auth
+        .share_admin
         .issue_share_token("query", &id, input.ttl_secs, issuer)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
@@ -1393,7 +1400,7 @@ async fn verify_share(
     expect_kind: &str,
 ) -> Result<String, ApiError> {
     let claims = s
-        .auth
+        .share_admin
         .verify_share_token(token)
         .await
         .map_err(|_| ApiError::Unauthorized)?;
@@ -1524,8 +1531,8 @@ async fn add_acl_rule(
     // System コンテキストか、現状 rule が 0 件なら作成可能。
     let (stype, sid) = split_colon(&input.subject)?;
     let subject = match stype {
-        "user" => Subject::User(parse_uuid_id(sid)?),
-        "group" => Subject::Group(parse_uuid_id(sid)?),
+        "user" => Subject::User(parse_i64_id(sid)?),
+        "group" => Subject::Group(parse_i64_id(sid)?),
         other => return Err(ApiError::BadRequest(format!("subject type: {other}"))),
     };
     let (ttype, tref) = split_colon(&input.target)?;
@@ -1588,13 +1595,11 @@ async fn register(
     Json(input): Json<AuthInput>,
 ) -> Result<(StatusCode, Json<yozist_auth::User>), ApiError> {
     let user = s
-        .auth
-        .create_user(&input.username, &input.password)
+        .auth_db
+        .users()
+        .create(&input.username, &input.password, &input.username, None)
         .await
-        .map_err(|e| match e {
-            yozist_auth::AuthError::UsernameTaken => ApiError::Conflict,
-            other => ApiError::Internal(other.to_string()),
-        })?;
+        .map_err(map_auth_error)?;
     Ok((StatusCode::CREATED, Json(user)))
 }
 
@@ -1602,15 +1607,18 @@ async fn login(
     State(s): State<ApiState>,
     Json(input): Json<AuthInput>,
 ) -> Result<Json<AuthResponse>, ApiError> {
-    match s
-        .auth
-        .authenticate(&input.username, &input.password)
+    let token = s
+        .auth_db
+        .users()
+        .authenticate(
+            &input.username,
+            &input.password,
+            std::time::Duration::from_secs(24 * 3600),
+        )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
-    {
-        Some(AuthToken(token)) => Ok(Json(AuthResponse { token })),
-        None => Err(ApiError::Unauthorized),
-    }
+        .ok_or(ApiError::Unauthorized)?;
+    Ok(Json(AuthResponse { token }))
 }
 
 #[derive(Serialize)]
@@ -1625,8 +1633,9 @@ async fn list_users(
 ) -> Result<Json<Vec<yozist_auth::User>>, ApiError> {
     require_authenticated(&ctx).await?;
     let users = s
-        .auth
-        .list_users()
+        .auth_db
+        .users()
+        .list_all(None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(users))
@@ -1644,8 +1653,9 @@ async fn list_groups(
 ) -> Result<Json<Vec<yozist_auth::Group>>, ApiError> {
     require_authenticated(&ctx).await?;
     let groups = s
-        .share_admin
-        .list_groups()
+        .auth_db
+        .groups()
+        .list_all(None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(groups))
@@ -1653,51 +1663,44 @@ async fn list_groups(
 
 #[derive(Deserialize)]
 struct AddGroupMemberInput {
-    user_id: String,
+    user_id: i64,
 }
 
 async fn list_group_members(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
-    Path(id): Path<String>,
+    Path(id): Path<i64>,
 ) -> Result<Json<Vec<UserId>>, ApiError> {
     require_authenticated(&ctx).await?;
-    let group_id = uuid::Uuid::parse_str(&id)
-        .map(yozist_core::GroupId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("group id: {e}")))?;
     let members = s
-        .share_admin
-        .group_members(&group_id)
+        .auth_db
+        .groups()
+        .get_members(id, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(Json(members))
+    Ok(Json(members.into_iter().map(|u| u.id).collect()))
 }
 
 async fn add_group_member(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
-    Path(id): Path<String>,
+    Path(id): Path<i64>,
     Json(input): Json<AddGroupMemberInput>,
 ) -> Result<StatusCode, ApiError> {
     require_authenticated(&ctx).await?;
-    let group_id = uuid::Uuid::parse_str(&id)
-        .map(yozist_core::GroupId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("group id: {e}")))?;
-    let user_id = uuid::Uuid::parse_str(&input.user_id)
-        .map(yozist_core::UserId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("user id: {e}")))?;
     let res = s
-        .auth
-        .add_user_to_group(user_id, group_id)
+        .auth_db
+        .groups()
+        .add_user(id, input.user_id, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
-    let meta = format!("{{\"user_id\":\"{}\"}}", input.user_id);
+    let meta = format!("{{\"user_id\":{}}}", input.user_id);
     audit_event(
         &s,
         &ctx,
         "add_group_member",
         Some("group"),
-        Some(&id),
+        Some(&id.to_string()),
         Some(&meta),
         &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
     )
@@ -1709,27 +1712,22 @@ async fn add_group_member(
 async fn remove_group_member(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
-    Path((id, user_id)): Path<(String, String)>,
+    Path((id, user_id)): Path<(i64, i64)>,
 ) -> Result<StatusCode, ApiError> {
     require_authenticated(&ctx).await?;
-    let group_id = uuid::Uuid::parse_str(&id)
-        .map(yozist_core::GroupId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("group id: {e}")))?;
-    let user_uuid = uuid::Uuid::parse_str(&user_id)
-        .map(yozist_core::UserId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("user id: {e}")))?;
     let res = s
-        .share_admin
-        .remove_user_from_group(&user_uuid, &group_id)
+        .auth_db
+        .groups()
+        .remove_user(id, user_id, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
-    let meta = format!("{{\"user_id\":\"{}\"}}", user_id);
+    let meta = format!("{{\"user_id\":{}}}", user_id);
     audit_event(
         &s,
         &ctx,
         "remove_group_member",
         Some("group"),
-        Some(&id),
+        Some(&id.to_string()),
         Some(&meta),
         &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
     )
@@ -1744,9 +1742,11 @@ async fn create_group(
     Json(input): Json<CreateGroupInput>,
 ) -> Result<(StatusCode, Json<yozist_auth::Group>), ApiError> {
     require_authenticated(&ctx).await?;
+    let desc = input.description.clone().unwrap_or_default();
     let res = s
-        .share_admin
-        .create_group(&input.name, input.description.as_deref())
+        .auth_db
+        .groups()
+        .create(&input.name, &desc, false, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
     let id_str = res.as_ref().ok().map(|g| g.id.to_string());
@@ -1763,6 +1763,16 @@ async fn create_group(
     .await;
     let group = res?;
     Ok((StatusCode::CREATED, Json(group)))
+}
+
+fn map_auth_error(e: user_permission_core::Error) -> ApiError {
+    // username 重複等は user_permission_core::Error::UsernameTaken にマップされる。
+    let msg = e.to_string();
+    if msg.to_lowercase().contains("already") || msg.to_lowercase().contains("taken") {
+        ApiError::Conflict
+    } else {
+        ApiError::Internal(msg)
+    }
 }
 
 async fn me(AuthCtx(ctx): AuthCtx) -> Json<MeResponse> {
@@ -1808,16 +1818,6 @@ mod yozist_idtype {
     pub trait FromUuid {
         fn from_uuid_(u: Uuid) -> Self;
     }
-    impl FromUuid for yozist_core::UserId {
-        fn from_uuid_(u: Uuid) -> Self {
-            Self::from_uuid(u)
-        }
-    }
-    impl FromUuid for yozist_core::GroupId {
-        fn from_uuid_(u: Uuid) -> Self {
-            Self::from_uuid(u)
-        }
-    }
     impl FromUuid for yozist_core::FileId {
         fn from_uuid_(u: Uuid) -> Self {
             Self::from_uuid(u)
@@ -1833,6 +1833,11 @@ mod yozist_idtype {
             Self::from_uuid(u)
         }
     }
+}
+
+fn parse_i64_id(s: &str) -> Result<i64, ApiError> {
+    s.parse::<i64>()
+        .map_err(|e| ApiError::BadRequest(format!("expected integer id, got '{s}': {e}")))
 }
 
 #[derive(Debug)]
@@ -1901,20 +1906,22 @@ mod tests {
         let db_authz = Arc::new(DbAuthorizer::new(pool.clone()));
         let authz: Arc<dyn Authorizer> = db_authz.clone();
         let audit = Arc::new(yozist_db::AuditLog::new(pool.clone()));
-        let sqlite_auth = Arc::new(yozist_auth::SqliteAuthService::new(
-            pool,
-            b"test".to_vec(),
-        ));
-        let auth: Arc<dyn AuthService> = sqlite_auth.clone();
+        let share_admin =
+            Arc::new(yozist_auth::ShareTokenStore::new(pool, b"test".to_vec()));
+        let auth_db = Arc::new(
+            AuthDb::open_local(dir.path().join("auth.db"), Some(dir.path().join("secret")))
+                .await
+                .unwrap(),
+        );
         (
             ApiState {
                 meta,
                 engine,
-                auth,
+                auth_db,
                 authz,
                 acl_admin: db_authz,
                 audit,
-                share_admin: sqlite_auth,
+                share_admin,
             },
             dir,
         )

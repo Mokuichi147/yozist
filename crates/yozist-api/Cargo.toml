@@ -13,6 +13,7 @@ yozist-versioning.workspace = true
 yozist-auth.workspace = true
 yozist-ai.workspace = true
 yozist-tagging.workspace = true
+user-permission-core.workspace = true
 uuid.workspace = true
 time.workspace = true
 async-trait.workspace = true

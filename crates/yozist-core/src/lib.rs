@@ -51,14 +51,15 @@ id_newtype!(/// タグ。
 TagId);
 id_newtype!(/// シリーズ。
 SeriesId);
-id_newtype!(/// ユーザー。
-UserId);
-id_newtype!(/// グループ。
-GroupId);
 id_newtype!(/// アクター（編集操作の主体）。CRDT の `actor_id` に対応。
 ActorId);
 id_newtype!(/// 保存クエリ（Shareable Path）。
 SavedQueryId);
+
+// ユーザー / グループの ID は upstream `user-permission` の `i64` を直接使う。
+// 型エイリアスで意図を表現するが、実体は `i64`。
+pub type UserId = i64;
+pub type GroupId = i64;
 
 /// Blob のコンテンツアドレス（SHA-256 を想定）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
