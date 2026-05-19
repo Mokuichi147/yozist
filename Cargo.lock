@@ -2973,9 +2973,9 @@ dependencies = [
 
 [[package]]
 name = "user-permission-core"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a39f073e7049b3c995304f40fffc56a43e4cc099e69bd50304ce224b68c43c6d"
+checksum = "c396bed52592e5a005a389a6837276c9fd8f24c0a8eafcda1d3bcc67a9ffc2ba"
 dependencies = [
  "argon2",
  "async-trait",

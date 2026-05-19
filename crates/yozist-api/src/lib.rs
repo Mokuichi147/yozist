@@ -34,7 +34,7 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, FileId, FileMeta, GroupId, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
+    ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -157,34 +157,12 @@ where
             .or_else(|| raw.strip_prefix("bearer "))
             .ok_or(ApiError::Unauthorized)?;
 
-        let tm = api
-            .auth_db
-            .token_manager()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let claims = tm
-            .verify_token(token)
+        // local / relay 共通: yozist_auth のヘルパに委譲する。
+        // backend の違い (ローカル署名検証 / 上流転送) は user-permission 内部で吸収される。
+        let ctx = yozist_auth::resolve_auth_context(&api.auth_db, token)
+            .await
             .map_err(|_| ApiError::Unauthorized)?;
-        let sub = claims
-            .get("sub")
-            .and_then(|v| v.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| v.as_i64()))
-            .ok_or(ApiError::Unauthorized)?;
-        let user = api
-            .auth_db
-            .users()
-            .get_by_id(sub, None)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .ok_or(ApiError::Unauthorized)?;
-        let groups: Vec<GroupId> = api
-            .auth_db
-            .groups()
-            .get_user_groups(user.id, None)
-            .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?
-            .into_iter()
-            .map(|g| g.id)
-            .collect();
-        Ok(AuthCtx(AuthContext::User { user, groups }))
+        Ok(AuthCtx(ctx))
     }
 }
 
