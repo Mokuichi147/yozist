@@ -175,12 +175,10 @@ async function loadGroups() {
   const el = $('group-list');
   try {
     const list = await json('/api/groups');
-    const byId = Object.fromEntries(list.map(g => [g.id, g]));
     if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">グループなし</div>'; return; }
     el.innerHTML = list.map(g => {
-      const parent = g.parent_id ? ` <span class="text-xs opacity-60">⊂ ${escapeHtml(byId[g.parent_id]?.name || '?')}</span>` : '';
       return `<div class="flex items-center justify-between row-compact">
-        <div><span class="font-semibold">${escapeHtml(g.name)}</span>${parent}</div>
+        <div><span class="font-semibold">${escapeHtml(g.name)}</span></div>
         <button class="btn btn-xs" onclick="manageGroupMembers('${g.id}','${escapeHtml(g.name)}')">メンバー</button>
       </div>`;
     }).join('');
