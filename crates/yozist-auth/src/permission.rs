@@ -1,24 +1,42 @@
 //! 権限モデル: Subject × Target × PermissionMask × allow/deny。
+//!
+//! `Target` は `(kind, ref_)` の opaque な組で表現する。
+//! kind/ref_ の解釈は呼び出し側（yozist-api 等）の責務。
 
 use serde::{Deserialize, Serialize};
-use yozist_core::{FileId, GroupId, SeriesId, TagId, UserId};
+use yozist_core::{GroupId, UserId};
 
-/// 権限の主体。
+/// 権限の主体。ID は user-permission の i64 を直接使う。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Subject {
     User(UserId),
     Group(GroupId),
 }
 
-/// 権限の対象。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Target {
-    Share(String),
-    Tag(TagId),
-    Series(SeriesId),
-    File(FileId),
-    /// 動的クエリ（saved path）。query は serde_json::Value 想定。
-    Query(serde_json::Value),
+/// 権限の対象。kind/ref_ は任意文字列。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Target {
+    pub kind: String,
+    pub ref_: String,
+}
+
+impl Target {
+    pub fn new(kind: impl Into<String>, ref_: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            ref_: ref_.into(),
+        }
+    }
+
+    /// ファイル単位の Target を組み立てるヘルパー。
+    pub fn file(id: impl ToString) -> Self {
+        Self::new("file", id.to_string())
+    }
+
+    /// 名前付き共有の Target を組み立てるヘルパー。
+    pub fn share(name: impl Into<String>) -> Self {
+        Self::new("share", name)
+    }
 }
 
 bitflags::bitflags! {
@@ -39,5 +57,4 @@ pub struct Permission {
     pub mask: PermissionMask,
     pub allow: bool,
     pub priority: i32,
-    pub expires_at: Option<time::OffsetDateTime>,
 }

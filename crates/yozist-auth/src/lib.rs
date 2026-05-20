@@ -1,28 +1,16 @@
-//! yozist-auth — 認証 + 認可（ACL）。
+//! yozist-auth — 認可 (ACL) + 共有トークン。
 //!
-//! ユーザー自作の Python 製 [`UserPermission`](https://github.com/Mokuichi147/UserPermission)
-//! を Rust に移植する形で実装する。
+//! ユーザー/グループ/JWT 認証は upstream `user-permission` クレートに委譲した。
+//! 本クレートは yozist 固有の以下の責務のみを担う:
 //!
-//! # マッピング
-//! - aiosqlite → sqlx (yozist-db 共有 DB)
-//! - pwdlib (Argon2) → argon2 クレート
-//! - PyJWT → jsonwebtoken クレート
+//! - **ACL ルール** (`acl_rules` テーブル): user/group × target × bitmask × allow/deny
+//! - **期限付き共有トークン** (`share_tokens` テーブル): jti 単位の revocation
 //!
-//! # 設計原則
-//! - **共有 DB**: ユーザー／グループ／ACL は `yozist-db` の同一 DB に格納する
-//!   （ファイル管理と統合）
-//! - **細粒度 ACL**: share / tag / series / file / query 各レベルで設定可能
-//! - **動的パス発行**: REST から saved-query share を作成、期限付き発行に対応
-//!
-//! # TODO
-//! - [ ] 元 `UserPermission` の API カバレッジ 100%（更新・削除・グループ一覧 等）
-//! - [ ] `smb-server::ConfigHandle` 連携で SMB ユーザーを動的同期
-//! - [ ] グループ階層（ネスト）対応
-//! - [ ] Authorizer の本実装（ACL ルール評価エンジン）
-//! - [ ] 監査ログ（誰がいつ何にアクセス）
+//! `User` / `Group` 型は `user_permission_core` のものをそのまま再エクスポートする。
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use user_permission_core::Database as AuthDb;
 use yozist_core::{GroupId, UserId};
 
 pub mod authorizer;
@@ -30,46 +18,75 @@ pub mod permission;
 pub mod sqlite;
 pub use authorizer::DbAuthorizer;
 pub use permission::{Permission, PermissionMask, Subject, Target};
-pub use sqlite::SqliteAuthService;
+pub use sqlite::ShareTokenStore;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct User {
-    pub id: UserId,
-    pub username: String,
-    pub display_name: Option<String>,
-    pub is_active: bool,
-    pub created_at: time::OffsetDateTime,
+// upstream の型を再エクスポート（呼び出し側は `yozist_auth::User` で参照可能）。
+pub use user_permission_core::{Group, User};
+
+/// Bearer JWT から `AuthContext` を解決する。
+///
+/// local / relay のどちらの backend でも同じコードパスで動く:
+/// 1. JWT のペイロードから `sub` (user id) を **未検証で** 取り出す
+/// 2. `users().get_by_id(sub, Some(token))` を呼ぶ。
+///    - local backend (user-permission >= 0.2.2) は per-call token を検証する
+///    - relay backend は token を上流へ転送し、上流が検証する
+/// 3. 署名が無効なら get_by_id がエラーになり、ここで `InvalidToken` を返す
+///
+/// `sub` を JWT 自身のペイロードから取る点が重要: リクエスト引数ではなく
+/// トークンの所有者 ID を使うため、有効な署名がある限りなりすましは起きない。
+pub async fn resolve_auth_context(
+    db: &AuthDb,
+    token: &str,
+) -> Result<AuthContext, AuthError> {
+    let sub = decode_jwt_sub(token).ok_or(AuthError::InvalidToken)?;
+    let user = db
+        .users()
+        .get_by_id(sub, Some(token))
+        .await
+        .map_err(|_| AuthError::InvalidToken)?
+        .ok_or(AuthError::InvalidToken)?;
+    let groups = db
+        .groups()
+        .get_user_groups(sub, Some(token))
+        .await
+        .map_err(|e| AuthError::Other(e.to_string()))?
+        .into_iter()
+        .map(|g| g.id)
+        .collect();
+    Ok(AuthContext::User { user, groups })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Group {
-    pub id: GroupId,
-    pub name: String,
-    pub description: Option<String>,
-    /// 親グループ。階層的所属の表現に使う。
-    pub parent_id: Option<GroupId>,
+/// JWT のペイロードから `sub` を **署名検証せずに** 取り出す。
+///
+/// どの user id のレコードを引くかを決めるためだけに使う。署名の検証は
+/// 後続の `get_by_id(sub, Some(token))` が backend 越しに行う。
+fn decode_jwt_sub(token: &str) -> Option<UserId> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+
+    #[derive(Deserialize)]
+    struct SubClaim {
+        sub: String,
+    }
+
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.insecure_disable_signature_validation();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+
+    let data = decode::<SubClaim>(token, &DecodingKey::from_secret(b""), &validation).ok()?;
+    data.claims.sub.parse::<UserId>().ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthToken(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenClaims {
-    pub sub: String, // user id
-    pub username: String,
-    pub exp: i64,
-    pub iat: i64,
-}
-
 /// 期限付き共有 URL のトークンに含めるクレーム。
-///
-/// `kind` でファイル単体共有か保存クエリ共有かを区別する。
-/// `target_id` はそれぞれ対応する UUID 文字列。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareClaims {
-    /// "file" | "query"
+    /// "file" | "query" など、任意の文字列。
     pub kind: String,
-    /// 対象 ID（FileId / SavedQueryId）
+    /// 対象 ID（FileId / SavedQueryId 等を文字列化したもの）。
     pub target_id: String,
     pub exp: i64,
     pub iat: i64,
@@ -98,39 +115,13 @@ pub enum AuthContext {
     System,
 }
 
-#[async_trait]
-pub trait AuthService: Send + Sync {
-    async fn create_user(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<User, AuthError>;
-    async fn authenticate(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<Option<AuthToken>, AuthError>;
-    async fn verify_token(&self, token: &str) -> Result<TokenClaims, AuthError>;
-    async fn list_users(&self) -> Result<Vec<User>, AuthError>;
-    async fn get_user(&self, id: &UserId) -> Result<Option<User>, AuthError>;
-    async fn groups_of(&self, user: &UserId) -> Result<Vec<GroupId>, AuthError>;
-    async fn add_user_to_group(
-        &self,
-        user: UserId,
-        group: GroupId,
-    ) -> Result<(), AuthError>;
-
-    /// 期限付き共有トークンを発行する。
-    async fn issue_share_token(
-        &self,
-        kind: &str,
-        target_id: &str,
-        ttl_secs: i64,
-        issuer: Option<&str>,
-    ) -> Result<AuthToken, AuthError>;
-
-    /// 期限付き共有トークンを検証する。
-    async fn verify_share_token(&self, token: &str) -> Result<ShareClaims, AuthError>;
+impl AuthContext {
+    pub fn user_id(&self) -> Option<UserId> {
+        match self {
+            AuthContext::User { user, .. } => Some(user.id),
+            _ => None,
+        }
+    }
 }
 
 /// 認可（ACL）評価器。
@@ -147,20 +138,12 @@ pub trait Authorizer: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    #[error("invalid credentials")]
-    InvalidCredentials,
-    #[error("token expired or invalid")]
+    #[error("invalid token")]
     InvalidToken,
-    #[error("user not found")]
-    UserNotFound,
-    #[error("username already exists")]
-    UsernameTaken,
     #[error("db error: {0}")]
     Db(#[from] yozist_db::DbError),
     #[error("sqlx error: {0}")]
     Sqlx(#[from] sqlx::Error),
-    #[error("hash error: {0}")]
-    Hash(String),
     #[error("jwt error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("other: {0}")]
@@ -170,10 +153,7 @@ pub enum AuthError {
 impl From<AuthError> for yozist_core::Error {
     fn from(e: AuthError) -> Self {
         match e {
-            AuthError::InvalidCredentials | AuthError::InvalidToken => {
-                yozist_core::Error::PermissionDenied(e.to_string())
-            }
-            AuthError::UserNotFound => yozist_core::Error::NotFound("user".into()),
+            AuthError::InvalidToken => yozist_core::Error::PermissionDenied(e.to_string()),
             _ => yozist_core::Error::Other(yozist_core::anyhow_compat::AnyError::new(
                 e.to_string(),
             )),

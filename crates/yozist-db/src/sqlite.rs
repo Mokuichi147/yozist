@@ -17,7 +17,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 use yozist_core::{
     ActorId, BlobId, Commit, CommitId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId,
-    Series, SeriesId, SeriesMember, Tag, TagId, TagKind, UserId,
+    Series, SeriesId, SeriesMember, Tag, TagId, TagKind,
 };
 
 use crate::{DbError, MetaStore};
@@ -150,7 +150,7 @@ fn row_to_saved_query(row: SqliteRow) -> Result<SavedQuery, DbError> {
     let name: String = row.try_get("name")?;
     let query_json: String = row.try_get("query_json")?;
     let description: Option<String> = row.try_get("description")?;
-    let created_by: Option<String> = row.try_get("created_by")?;
+    let created_by: Option<i64> = row.try_get("created_by")?;
     let created_at: String = row.try_get("created_at")?;
     let expires_at: Option<String> = row.try_get("expires_at")?;
 
@@ -161,9 +161,7 @@ fn row_to_saved_query(row: SqliteRow) -> Result<SavedQuery, DbError> {
         name,
         query,
         description,
-        created_by: created_by
-            .map(|s| parse_uuid(&s).map(UserId::from_uuid))
-            .transpose()?,
+        created_by,
         created_at: parse_dt(&created_at)?,
         expires_at: expires_at.map(|s| parse_dt(&s)).transpose()?,
     })
@@ -563,7 +561,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(&q.name)
         .bind(body)
         .bind(&q.description)
-        .bind(q.created_by.map(|u| u.to_string()))
+        .bind(q.created_by)
         .bind(fmt_dt(q.created_at))
         .bind(q.expires_at.map(fmt_dt))
         .execute(&self.pool)

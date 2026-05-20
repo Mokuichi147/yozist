@@ -1,309 +1,32 @@
-//! SQLite 製 `AuthService` 実装。
+//! SQLite 製の共有トークンストア。
 //!
-//! - パスワードハッシュ: Argon2id（`argon2` クレート）
-//! - トークン: HS256 JWT（`jsonwebtoken` クレート）
-//! - DB は `yozist-db` と共有（`SqlitePool` を受け取る）
-//!
-//! # シークレットキー
-//! HMAC 鍵は呼び出し側から `Vec<u8>` で渡す。バイナリ側で初回起動時に
-//! 生成・ファイル保存する想定。
+//! ユーザー/グループ/JWT は upstream `user-permission` に移管したため、
+//! 本モジュールは `share_tokens` テーブルの操作のみを担当する。
+//! 共有トークン自体は HS256 JWT で、jti を `share_tokens` テーブルに記録して
+//! 失効を判定する。
 
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
-use argon2::Argon2;
-use async_trait::async_trait;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use sqlx::{Row, SqlitePool};
-use std::str::FromStr;
 use time::OffsetDateTime;
-use uuid::Uuid;
-use yozist_core::{GroupId, UserId};
 
-use crate::{
-    AuthError, AuthService, AuthToken, Group, ShareClaims, ShareTokenRecord, TokenClaims, User,
-};
+use crate::{AuthError, AuthToken, ShareClaims, ShareTokenRecord};
 
-pub struct SqliteAuthService {
+pub struct ShareTokenStore {
     pool: SqlitePool,
     secret: Vec<u8>,
-    /// JWT 有効期限（秒）。デフォルト 24h。
-    pub token_ttl_secs: i64,
 }
 
-impl SqliteAuthService {
+impl ShareTokenStore {
     pub fn new(pool: SqlitePool, secret: Vec<u8>) -> Self {
-        Self {
-            pool,
-            secret,
-            token_ttl_secs: 24 * 3600,
-        }
+        Self { pool, secret }
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    /// グループを作成。
-    pub async fn create_group(
-        &self,
-        name: &str,
-        description: Option<&str>,
-    ) -> Result<Group, AuthError> {
-        self.create_group_with_parent(name, description, None).await
-    }
-
-    /// 親グループを指定してグループを作成。
-    pub async fn create_group_with_parent(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        parent: Option<GroupId>,
-    ) -> Result<Group, AuthError> {
-        let id = GroupId::new();
-        sqlx::query(
-            "INSERT INTO groups (id, name, description, parent_group_id) VALUES (?, ?, ?, ?)",
-        )
-        .bind(id.to_string())
-        .bind(name)
-        .bind(description)
-        .bind(parent.map(|g| g.to_string()))
-        .execute(&self.pool)
-        .await?;
-        Ok(Group {
-            id,
-            name: name.into(),
-            description: description.map(str::to_string),
-            parent_id: parent,
-        })
-    }
-
-    /// 全グループ一覧（親子関係を含む）。
-    pub async fn list_groups(&self) -> Result<Vec<Group>, AuthError> {
-        let rows = sqlx::query(
-            "SELECT id, name, description, parent_group_id FROM groups ORDER BY name ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| {
-                let id: String = r.try_get("id")?;
-                let parent: Option<String> = r.try_get("parent_group_id")?;
-                Ok(Group {
-                    id: GroupId::from_uuid(
-                        Uuid::parse_str(&id)
-                            .map_err(|e| AuthError::Other(format!("uuid: {e}")))?,
-                    ),
-                    name: r.try_get("name")?,
-                    description: r.try_get("description")?,
-                    parent_id: parent
-                        .map(|s| {
-                            Uuid::parse_str(&s)
-                                .map(GroupId::from_uuid)
-                                .map_err(|e| AuthError::Other(format!("uuid: {e}")))
-                        })
-                        .transpose()?,
-                })
-            })
-            .collect()
-    }
-
-    /// ユーザー名で取得。
-    pub async fn get_user_by_username(
-        &self,
-        username: &str,
-    ) -> Result<Option<User>, AuthError> {
-        let row = sqlx::query(
-            "SELECT id, username, display_name, is_active, created_at FROM users WHERE username = ?",
-        )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(row_to_user).transpose()
-    }
-
-    /// グループ ID 一覧（ユーザーが所属する + 親グループへの推移閉包）。
-    pub async fn user_groups(&self, user: &UserId) -> Result<Vec<GroupId>, AuthError> {
-        // SQLite の再帰 CTE で親グループを辿る
-        let rows = sqlx::query(
-            "WITH RECURSIVE ancestor(id) AS (
-                SELECT group_id FROM user_groups WHERE user_id = ?
-                UNION
-                SELECT g.parent_group_id FROM groups g
-                JOIN ancestor a ON g.id = a.id
-                WHERE g.parent_group_id IS NOT NULL
-             )
-             SELECT id FROM ancestor",
-        )
-        .bind(user.to_string())
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| {
-                let s: String = r.try_get("id")?;
-                Uuid::parse_str(&s)
-                    .map(GroupId::from_uuid)
-                    .map_err(|e| AuthError::Other(format!("uuid: {e}")))
-            })
-            .collect()
-    }
-}
-
-fn row_to_user(row: sqlx::sqlite::SqliteRow) -> Result<User, AuthError> {
-    let id: String = row.try_get("id")?;
-    let username: String = row.try_get("username")?;
-    let display_name: Option<String> = row.try_get("display_name")?;
-    let is_active: i64 = row.try_get("is_active")?;
-    let created_at: String = row.try_get("created_at")?;
-    let dt = OffsetDateTime::parse(&created_at, &time::format_description::well_known::Rfc3339)
-        .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
-    Ok(User {
-        id: UserId::from_uuid(
-            Uuid::from_str(&id).map_err(|e| AuthError::Other(format!("uuid: {e}")))?,
-        ),
-        username,
-        display_name,
-        is_active: is_active != 0,
-        created_at: dt,
-    })
-}
-
-fn hash_password(pw: &str) -> Result<String, AuthError> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(pw.as_bytes(), &salt)
-        .map(|h| h.to_string())
-        .map_err(|e| AuthError::Hash(e.to_string()))
-}
-
-fn verify_password(pw: &str, hash: &str) -> Result<bool, AuthError> {
-    let parsed = PasswordHash::new(hash).map_err(|e| AuthError::Hash(e.to_string()))?;
-    Ok(Argon2::default()
-        .verify_password(pw.as_bytes(), &parsed)
-        .is_ok())
-}
-
-#[async_trait]
-impl AuthService for SqliteAuthService {
-    async fn create_user(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<User, AuthError> {
-        // 同名チェック
-        if self.get_user_by_username(username).await?.is_some() {
-            return Err(AuthError::UsernameTaken);
-        }
-        let id = UserId::new();
-        let now = OffsetDateTime::now_utc();
-        let now_str = now
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
-        let hash = hash_password(password)?;
-        sqlx::query(
-            "INSERT INTO users (id, username, display_name, password_hash, is_active, created_at)
-             VALUES (?, ?, NULL, ?, 1, ?)",
-        )
-        .bind(id.to_string())
-        .bind(username)
-        .bind(&hash)
-        .bind(&now_str)
-        .execute(&self.pool)
-        .await?;
-        Ok(User {
-            id,
-            username: username.into(),
-            display_name: None,
-            is_active: true,
-            created_at: now,
-        })
-    }
-
-    async fn authenticate(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<Option<AuthToken>, AuthError> {
-        let row = sqlx::query("SELECT id, password_hash, is_active FROM users WHERE username = ?")
-            .bind(username)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(row) = row else { return Ok(None) };
-        let id: String = row.try_get("id")?;
-        let stored: String = row.try_get("password_hash")?;
-        let is_active: i64 = row.try_get("is_active")?;
-        if is_active == 0 {
-            return Ok(None);
-        }
-        if !verify_password(password, &stored)? {
-            return Ok(None);
-        }
-
-        let iat = OffsetDateTime::now_utc().unix_timestamp();
-        let claims = TokenClaims {
-            sub: id,
-            username: username.to_string(),
-            exp: iat + self.token_ttl_secs,
-            iat,
-        };
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(&self.secret),
-        )?;
-        Ok(Some(AuthToken(token)))
-    }
-
-    async fn verify_token(&self, token: &str) -> Result<TokenClaims, AuthError> {
-        let data = decode::<TokenClaims>(
-            token,
-            &DecodingKey::from_secret(&self.secret),
-            &Validation::default(),
-        )?;
-        Ok(data.claims)
-    }
-
-    async fn get_user(&self, id: &UserId) -> Result<Option<User>, AuthError> {
-        let row = sqlx::query(
-            "SELECT id, username, display_name, is_active, created_at FROM users WHERE id = ?",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(row_to_user).transpose()
-    }
-
-    async fn groups_of(&self, user: &UserId) -> Result<Vec<GroupId>, AuthError> {
-        self.user_groups(user).await
-    }
-
-    async fn list_users(&self) -> Result<Vec<User>, AuthError> {
-        let rows = sqlx::query(
-            "SELECT id, username, display_name, is_active, created_at
-             FROM users ORDER BY created_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(row_to_user).collect()
-    }
-
-    async fn add_user_to_group(
-        &self,
-        user: UserId,
-        group: GroupId,
-    ) -> Result<(), AuthError> {
-        sqlx::query(
-            "INSERT INTO user_groups (user_id, group_id) VALUES (?, ?)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(user.to_string())
-        .bind(group.to_string())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn issue_share_token(
+    /// 期限付き共有トークンを発行する。
+    pub async fn issue_share_token(
         &self,
         kind: &str,
         target_id: &str,
@@ -315,7 +38,6 @@ impl AuthService for SqliteAuthService {
         let exp = iat + ttl_secs;
         let jti = uuid::Uuid::now_v7().to_string();
 
-        // share_tokens テーブルに記録
         let iat_str = iat_dt
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| AuthError::Other(format!("dt: {e}")))?;
@@ -354,8 +76,9 @@ impl AuthService for SqliteAuthService {
         Ok(AuthToken(token))
     }
 
-    async fn verify_share_token(&self, token: &str) -> Result<ShareClaims, AuthError> {
-        // 共有URLは期限を厳密に評価（デフォルトのleeway 60秒は使わない）
+    /// 期限付き共有トークンを検証する。
+    pub async fn verify_share_token(&self, token: &str) -> Result<ShareClaims, AuthError> {
+        // 共有URLは期限を厳密に評価（デフォルトの leeway 60 秒は使わない）。
         let mut validation = Validation::default();
         validation.leeway = 0;
         let data = decode::<ShareClaims>(
@@ -365,7 +88,6 @@ impl AuthService for SqliteAuthService {
         )?;
         let claims = data.claims;
 
-        // 失効リストを確認
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT revoked_at FROM share_tokens WHERE jti = ?")
                 .bind(&claims.jti)
@@ -374,15 +96,10 @@ impl AuthService for SqliteAuthService {
         match row {
             Some((Some(_),)) => Err(AuthError::InvalidToken),
             Some((None,)) => Ok(claims),
-            None => {
-                // DB に記録の無いトークン（古い形式等）は無効扱い
-                Err(AuthError::InvalidToken)
-            }
+            None => Err(AuthError::InvalidToken),
         }
     }
-}
 
-impl SqliteAuthService {
     /// 発行済み共有トークン一覧（issuer が指定されればそのユーザー分のみ）。
     pub async fn list_share_tokens(
         &self,
@@ -434,7 +151,7 @@ impl SqliteAuthService {
             .collect()
     }
 
-    /// jti を指定して失効させる。既に失効済みなら no-op。
+    /// jti を指定して失効させる。既に失効済みなら not-found 相当のエラー。
     pub async fn revoke_share_token(&self, jti: &str) -> Result<(), AuthError> {
         let now_str = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -448,39 +165,9 @@ impl SqliteAuthService {
         .execute(&self.pool)
         .await?;
         if res.rows_affected() == 0 {
-            return Err(AuthError::UserNotFound); // 流用: not found 系
+            return Err(AuthError::Other("share token not found or already revoked".into()));
         }
         Ok(())
-    }
-
-    /// グループからユーザーを除外する。
-    pub async fn remove_user_from_group(
-        &self,
-        user: &UserId,
-        group: &GroupId,
-    ) -> Result<(), AuthError> {
-        sqlx::query("DELETE FROM user_groups WHERE user_id = ? AND group_id = ?")
-            .bind(user.to_string())
-            .bind(group.to_string())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// グループの直接メンバー（親グループ経由は含まない）。
-    pub async fn group_members(&self, group: &GroupId) -> Result<Vec<UserId>, AuthError> {
-        let rows = sqlx::query("SELECT user_id FROM user_groups WHERE group_id = ?")
-            .bind(group.to_string())
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .map(|r| {
-                let s: String = r.try_get("user_id")?;
-                Uuid::parse_str(&s)
-                    .map(UserId::from_uuid)
-                    .map_err(|e| AuthError::Other(format!("uuid: {e}")))
-            })
-            .collect()
     }
 }
 
@@ -489,61 +176,33 @@ mod tests {
     use super::*;
     use yozist_db::SqliteMetaStore;
 
-    async fn service() -> SqliteAuthService {
-        let store = SqliteMetaStore::open_in_memory().await.unwrap();
-        SqliteAuthService::new(store.pool().clone(), b"test-secret".to_vec())
+    async fn store() -> ShareTokenStore {
+        let s = SqliteMetaStore::open_in_memory().await.unwrap();
+        ShareTokenStore::new(s.pool().clone(), b"test-secret".to_vec())
     }
 
     #[tokio::test]
-    async fn create_and_authenticate() {
-        let s = service().await;
-        let user = s.create_user("alice", "password123").await.unwrap();
-        assert_eq!(user.username, "alice");
-
-        let token = s
-            .authenticate("alice", "password123")
+    async fn issue_and_verify() {
+        let s = store().await;
+        let tok = s
+            .issue_share_token("file", "abc", 60, Some("alice"))
             .await
-            .unwrap()
-            .expect("authenticated");
-        let claims = s.verify_token(&token.0).await.unwrap();
-        assert_eq!(claims.username, "alice");
-        assert_eq!(claims.sub, user.id.to_string());
+            .unwrap();
+        let claims = s.verify_share_token(&tok.0).await.unwrap();
+        assert_eq!(claims.kind, "file");
+        assert_eq!(claims.target_id, "abc");
+        assert_eq!(claims.iss.as_deref(), Some("alice"));
     }
 
     #[tokio::test]
-    async fn wrong_password_returns_none() {
-        let s = service().await;
-        s.create_user("alice", "right").await.unwrap();
-        let t = s.authenticate("alice", "wrong").await.unwrap();
-        assert!(t.is_none());
-    }
-
-    #[tokio::test]
-    async fn duplicate_username_rejected() {
-        let s = service().await;
-        s.create_user("alice", "pw").await.unwrap();
-        match s.create_user("alice", "pw2").await {
-            Err(AuthError::UsernameTaken) => {}
-            other => panic!("expected UsernameTaken, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn group_membership() {
-        let s = service().await;
-        let user = s.create_user("bob", "pw").await.unwrap();
-        let group = s.create_group("admins", None).await.unwrap();
-        s.add_user_to_group(user.id, group.id).await.unwrap();
-        let groups = s.user_groups(&user.id).await.unwrap();
-        assert_eq!(groups, vec![group.id]);
-    }
-
-    #[tokio::test]
-    async fn list_users_returns_all() {
-        let s = service().await;
-        s.create_user("a", "pw").await.unwrap();
-        s.create_user("b", "pw").await.unwrap();
-        let users = s.list_users().await.unwrap();
-        assert_eq!(users.len(), 2);
+    async fn revoke_invalidates() {
+        let s = store().await;
+        let tok = s
+            .issue_share_token("file", "abc", 60, None)
+            .await
+            .unwrap();
+        let claims = s.verify_share_token(&tok.0).await.unwrap();
+        s.revoke_share_token(&claims.jti).await.unwrap();
+        assert!(s.verify_share_token(&tok.0).await.is_err());
     }
 }

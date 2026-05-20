@@ -11,6 +11,7 @@ yozist-db.workspace = true
 yozist-storage.workspace = true
 yozist-versioning.workspace = true
 yozist-auth.workspace = true
+user-permission-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 bytes.workspace = true

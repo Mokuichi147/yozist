@@ -21,7 +21,8 @@
 
 use smb_server::{Access, Share, SmbServer};
 use std::sync::Arc;
-use yozist_auth::{AuthContext, AuthService, Authorizer, DbAuthorizer};
+use user_permission_core::Database as AuthDb;
+use yozist_auth::{AuthContext, Authorizer, DbAuthorizer};
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
 use yozist_storage::SharedBlobStore;
 use yozist_versioning::VersioningEngine;
@@ -37,7 +38,7 @@ pub struct ShareDeps {
     pub blob: SharedBlobStore,
     pub engine: Arc<VersioningEngine>,
     pub authz: Arc<dyn Authorizer>,
-    pub auth: Arc<dyn AuthService>,
+    pub auth_db: Arc<AuthDb>,
     /// ACL ルール CRUD 用の具象参照（新規ファイル作成時のオーナー ACL 発行に使用）。
     pub acl_admin: Arc<DbAuthorizer>,
     /// 監査ログ（REST/SMB 共通）。SMB 経路は actor_label を `smb:<user>` で記録。
@@ -46,11 +47,6 @@ pub struct ShareDeps {
 
 impl ShareDeps {
     /// SMB の `Identity` を yozist の `AuthContext` に解決する。
-    ///
-    /// - `Anonymous` → `AuthContext::Anonymous`
-    /// - `User { user, .. }` で username が DB に存在 → `AuthContext::User`
-    /// - 存在しない場合は `Anonymous` 扱い（SMB 側で認証は通っているが yozist 側に
-    ///   ユーザー登録が無いケース。書き込みは Authorizer 経由で拒否される。）
     pub async fn identity_to_context(
         &self,
         identity: &smb_server::Identity,
@@ -58,28 +54,22 @@ impl ShareDeps {
         match identity {
             smb_server::Identity::Anonymous => AuthContext::Anonymous,
             smb_server::Identity::User { user, .. } => {
-                if let Ok(Some(u)) = self.lookup_smb_user(user).await {
+                if let Ok(Some(u)) = self.auth_db.users().get_by_username(user, None).await {
                     let groups = self
-                        .auth
-                        .groups_of(&u.id)
+                        .auth_db
+                        .groups()
+                        .get_user_groups(u.id, None)
                         .await
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| g.id)
+                        .collect();
                     AuthContext::User { user: u, groups }
                 } else {
                     AuthContext::Anonymous
                 }
             }
         }
-    }
-
-    async fn lookup_smb_user(
-        &self,
-        username: &str,
-    ) -> Result<Option<yozist_auth::User>, yozist_auth::AuthError> {
-        // AuthService trait に `get_user_by_username` を生やす方が綺麗だが、
-        // 当面は list_users から線形検索で実装（SMB 接続は頻度が低いため許容）。
-        let users = self.auth.list_users().await?;
-        Ok(users.into_iter().find(|u| u.username == username))
     }
 
     /// SMB 操作を audit に記録する。`actor_label` は `smb:<user>` 形式。

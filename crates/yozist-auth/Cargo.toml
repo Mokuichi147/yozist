@@ -3,21 +3,23 @@ name = "yozist-auth"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-description = "yozist: authentication + ACL (port of Mokuichi147/UserPermission to Rust)."
+description = "yozist: ACL + share tokens. Auth/users/groups は upstream user-permission に委譲。"
 
 [dependencies]
 yozist-core.workspace = true
 yozist-db.workspace = true
+user-permission-core.workspace = true
 sqlx.workspace = true
 uuid.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
-argon2.workspace = true
 jsonwebtoken.workspace = true
-rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bitflags = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

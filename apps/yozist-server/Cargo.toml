@@ -15,6 +15,7 @@ yozist-auth.workspace = true
 yozist-ai.workspace = true
 yozist-smb.workspace = true
 yozist-api.workspace = true
+user-permission-core.workspace = true
 
 tokio.workspace = true
 clap.workspace = true

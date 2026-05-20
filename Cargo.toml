@@ -73,7 +73,9 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 
 # Auth
-argon2 = "0.5"
+# 認証・ユーザー/グループ管理は upstream user-permission (crates.io) に委譲する。
+user-permission-core = "0.2"
+user-permission = "0.2"
 jsonwebtoken = "9"
 rand = "0.8"
 

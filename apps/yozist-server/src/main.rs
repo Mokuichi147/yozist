@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+use user_permission_core::Database as AuthDb;
 use yozist_api::ApiState;
-use yozist_auth::{AuthService, Authorizer, DbAuthorizer, SqliteAuthService};
+use yozist_auth::{Authorizer, DbAuthorizer, ShareTokenStore};
 use yozist_db::{AuditLog, SharedMetaStore, SqliteMetaStore};
 use yozist_smb::{ShareDeps, SmbConfig};
 use yozist_storage::{FsBlobStore, SharedBlobStore};
@@ -45,6 +46,12 @@ struct Cli {
     /// 初期 SMB ユーザー (`user:password`)。複数指定可。
     #[arg(long, env = "YOZIST_SMB_USER")]
     smb_user: Vec<String>,
+
+    /// 認証 (ユーザー/グループ/JWT) を中央の user-permission サーバへ中継する
+    /// 場合の URL（例: `http://localhost:8001`）。未指定ならローカル SQLite
+    /// (`<data>/auth.db`) を使う。
+    #[arg(long, env = "YOZIST_AUTH_RELAY")]
+    auth_relay: Option<String>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -98,10 +105,22 @@ async fn main() -> anyhow::Result<()> {
                 meta.clone(),
             ));
 
+            // 共有トークン用の HMAC シークレット (yozist-auth)。
             let secret_path = cli.data.join("jwt-secret.bin");
             let secret = load_or_create_secret(&secret_path).await?;
-            let sqlite_auth = Arc::new(SqliteAuthService::new(pool.clone(), secret));
-            let auth: Arc<dyn AuthService> = sqlite_auth.clone();
+            let share_admin = Arc::new(ShareTokenStore::new(pool.clone(), secret));
+
+            // ユーザー / グループ / JWT 認証は upstream user-permission に委譲。
+            // --auth-relay が指定されていれば中央サーバへ中継、無ければローカル SQLite。
+            let auth_db = if let Some(url) = &cli.auth_relay {
+                tracing::info!("auth relay: {url}");
+                Arc::new(AuthDb::open_relay(url)?)
+            } else {
+                let auth_db_path = cli.data.join("auth.db");
+                let auth_secret_path = cli.data.join("auth-secret.key");
+                tracing::info!("opening auth db: {}", auth_db_path.display());
+                Arc::new(AuthDb::open_local(&auth_db_path, Some(&auth_secret_path)).await?)
+            };
 
             let db_authz = Arc::new(DbAuthorizer::new(pool.clone()));
             let authz: Arc<dyn Authorizer> = db_authz.clone();
@@ -110,11 +129,11 @@ async fn main() -> anyhow::Result<()> {
             let state = ApiState {
                 meta: meta.clone(),
                 engine: engine.clone(),
-                auth: auth.clone(),
+                auth_db: auth_db.clone(),
                 authz: authz.clone(),
                 acl_admin: db_authz.clone(),
                 audit: audit.clone(),
-                share_admin: sqlite_auth,
+                share_admin,
             };
             let app = yozist_api::router(state);
 
@@ -147,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                     blob,
                     engine,
                     authz,
-                    auth,
+                    auth_db,
                     acl_admin: db_authz,
                     audit: audit.clone(),
                 };
