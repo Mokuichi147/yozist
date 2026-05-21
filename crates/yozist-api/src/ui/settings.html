@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yozist - ユーザー設定</title>
+<script>
+  document.documentElement.setAttribute(
+    'data-theme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  );
+</script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  .hidden { display: none !important; }
+</style>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
+  <div class="flex-1 px-2 flex items-center gap-3">
+    <a href="/ui" class="text-xl font-bold">yozist</a>
+    <div class="tabs tabs-boxed tabs-sm">
+      <a href="/ui/files" class="tab">files</a>
+    </div>
+  </div>
+  <div class="flex-none flex items-center gap-3 px-2">
+    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case">…</a>
+    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  </div>
+</div>
+
+<div id="main" class="hidden max-w-2xl mx-auto p-4 space-y-6">
+  <h1 class="text-2xl font-bold">ユーザー設定</h1>
+
+  <!-- アカウント情報 -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-6">
+      <div class="grid grid-cols-[5rem_1fr] gap-y-3 items-center text-sm">
+        <span class="opacity-70">ユーザーID</span>
+        <span id="acc-username" class="font-medium"></span>
+        <span class="opacity-70">グループ</span>
+        <span id="acc-groups" class="flex flex-wrap gap-1"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 表示名の変更 -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-6">
+      <h2 class="text-lg font-semibold mb-4">ユーザー名の変更</h2>
+      <label for="dn-input" class="block text-sm mb-1">ユーザー名</label>
+      <input id="dn-input" class="input input-bordered w-full" autocomplete="off">
+      <p class="text-xs opacity-60 mt-1">画面に表示される名前です。空欄にするとユーザーIDが表示されます。</p>
+      <div class="flex justify-end mt-4">
+        <button id="dn-save" class="btn btn-primary">ユーザー名を変更</button>
+      </div>
+      <div id="dn-msg" class="text-sm mt-2 hidden"></div>
+    </div>
+  </div>
+
+  <!-- パスワードの変更 -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-6">
+      <h2 class="text-lg font-semibold mb-4">パスワードの変更</h2>
+      <form id="pw-form" autocomplete="off">
+        <label for="pw-current" class="block text-sm mb-1">現パスワード</label>
+        <input id="pw-current" type="password" autocomplete="current-password"
+               class="input input-bordered w-full">
+
+        <label for="pw-new" class="block text-sm mt-4 mb-1">新パスワード</label>
+        <input id="pw-new" type="password" autocomplete="new-password"
+               class="input input-bordered w-full">
+        <p class="text-xs opacity-60 mt-1">8 文字以上で入力してください。</p>
+
+        <label for="pw-confirm" class="block text-sm mt-4 mb-1">新パスワード（確認）</label>
+        <input id="pw-confirm" type="password" autocomplete="new-password"
+               class="input input-bordered w-full">
+
+        <div class="flex justify-end mt-4">
+          <button type="submit" class="btn btn-primary">パスワードを変更</button>
+        </div>
+        <div id="pw-msg" class="text-sm mt-2 hidden"></div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem('yozist_token') || '';
+
+function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
+  return fetch(path, opts);
+}
+function json(path, opts) {
+  opts = opts || {};
+  if (opts.body && typeof opts.body === 'object') {
+    opts.body = JSON.stringify(opts.body);
+    opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
+  }
+  return api(path, opts).then(async r => {
+    if (!r.ok) return Promise.reject(new Error(await r.text() || r.statusText));
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
+}
+
+function redirectToLogin() {
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.href = '/ui/login?next=' + next;
+}
+function logout() {
+  localStorage.removeItem('yozist_token');
+  token = '';
+  redirectToLogin();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+
+function showMsg(el, text, ok) {
+  el.textContent = text;
+  el.className = 'text-sm mt-2 ' + (ok ? 'text-success' : 'text-error');
+}
+
+let currentUser = null;
+
+async function init() {
+  if (!token) { redirectToLogin(); return; }
+  try {
+    const me = await json('/api/auth/me');
+    if (me.anonymous) return logout();
+    currentUser = me.user;
+    const label = me.user.display_name || me.user.username;
+    $('me').textContent = label;
+    $('acc-username').textContent = me.user.username;
+    $('dn-input').value = me.user.display_name || '';
+
+    const groupsEl = $('acc-groups');
+    if (me.groups && me.groups.length) {
+      groupsEl.innerHTML = me.groups.map(g => {
+        const adminBadge = g.is_admin
+          ? ' <span class="badge badge-warning badge-sm">管理者</span>' : '';
+        return `<span class="inline-flex items-center gap-1">
+          <span class="badge badge-ghost badge-sm">${escapeHtml(g.name)}</span>${adminBadge}</span>`;
+      }).join('');
+    } else {
+      groupsEl.innerHTML = '<span class="opacity-50">所属なし</span>';
+    }
+
+    $('main').classList.remove('hidden');
+  } catch (e) { logout(); }
+}
+
+async function saveDisplayName() {
+  const el = $('dn-msg');
+  el.classList.remove('hidden');
+  const display_name = $('dn-input').value.trim();
+  $('dn-save').disabled = true;
+  try {
+    const user = await json('/api/auth/me', { method: 'PATCH', body: { display_name } });
+    currentUser = user;
+    $('me').textContent = user.display_name || user.username;
+    showMsg(el, 'ユーザー名を変更しました。', true);
+  } catch (e) {
+    showMsg(el, '変更に失敗しました: ' + e.message, false);
+  } finally {
+    $('dn-save').disabled = false;
+  }
+}
+
+async function changePassword(e) {
+  e.preventDefault();
+  const el = $('pw-msg');
+  el.classList.remove('hidden');
+  const current = $('pw-current').value;
+  const next = $('pw-new').value;
+  const confirm = $('pw-confirm').value;
+  if (next.length < 8) { showMsg(el, '新パスワードは 8 文字以上で入力してください。', false); return; }
+  if (next !== confirm) { showMsg(el, '新パスワード（確認）が一致しません。', false); return; }
+  const btn = $('pw-form').querySelector('button[type="submit"]');
+  btn.disabled = true;
+  try {
+    await json('/api/auth/password', {
+      method: 'POST',
+      body: { current_password: current, new_password: next },
+    });
+    $('pw-form').reset();
+    showMsg(el, 'パスワードを変更しました。', true);
+  } catch (e2) {
+    showMsg(el, '変更に失敗しました: ' + e2.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('logout').onclick = logout;
+$('dn-save').onclick = saveDisplayName;
+$('pw-form').addEventListener('submit', changePassword);
+init();
+</script>
+</body>
+</html>

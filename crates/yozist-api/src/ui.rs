@@ -19,6 +19,7 @@ pub fn router() -> Router<crate::ApiState> {
     Router::new()
         .route("/", get(index))
         .route("/login", get(login_page))
+        .route("/settings", get(settings_page))
         .route("/files", get(files_page))
         .route("/files/:id", get(file_detail_page))
         .route("/files/:id/histories/:cid", get(file_commit_page))
@@ -30,6 +31,10 @@ async fn index() -> Response {
 
 async fn login_page() -> Response {
     Html(LOGIN_HTML).into_response()
+}
+
+async fn settings_page() -> Response {
+    Html(SETTINGS_HTML).into_response()
 }
 
 async fn files_page() -> Response {
@@ -46,6 +51,7 @@ async fn file_commit_page() -> Response {
 
 const INDEX_HTML: &str = include_str!("ui/index.html");
 const LOGIN_HTML: &str = include_str!("ui/login.html");
+const SETTINGS_HTML: &str = include_str!("ui/settings.html");
 const FILES_HTML: &str = include_str!("ui/files.html");
 const FILE_DETAIL_HTML: &str = include_str!("ui/file_detail.html");
 const FILE_COMMIT_HTML: &str = include_str!("ui/file_commit.html");
