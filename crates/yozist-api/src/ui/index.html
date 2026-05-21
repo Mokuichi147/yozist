@@ -32,7 +32,7 @@
     </div>
   </div>
   <div class="flex-none flex items-center gap-3 px-2">
-    <span id="me" class="text-sm opacity-70">…</span>
+    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
     <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
   </div>
 </div>
@@ -161,7 +161,7 @@ async function init() {
   try {
     const me = await json('/api/auth/me');
     if (me.anonymous) return logout();
-    $('me').textContent = me.user.username;
+    $('me').textContent = me.user.display_name || me.user.username;
     $('main').classList.remove('hidden');
     await refresh();
   } catch (e) { logout(); }

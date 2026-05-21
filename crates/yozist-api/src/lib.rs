@@ -109,7 +109,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/acl", post(add_acl_rule))
         .route("/api/auth/register", post(register))
         .route("/api/auth/login", post(login))
-        .route("/api/auth/me", get(me))
+        .route("/api/auth/me", get(me).patch(update_me))
+        .route("/api/auth/password", post(change_password))
         .route("/api/users", get(list_users))
         .route("/api/groups", get(list_groups).post(create_group))
         .route(
@@ -1602,6 +1603,8 @@ async fn login(
 #[derive(Serialize)]
 struct MeResponse {
     user: Option<yozist_auth::User>,
+    /// 所属グループ一覧（設定ページでの表示用）。
+    groups: Vec<yozist_auth::Group>,
     anonymous: bool,
 }
 
@@ -1753,17 +1756,134 @@ fn map_auth_error(e: user_permission_core::Error) -> ApiError {
     }
 }
 
-async fn me(AuthCtx(ctx): AuthCtx) -> Json<MeResponse> {
+async fn me(State(s): State<ApiState>, AuthCtx(ctx): AuthCtx) -> Json<MeResponse> {
     match ctx {
-        AuthContext::User { user, .. } => Json(MeResponse {
-            user: Some(user),
-            anonymous: false,
-        }),
+        AuthContext::User { user, .. } => {
+            let groups = s
+                .auth_db
+                .groups()
+                .get_user_groups(user.id, None)
+                .await
+                .unwrap_or_default();
+            Json(MeResponse {
+                user: Some(user),
+                groups,
+                anonymous: false,
+            })
+        }
         _ => Json(MeResponse {
             user: None,
+            groups: Vec::new(),
             anonymous: true,
         }),
     }
+}
+
+#[derive(Deserialize)]
+struct UpdateMeInput {
+    display_name: String,
+}
+
+/// ログイン中ユーザー自身の表示名を変更する。
+async fn update_me(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<UpdateMeInput>,
+) -> Result<Json<yozist_auth::User>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let user_id = ctx.user_id().ok_or(ApiError::Unauthorized)?;
+    let display_name = input.display_name.trim().to_string();
+    let update = user_permission_core::UserUpdate {
+        display_name: Some(display_name),
+        ..Default::default()
+    };
+    let res = s
+        .auth_db
+        .users()
+        .update(user_id, update, None)
+        .await
+        .map_err(map_auth_error);
+    audit_event(
+        &s,
+        &ctx,
+        "update_display_name",
+        Some("user"),
+        Some(&user_id.to_string()),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?.map(Json).ok_or(ApiError::NotFound)
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordInput {
+    current_password: String,
+    new_password: String,
+}
+
+/// ログイン中ユーザー自身のパスワードを変更する。現パスワードを検証してから更新する。
+async fn change_password(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<ChangePasswordInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let user = match &ctx {
+        AuthContext::User { user, .. } => user.clone(),
+        _ => return Err(ApiError::Unauthorized),
+    };
+    if input.new_password.len() < 8 {
+        return Err(ApiError::BadRequest(
+            "新パスワードは8文字以上で入力してください".into(),
+        ));
+    }
+    // 現パスワードの検証: authenticate が成功すれば一致している。
+    let verified = s
+        .auth_db
+        .users()
+        .authenticate(
+            &user.username,
+            &input.current_password,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    if verified.is_none() {
+        audit_event(
+            &s,
+            &ctx,
+            "change_password",
+            Some("user"),
+            Some(&user.id.to_string()),
+            None,
+            &Err::<(), _>("現パスワードが正しくありません".to_string()),
+        )
+        .await;
+        return Err(ApiError::BadRequest("現パスワードが正しくありません".into()));
+    }
+    let update = user_permission_core::UserUpdate {
+        password: Some(input.new_password.clone()),
+        ..Default::default()
+    };
+    let res = s
+        .auth_db
+        .users()
+        .update(user.id, update, None)
+        .await
+        .map_err(map_auth_error);
+    audit_event(
+        &s,
+        &ctx,
+        "change_password",
+        Some("user"),
+        Some(&user.id.to_string()),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
