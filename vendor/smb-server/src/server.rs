@@ -269,6 +269,19 @@ impl ConfigHandle {
         Ok(())
     }
 
+    /// Insert or replace a user from precomputed NTLM credentials. Lets callers
+    /// restore persisted NT hashes without ever holding the plaintext password.
+    pub async fn add_user_creds(
+        &self,
+        name: impl Into<String>,
+        creds: UserCreds,
+    ) -> Result<(), ConfigError> {
+        let name = name.into();
+        validate_user_name(&name)?;
+        self.state.users.table.write().await.insert(name, creds);
+        Ok(())
+    }
+
     pub async fn remove_user(&self, name: &str) -> Result<(), ConfigError> {
         validate_user_name(name)?;
         let removed = self.state.users.table.write().await.remove(name);

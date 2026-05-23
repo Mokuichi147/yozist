@@ -19,7 +19,8 @@
 //! - [ ] SMB Change Notify による他クライアントへの即時反映
 //! - [ ] truncate / set_times の完全対応
 
-use smb_server::{Access, Share, SmbServer};
+use smb_server::{Share, SmbServer};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use user_permission_core::Database as AuthDb;
 use yozist_auth::{AuthContext, Authorizer, DbAuthorizer};
@@ -28,8 +29,10 @@ use yozist_storage::SharedBlobStore;
 use yozist_versioning::VersioningEngine;
 
 pub mod backends;
+pub mod credentials;
 pub mod handle;
 pub use backends::{AllBackend, QueriesBackend, RecentBackend, SeriesBackend, TagsBackend};
+pub use credentials::{SmbCredentialStore, SmbCredentialSync};
 
 /// 各 share 実装が共有する依存。
 #[derive(Clone)]
@@ -143,55 +146,65 @@ pub struct RequestCtx {
 /// 起動設定。
 pub struct SmbConfig {
     pub listen: std::net::SocketAddr,
-    /// 初期ユーザー（user, password）。`smb-server` 組込み認証で利用。
-    pub initial_users: Vec<(String, String)>,
 }
 
-/// SMB サーバー起動エントリ。
-pub async fn serve(cfg: SmbConfig, deps: ShareDeps) -> Result<(), SmbError> {
-    let mut builder = SmbServer::builder().listen(cfg.listen);
-    for (u, p) in &cfg.initial_users {
-        builder = builder.user(u, p);
+/// 公開する share 名の一覧（すべて `AuthenticatedOnly`）。
+const SHARE_NAMES: [&str; 4] = ["all", "tags", "series", "queries"];
+
+/// ビルド済み（未起動）の SMB サーバーと、REST 認証経路へ渡す資格情報シンク。
+pub struct BuiltSmb {
+    server: SmbServer,
+    sync: Arc<SmbCredentialSync>,
+}
+
+impl BuiltSmb {
+    /// REST 認証ハンドラ（register / login / change_password）が利用する資格情報シンク。
+    pub fn credential_sink(&self) -> Arc<dyn yozist_auth::SmbCredentialSink> {
+        self.sync.clone()
     }
 
-    let setup_share = |_name: &str, share: Share| {
-        if cfg.initial_users.is_empty() {
-            share.public()
-        } else {
-            cfg.initial_users
-                .iter()
-                .fold(share, |sh, (u, _)| sh.user(u, Access::ReadWrite))
-        }
-    };
-    let all_share = setup_share("all", Share::new("all", AllBackend::new(deps.clone())));
-    let tags_share = setup_share("tags", Share::new("tags", TagsBackend::new(deps.clone())));
-    let series_share = setup_share(
-        "series",
-        Share::new("series", SeriesBackend::new(deps.clone())),
-    );
-    let queries_share = setup_share(
-        "queries",
-        Share::new("queries", QueriesBackend::new(deps.clone())),
-    );
+    /// listen アドレスへ bind し、シャットダウンまでサーブする。
+    pub async fn serve(self) -> Result<(), SmbError> {
+        let BuiltSmb { server, .. } = self;
+        let bound = server
+            .bind()
+            .await
+            .map_err(|e| SmbError::Bind(e.to_string()))?;
+        tracing::info!("SMB server listening on {bound}");
+        server
+            .serve()
+            .await
+            .map_err(|e| SmbError::Serve(e.to_string()))?;
+        Ok(())
+    }
+}
 
-    let server = builder
-        .share(all_share)
-        .share(tags_share)
-        .share(series_share)
-        .share(queries_share)
+/// SMB サーバーを構築する。
+///
+/// share はすべて `AuthenticatedOnly`。ユーザー認証は user-permission と統合され、
+/// 平文パスワードが REST 認証経路を通過した時に NT ハッシュが `pool` の
+/// `smb_credentials` テーブルへ保存される（[`SmbCredentialSink`](yozist_auth::SmbCredentialSink)）。
+/// 構築時に永続化済みの資格情報を稼働中テーブルへ復元するため、再起動後も
+/// 既存ユーザーはログイン無しで接続できる。
+pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<BuiltSmb, SmbError> {
+    let server = SmbServer::builder()
+        .listen(cfg.listen)
+        .share(Share::new("all", AllBackend::new(deps.clone())))
+        .share(Share::new("tags", TagsBackend::new(deps.clone())))
+        .share(Share::new("series", SeriesBackend::new(deps.clone())))
+        .share(Share::new("queries", QueriesBackend::new(deps.clone())))
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 
-    let bound = server
-        .bind()
-        .await
-        .map_err(|e| SmbError::Bind(e.to_string()))?;
-    tracing::info!("SMB server listening on {} (bound={bound})", cfg.listen);
-    server
-        .serve()
-        .await
-        .map_err(|e| SmbError::Serve(e.to_string()))?;
-    Ok(())
+    let shares = SHARE_NAMES.iter().map(|s| s.to_string()).collect();
+    let sync = Arc::new(SmbCredentialSync::new(
+        SmbCredentialStore::new(pool),
+        server.config_handle(),
+        shares,
+    ));
+    sync.restore().await;
+
+    Ok(BuiltSmb { server, sync })
 }
 
 #[derive(Debug, thiserror::Error)]

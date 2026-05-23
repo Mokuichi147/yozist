@@ -52,6 +52,9 @@ pub struct ApiState {
     pub audit: SharedAuditLog,
     /// 共有トークン (`share_tokens` テーブル) の操作。
     pub share_admin: Arc<ShareTokenStore>,
+    /// SMB(NTLM) 資格情報の同期先。SMB 無効時は `None`。
+    /// register / login / change_password 成功時に平文パスワードを渡して反映する。
+    pub smb_creds: Option<Arc<dyn yozist_auth::SmbCredentialSink>>,
 }
 
 /// ルーター生成。
@@ -1579,6 +1582,9 @@ async fn register(
         .create(&input.username, &input.password, &input.username, None)
         .await
         .map_err(map_auth_error)?;
+    if let Some(smb) = &s.smb_creds {
+        smb.upsert(&input.username, &input.password).await;
+    }
     Ok((StatusCode::CREATED, Json(user)))
 }
 
@@ -1597,6 +1603,11 @@ async fn login(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or(ApiError::Unauthorized)?;
+    // 認証成功時のみ平文パスワードを観測できる。既存ユーザーや再起動後の
+    // NT ハッシュ復旧を兼ねて SMB へ反映する（冪等）。
+    if let Some(smb) = &s.smb_creds {
+        smb.upsert(&input.username, &input.password).await;
+    }
     Ok(Json(AuthResponse { token }))
 }
 
@@ -1883,6 +1894,9 @@ async fn change_password(
     )
     .await;
     res?;
+    if let Some(smb) = &s.smb_creds {
+        smb.upsert(&user.username, &input.new_password).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2020,6 +2034,7 @@ mod tests {
                 acl_admin: db_authz,
                 audit,
                 share_admin,
+                smb_creds: None,
             },
             dir,
         )

@@ -3686,6 +3686,8 @@ dependencies = [
  "bytes",
  "parking_lot",
  "smb-server",
+ "sqlx",
+ "tempfile",
  "thiserror 1.0.69",
  "time",
  "tokio",

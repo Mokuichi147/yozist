@@ -40,7 +40,7 @@ pub use error::{SmbError, SmbResult};
 #[cfg(feature = "localfs")]
 pub use fs::LocalFsBackend;
 pub use path::SmbPath;
-pub use proto::auth::ntlm::Identity;
+pub use proto::auth::ntlm::{nt_hash, Identity, UserCreds};
 pub use server::{ConfigHandle, ShareMode, ShutdownHandle, SmbServer};
 
 pub mod wire {

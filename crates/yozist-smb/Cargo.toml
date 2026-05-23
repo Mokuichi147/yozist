@@ -12,6 +12,7 @@ yozist-storage.workspace = true
 yozist-versioning.workspace = true
 yozist-auth.workspace = true
 user-permission-core.workspace = true
+sqlx.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 bytes.workspace = true
@@ -21,3 +22,6 @@ smb-server = { workspace = true }
 uuid.workspace = true
 time.workspace = true
 parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
