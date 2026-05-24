@@ -227,40 +227,13 @@ async function loadDetail() {
             ${escapeHtml(c.message || '')}
           </div>
           <div class="flex gap-1 shrink-0">
-            <button class="btn btn-xs" onclick="diffCommit('${c.id}','${time}')">Δ</button>
+            <a class="btn btn-xs" href="/ui/files/${fileId}/compare?base=${c.id}&compare=${currentCommitId}" title="現在の内容と比較">Δ 比較</a>
             <a class="btn btn-xs" href="/ui/files/${fileId}/histories/${c.id}">表示</a>
             ${isCurrent ? '' : `<button class="btn btn-xs btn-warning btn-outline"
               onclick="rollback('${c.id}','${time}')">戻す</button>`}
           </div>
         </div>`;
       }).join('');
-}
-
-async function diffCommit(commitId, time) {
-  const [oldR, newR] = await Promise.all([
-    api(`/api/files/${fileId}/commits/${commitId}`),
-    api(`/api/files/${fileId}/content`),
-  ]);
-  if (!oldR.ok || !newR.ok) return alert('diff取得失敗');
-  const oldText = await oldR.text();
-  const newText = await newR.text();
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  const max = Math.max(oldLines.length, newLines.length);
-  let out = `=== diff ===\n旧 (${time}) → 現在\n\n`;
-  const oldSet = new Set(oldLines);
-  const newSet = new Set(newLines);
-  for (let i = 0; i < max; i++) {
-    const a = oldLines[i] ?? '';
-    const b = newLines[i] ?? '';
-    if (a === b) out += `  ${a}\n`;
-    else {
-      if (a && !newSet.has(a)) out += `- ${a}\n`;
-      if (b && !oldSet.has(b)) out += `+ ${b}\n`;
-      if (a && newSet.has(a) && b && oldSet.has(b)) out += `~ ${a} → ${b}\n`;
-    }
-  }
-  alert(out.length > 3000 ? out.slice(0, 3000) + '\n…' : out);
 }
 
 async function rollback(commitId, time) {

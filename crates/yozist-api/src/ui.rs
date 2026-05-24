@@ -22,6 +22,7 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/settings", get(settings_page))
         .route("/files", get(files_page))
         .route("/files/:id", get(file_detail_page))
+        .route("/files/:id/compare", get(file_compare_page))
         .route("/files/:id/histories/:cid", get(file_commit_page))
 }
 
@@ -45,6 +46,10 @@ async fn file_detail_page() -> Response {
     Html(FILE_DETAIL_HTML).into_response()
 }
 
+async fn file_compare_page() -> Response {
+    Html(FILE_COMPARE_HTML).into_response()
+}
+
 async fn file_commit_page() -> Response {
     Html(FILE_COMMIT_HTML).into_response()
 }
@@ -54,4 +59,5 @@ const LOGIN_HTML: &str = include_str!("ui/login.html");
 const SETTINGS_HTML: &str = include_str!("ui/settings.html");
 const FILES_HTML: &str = include_str!("ui/files.html");
 const FILE_DETAIL_HTML: &str = include_str!("ui/file_detail.html");
+const FILE_COMPARE_HTML: &str = include_str!("ui/compare.html");
 const FILE_COMMIT_HTML: &str = include_str!("ui/file_commit.html");
