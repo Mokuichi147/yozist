@@ -43,10 +43,6 @@ struct Cli {
     #[arg(long, env = "YOZIST_SMB_LISTEN", default_value = "127.0.0.1:4445")]
     smb_listen: String,
 
-    /// 初期 SMB ユーザー (`user:password`)。複数指定可。
-    #[arg(long, env = "YOZIST_SMB_USER")]
-    smb_user: Vec<String>,
-
     /// 認証 (ユーザー/グループ/JWT) を中央の user-permission サーバへ中継する
     /// 場合の URL（例: `http://localhost:8001`）。未指定ならローカル SQLite
     /// (`<data>/auth.db`) を使う。
@@ -126,6 +122,31 @@ async fn main() -> anyhow::Result<()> {
             let authz: Arc<dyn Authorizer> = db_authz.clone();
 
             let audit = Arc::new(AuditLog::new(pool.clone()));
+
+            // SMB を (有効なら) 先に構築し、REST 認証経路へ渡す資格情報シンクを得る。
+            // 認証は user-permission と統合され、平文パスワードが REST 経路を通過した
+            // 時に NT ハッシュが smb_credentials テーブルへ保存される。
+            let smb_built = if cli.smb_listen.is_empty() {
+                tracing::info!("SMB disabled (--smb-listen is empty)");
+                None
+            } else {
+                let smb_addr: std::net::SocketAddr = cli
+                    .smb_listen
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid SMB listen addr: {e}"))?;
+                let deps = ShareDeps {
+                    meta: meta.clone(),
+                    blob: blob.clone(),
+                    engine: engine.clone(),
+                    authz: authz.clone(),
+                    auth_db: auth_db.clone(),
+                    acl_admin: db_authz.clone(),
+                    audit: audit.clone(),
+                };
+                Some(yozist_smb::build(SmbConfig { listen: smb_addr }, deps, pool.clone()).await?)
+            };
+            let smb_creds = smb_built.as_ref().map(|b| b.credential_sink());
+
             let state = ApiState {
                 meta: meta.clone(),
                 engine: engine.clone(),
@@ -134,48 +155,18 @@ async fn main() -> anyhow::Result<()> {
                 acl_admin: db_authz.clone(),
                 audit: audit.clone(),
                 share_admin,
+                smb_creds,
             };
             let app = yozist_api::router(state);
 
             // SMB を別タスクで起動
-            let smb_task = if cli.smb_listen.is_empty() {
-                tracing::info!("SMB disabled (--smb-listen is empty)");
-                None
-            } else {
-                let smb_addr: std::net::SocketAddr = cli
-                    .smb_listen
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("invalid SMB listen addr: {e}"))?;
-                let users: Vec<(String, String)> = cli
-                    .smb_user
-                    .iter()
-                    .filter_map(|s| s.split_once(':').map(|(u, p)| (u.into(), p.into())))
-                    .collect();
-                if users.is_empty() {
-                    tracing::warn!(
-                        "SMB starting in public mode (no --smb-user provided); \
-                         use --smb-user user:pw to require authentication"
-                    );
-                }
-                let cfg = SmbConfig {
-                    listen: smb_addr,
-                    initial_users: users,
-                };
-                let deps = ShareDeps {
-                    meta,
-                    blob,
-                    engine,
-                    authz,
-                    auth_db,
-                    acl_admin: db_authz,
-                    audit: audit.clone(),
-                };
-                Some(tokio::spawn(async move {
-                    if let Err(e) = yozist_smb::serve(cfg, deps).await {
+            let smb_task = smb_built.map(|built| {
+                tokio::spawn(async move {
+                    if let Err(e) = built.serve().await {
                         tracing::error!("SMB server failed: {e}");
                     }
-                }))
-            };
+                })
+            });
 
             let listener = TcpListener::bind(&cli.listen).await?;
             tracing::info!("listening on {}", cli.listen);

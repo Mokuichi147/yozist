@@ -136,6 +136,20 @@ pub trait Authorizer: Send + Sync {
     ) -> Result<bool, AuthError>;
 }
 
+/// SMB(NTLM) 認証に必要な NT ハッシュを同期するためのフック。
+///
+/// user-permission は Argon2id ハッシュしか持たず NTLM では使えないため、REST
+/// 認証経路で平文パスワードを観測したタイミングで本トレイト経由 NT ハッシュを
+/// 導出・永続化し、稼働中の SMB サーバへ反映する。実装は `yozist-smb` 側にある。
+#[async_trait]
+pub trait SmbCredentialSink: Send + Sync {
+    /// 平文パスワードから NT ハッシュを導出して保存し、稼働中 SMB へ反映する。
+    /// 失敗は内部でログに記録し、認証フローは中断しない。
+    async fn upsert(&self, username: &str, password: &str);
+    /// ユーザーの SMB 資格情報を削除する。
+    async fn remove(&self, username: &str);
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("invalid token")]
