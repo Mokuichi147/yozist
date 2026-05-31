@@ -10,8 +10,10 @@ yozist-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 bytes.workspace = true
+futures.workspace = true
 sha2.workspace = true
 zstd.workspace = true
+async-compression.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

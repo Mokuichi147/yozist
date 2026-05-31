@@ -18,6 +18,7 @@ uuid.workspace = true
 time.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+futures.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

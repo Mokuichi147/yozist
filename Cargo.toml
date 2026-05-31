@@ -58,6 +58,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 # Storage / compression / hashing
 sha2 = "0.10"
 zstd = "0.13"
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 
 # Diff / CRDT
 similar = "2.6"

@@ -16,15 +16,17 @@
 //! - [ ] 共有 URL（期限付き、JWT）配信エンドポイント `/api/shared/<token>`
 
 use axum::{
-    body::Bytes,
+    body::Body,
     extract::{FromRef, FromRequestParts, Path, Query, State},
     http::{request::Parts, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use yozist_storage::StorageError;
 
 use user_permission_core::Database as AuthDb;
 use yozist_auth::{
@@ -255,14 +257,19 @@ async fn create_file(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Query(q): Query<CreateFileQuery>,
-    body: Bytes,
+    body: Body,
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
     require_authenticated(&ctx).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let name_for_audit = q.name.clone();
+    // ボディをメモリに載せず 1 チャンクずつ blob ストアへ流す。
+    let stream = body
+        .into_data_stream()
+        .map_err(|e| StorageError::Other(e.to_string()))
+        .boxed();
     let result = s
         .engine
-        .create_file(q.name, &body, actor, None)
+        .create_file_streaming(q.name, stream, actor, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
 
@@ -389,14 +396,19 @@ async fn commit_file(
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
     Query(q): Query<CommitQuery>,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<yozist_core::Commit>, ApiError> {
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
+    // ボディをメモリに載せず 1 チャンクずつ blob ストアへ流す。
+    let stream = body
+        .into_data_stream()
+        .map_err(|e| StorageError::Other(e.to_string()))
+        .boxed();
     let result = s
         .engine
-        .commit(id, &body, actor, q.message)
+        .commit_streaming(id, stream, actor, q.message)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
 

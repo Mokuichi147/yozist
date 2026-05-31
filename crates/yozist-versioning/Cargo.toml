@@ -12,6 +12,7 @@ yozist-db.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 bytes.workspace = true
+futures.workspace = true
 similar.workspace = true
 yrs.workspace = true
 thiserror.workspace = true
