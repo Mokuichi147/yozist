@@ -3,7 +3,7 @@ name = "yozist-api"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-description = "yozist: REST API + AI endpoints + WebUI (axum + leptos placeholder)."
+description = "yozist: REST API + AI endpoints + WebUI (axum + askama)."
 
 [dependencies]
 yozist-core.workspace = true
@@ -25,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+askama.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

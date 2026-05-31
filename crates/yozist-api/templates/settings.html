@@ -1,38 +1,7 @@
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>yozist - ユーザー設定</title>
-<script>
-  document.documentElement.setAttribute(
-    'data-theme',
-    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-  );
-</script>
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-<style>
-  .hidden { display: none !important; }
-</style>
-</head>
-<body class="min-h-screen bg-base-200 text-base-content">
+{% extends "base.html" %}
+{% block title %}yozist - ユーザー設定{% endblock %}
 
-<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2 flex items-center gap-3">
-    <a href="/ui" class="text-xl font-bold">yozist</a>
-    <div class="tabs tabs-boxed tabs-sm">
-      <a href="/ui/files" class="tab">ファイル</a>
-      <a href="/ui/manage" class="tab">管理</a>
-    </div>
-  </div>
-  <div class="flex-none flex items-center gap-3 px-2">
-    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case">…</a>
-    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
-  </div>
-</div>
-
+{% block content %}
 <div id="main" class="hidden max-w-2xl mx-auto p-4 space-y-6">
   <h1 class="text-2xl font-bold">ユーザー設定</h1>
 
@@ -88,45 +57,10 @@
     </div>
   </div>
 </div>
+{% endblock %}
 
+{% block script %}
 <script>
-const $ = id => document.getElementById(id);
-let token = localStorage.getItem('yozist_token') || '';
-
-function api(path, opts = {}) {
-  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
-  return fetch(path, opts);
-}
-function json(path, opts) {
-  opts = opts || {};
-  if (opts.body && typeof opts.body === 'object') {
-    opts.body = JSON.stringify(opts.body);
-    opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
-  }
-  return api(path, opts).then(async r => {
-    if (!r.ok) return Promise.reject(new Error(await r.text() || r.statusText));
-    if (r.status === 204) return null;
-    const text = await r.text();
-    return text ? JSON.parse(text) : null;
-  });
-}
-
-function redirectToLogin() {
-  const next = encodeURIComponent(location.pathname + location.search);
-  location.href = '/ui/login?next=' + next;
-}
-function logout() {
-  localStorage.removeItem('yozist_token');
-  token = '';
-  redirectToLogin();
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[c]);
-}
-
 function showMsg(el, text, ok) {
   el.textContent = text;
   el.className = 'text-sm mt-2 ' + (ok ? 'text-success' : 'text-error');
@@ -135,30 +69,25 @@ function showMsg(el, text, ok) {
 let currentUser = null;
 
 async function init() {
-  if (!token) { redirectToLogin(); return; }
-  try {
-    const me = await json('/api/auth/me');
-    if (me.anonymous) return logout();
-    currentUser = me.user;
-    const label = me.user.display_name || me.user.username;
-    $('me').textContent = label;
-    $('acc-username').textContent = me.user.username;
-    $('dn-input').value = me.user.display_name || '';
+  const me = await requireAuth();
+  if (!me) return;
+  currentUser = me.user;
+  $('acc-username').textContent = me.user.username;
+  $('dn-input').value = me.user.display_name || '';
 
-    const groupsEl = $('acc-groups');
-    if (me.groups && me.groups.length) {
-      groupsEl.innerHTML = me.groups.map(g => {
-        const adminBadge = g.is_admin
-          ? ' <span class="badge badge-warning badge-sm">管理者</span>' : '';
-        return `<span class="inline-flex items-center gap-1">
-          <span class="badge badge-ghost badge-sm">${escapeHtml(g.name)}</span>${adminBadge}</span>`;
-      }).join('');
-    } else {
-      groupsEl.innerHTML = '<span class="opacity-50">所属なし</span>';
-    }
+  const groupsEl = $('acc-groups');
+  if (me.groups && me.groups.length) {
+    groupsEl.innerHTML = me.groups.map(g => {
+      const adminBadge = g.is_admin
+        ? ' <span class="badge badge-warning badge-sm">管理者</span>' : '';
+      return `<span class="inline-flex items-center gap-1">
+        <span class="badge badge-ghost badge-sm">${escapeHtml(g.name)}</span>${adminBadge}</span>`;
+    }).join('');
+  } else {
+    groupsEl.innerHTML = '<span class="opacity-50">所属なし</span>';
+  }
 
-    $('main').classList.remove('hidden');
-  } catch (e) { logout(); }
+  $('main').classList.remove('hidden');
 }
 
 async function saveDisplayName() {
@@ -203,10 +132,8 @@ async function changePassword(e) {
   }
 }
 
-$('logout').onclick = logout;
 $('dn-save').onclick = saveDisplayName;
 $('pw-form').addEventListener('submit', changePassword);
 init();
 </script>
-</body>
-</html>
+{% endblock %}

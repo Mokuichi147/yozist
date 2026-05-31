@@ -1,44 +1,7 @@
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>yozist</title>
-<script>
-  // OS のダーク設定に追従 (Tailwind/daisyUI が DOM を見る前に data-theme を確定させる)
-  document.documentElement.setAttribute(
-    'data-theme',
-    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-  );
-</script>
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-<style>
-  /* CDN ロード完了前のフラッシュ防止 */
-  .hidden { display: none !important; }
-  /* row-compact: Tailwind 拡張に頼らず純 CSS で */
-  .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
-  .row-compact:hover { background: rgba(127,127,127,0.12); }
-</style>
-</head>
-<body class="min-h-screen bg-base-200 text-base-content">
+{% extends "base.html" %}
+{% block title %}yozist{% endblock %}
 
-<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2 flex items-center gap-3">
-    <a href="/ui" class="text-xl font-bold">yozist</a>
-    <div class="tabs tabs-boxed tabs-sm">
-      <a href="/ui/files" class="tab">ファイル</a>
-      <a href="/ui/manage" class="tab">管理</a>
-    </div>
-  </div>
-  <div class="flex-none flex items-center gap-3 px-2">
-    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
-    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
-  </div>
-</div>
-
-<!-- メイン -->
+{% block content %}
 <div id="main" class="hidden max-w-7xl mx-auto p-4">
   <div class="grid grid-cols-1 md:grid-cols-[240px_1fr] gap-4">
 
@@ -89,48 +52,15 @@
     </div>
   </div>
 </div>
+{% endblock %}
 
+{% block script %}
 <script>
-const $ = id => document.getElementById(id);
-let token = localStorage.getItem('yozist_token') || '';
-
-function api(path, opts = {}) {
-  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
-  return fetch(path, opts);
-}
-function json(path, opts) {
-  opts = opts || {};
-  if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof ArrayBuffer)) {
-    opts.body = JSON.stringify(opts.body);
-    opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
-  }
-  return api(path, opts).then(async r => {
-    if (!r.ok) return Promise.reject(r);
-    if (r.status === 204) return null;
-    const text = await r.text();
-    return text ? JSON.parse(text) : null;
-  });
-}
-
-function redirectToLogin() {
-  const next = encodeURIComponent(location.pathname + location.search);
-  location.href = '/ui/login?next=' + next;
-}
-function logout() {
-  localStorage.removeItem('yozist_token');
-  token = '';
-  redirectToLogin();
-}
-
 async function init() {
-  if (!token) { redirectToLogin(); return; }
-  try {
-    const me = await json('/api/auth/me');
-    if (me.anonymous) return logout();
-    $('me').textContent = me.user.display_name || me.user.username;
-    $('main').classList.remove('hidden');
-    await refresh();
-  } catch (e) { logout(); }
+  const me = await requireAuth();
+  if (!me) return;
+  $('main').classList.remove('hidden');
+  await refresh();
 }
 
 async function refresh() {
@@ -161,19 +91,27 @@ async function loadTags() {
     a.append(renameBtn, delBtn);
     renameBtn.onclick = async (e) => {
       e.stopPropagation(); e.preventDefault();
-      const name = prompt('新しいタグ名', t.name);
+      const r = await uiPrompt({
+        title: 'タグ名の変更', okText: '変更',
+        fields: [{ name: 'name', label: '新しいタグ名', value: t.name }],
+      });
+      if (!r) return;
+      const name = r.name.trim();
       if (!name || name === t.name) return;
-      await api(`/api/tags/${t.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ name }),
+      const rr = await api(`/api/tags/${t.id}`, {
+        method: 'PATCH', body: JSON.stringify({ name }),
         headers: { 'content-type': 'application/json' },
       });
+      if (!rr.ok) { uiToast('変更に失敗しました', 'error'); return; }
+      uiToast('タグ名を変更しました', 'success');
       await refresh();
     };
     delBtn.onclick = async (e) => {
       e.stopPropagation(); e.preventDefault();
-      if (!confirm(`タグ "${t.name}" を削除しますか？\n(ファイル本体は残りますが、このタグの紐付けは全て解除されます)`)) return;
-      await api(`/api/tags/${t.id}`, { method: 'DELETE' });
+      if (!await uiConfirm(`タグ "${t.name}" を削除しますか？\n(ファイル本体は残りますが、このタグの紐付けは全て解除されます)`, { danger: true, okText: '削除' })) return;
+      const rr = await api(`/api/tags/${t.id}`, { method: 'DELETE' });
+      if (!rr.ok) { uiToast('削除に失敗しました', 'error'); return; }
+      uiToast('タグを削除しました', 'success');
       await refresh();
     };
     li.appendChild(a);
@@ -192,7 +130,9 @@ async function loadSeries() {
       const li = document.createElement('li');
       const a = document.createElement('a');
       a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded hover:bg-base-200';
-      a.title = s.description || '';
+      // クリックでそのシリーズのファイル一覧へ (旧: メンバーを alert 表示)
+      a.href = '/ui/files?series=' + encodeURIComponent(s.id);
+      a.title = s.description || 'このシリーズのファイル一覧を表示';
       a.innerHTML = `<span class="flex-1 truncate">${escapeHtml(s.name)}</span>`;
       const renameBtn = document.createElement('button');
       renameBtn.className = 'btn btn-xs btn-ghost px-1';
@@ -205,27 +145,32 @@ async function loadSeries() {
       a.append(renameBtn, delBtn);
       renameBtn.onclick = async (e) => {
         e.stopPropagation(); e.preventDefault();
-        const name = prompt('新しいシリーズ名', s.name);
+        const r = await uiPrompt({
+          title: 'シリーズの編集', okText: '保存',
+          fields: [
+            { name: 'name', label: 'シリーズ名', value: s.name },
+            { name: 'description', label: '説明 (空可)', value: s.description || '' },
+          ],
+        });
+        if (!r) return;
+        const name = r.name.trim();
         if (!name) return;
-        const description = prompt('説明 (空可)', s.description || '');
-        await api(`/api/series/${s.id}`, {
+        const rr = await api(`/api/series/${s.id}`, {
           method: 'PATCH',
-          body: JSON.stringify({ name, description: description || null }),
+          body: JSON.stringify({ name, description: r.description || null }),
           headers: { 'content-type': 'application/json' },
         });
+        if (!rr.ok) { uiToast('変更に失敗しました', 'error'); return; }
+        uiToast('シリーズを更新しました', 'success');
         await refresh();
       };
       delBtn.onclick = async (e) => {
         e.stopPropagation(); e.preventDefault();
-        if (!confirm(`シリーズ "${s.name}" を削除しますか？\n(ファイル本体は残ります)`)) return;
-        await api(`/api/series/${s.id}`, { method: 'DELETE' });
+        if (!await uiConfirm(`シリーズ "${s.name}" を削除しますか？\n(ファイル本体は残ります)`, { danger: true, okText: '削除' })) return;
+        const rr = await api(`/api/series/${s.id}`, { method: 'DELETE' });
+        if (!rr.ok) { uiToast('削除に失敗しました', 'error'); return; }
+        uiToast('シリーズを削除しました', 'success');
         await refresh();
-      };
-      a.onclick = async (e) => {
-        if (e.target === renameBtn || e.target === delBtn) return;
-        const members = await fetch('/api/series/' + s.id + '/members').then(r => r.json());
-        alert(`series "${s.name}"\nメンバー: ${members.length}件\n` + members.map(m =>
-          `[${m.order_index}] ${m.file_id.slice(0,8)}…`).join('\n'));
       };
       li.appendChild(a);
       el.appendChild(li);
@@ -239,10 +184,16 @@ async function loadSeries() {
   addLink.textContent = '+ 新規シリーズ';
   addLink.onclick = async (e) => {
     e.preventDefault();
-    const name = prompt('シリーズ名');
-    if (!name) return;
-    await json('/api/series', { method: 'POST', body: { name } });
-    await refresh();
+    const r = await uiPrompt({
+      title: '新規シリーズ', okText: '作成',
+      fields: [{ name: 'name', label: 'シリーズ名' }],
+    });
+    if (!r || !r.name.trim()) return;
+    try {
+      await json('/api/series', { method: 'POST', body: { name: r.name.trim() } });
+      uiToast('シリーズを作成しました', 'success');
+      await refresh();
+    } catch (err) { uiToast('作成に失敗しました: ' + err.message, 'error'); }
   };
   add.appendChild(addLink);
   el.appendChild(add);
@@ -257,7 +208,7 @@ async function doUpload() {
     if (!name) name = f.name;
     body = await f.arrayBuffer();
   } else {
-    if (!name) return alert('ファイル名 or アップロードファイルを指定してください');
+    if (!name) { uiToast('ファイル名またはアップロードファイルを指定してください', 'warning'); return; }
     body = new TextEncoder().encode($('upload-content').value || '').buffer;
   }
   const r = await api('/api/files?name=' + encodeURIComponent(name), {
@@ -265,39 +216,17 @@ async function doUpload() {
     body,
     headers: { 'content-type': 'application/octet-stream' },
   });
-  if (!r.ok) return alert('登録失敗: ' + await r.text());
+  if (!r.ok) { uiToast('登録に失敗しました: ' + await r.text(), 'error'); return; }
   const meta = await r.json();
   $('upload-name').value = '';
   $('upload-content').value = '';
   fileInput.value = '';
   $('upload-result').innerHTML =
     `登録しました: <a class="link link-primary" href="/ui/files/${meta.id}">${escapeHtml(meta.display_name)}</a>`;
+  uiToast('ファイルを登録しました', 'success');
   await refresh();
 }
 
-// API は timestamp を ISO 文字列で返す場合と
-// time::OffsetDateTime のシリアライズ形式 ([year, day_of_year, h, m, s, ns, ...]) で返す場合がある
-function fmtTs(ts) {
-  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
-  if (Array.isArray(ts) && ts.length >= 5) {
-    const [y, doy, h, m, s] = ts;
-    const d = new Date(Date.UTC(y, 0, doy));
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    const pad = n => String(n).padStart(2, '0');
-    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
-  }
-  return String(ts ?? '');
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[c]);
-}
-
-$('logout').onclick = logout;
 init();
 </script>
-</body>
-</html>
+{% endblock %}

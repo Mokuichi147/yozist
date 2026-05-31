@@ -1,40 +1,8 @@
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>yozist - commit</title>
-<script>
-  document.documentElement.setAttribute(
-    'data-theme',
-    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-  );
-</script>
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-<style>
-  .hidden { display: none !important; }
-</style>
-</head>
-<body class="min-h-screen bg-base-200 text-base-content">
+{% extends "base.html" %}
+{% block title %}yozist - commit{% endblock %}
+{% block subtabs %}<a id="back-detail" href="#" class="tab">詳細</a><span class="tab tab-active">コミット</span>{% endblock %}
 
-<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2 flex items-center gap-3">
-    <a href="/ui" class="text-xl font-bold">yozist</a>
-    <div class="tabs tabs-boxed tabs-sm">
-      <a href="/ui/files" class="tab">ファイル</a>
-      <a href="/ui/manage" class="tab">管理</a>
-      <a id="back-detail" href="#" class="tab">詳細</a>
-      <span class="tab tab-active">コミット</span>
-    </div>
-  </div>
-  <div class="flex-none flex items-center gap-3 px-2">
-    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
-    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
-  </div>
-</div>
-
+{% block content %}
 <div id="not-found" class="hidden max-w-md mx-auto mt-24">
   <div class="alert alert-error">
     <span id="not-found-msg">コミットが見つかりません。</span>
@@ -66,54 +34,14 @@
     </div>
   </div>
 </div>
+{% endblock %}
 
+{% block script %}
 <script>
-const $ = id => document.getElementById(id);
-let token = localStorage.getItem('yozist_token') || '';
-
 const parts = location.pathname.split('/').filter(Boolean);
 // /ui/files/:id/histories/:cid → ['ui','files',':id','histories',':cid']
 const fileId = parts[2];
 const commitId = parts[4];
-
-function api(path, opts = {}) {
-  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
-  return fetch(path, opts);
-}
-function json(path, opts) {
-  return api(path, opts).then(async r => {
-    if (!r.ok) return Promise.reject(r);
-    if (r.status === 204) return null;
-    const text = await r.text();
-    return text ? JSON.parse(text) : null;
-  });
-}
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[c]);
-}
-function fmtTs(ts) {
-  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
-  if (Array.isArray(ts) && ts.length >= 5) {
-    const [y, doy, h, m, s] = ts;
-    const d = new Date(Date.UTC(y, 0, doy));
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    const pad = n => String(n).padStart(2, '0');
-    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
-  }
-  return String(ts ?? '');
-}
-function redirectToLogin() {
-  const next = encodeURIComponent(location.pathname + location.search);
-  location.href = '/ui/login?next=' + next;
-}
-function logout() {
-  localStorage.removeItem('yozist_token');
-  redirectToLogin();
-}
-$('logout').onclick = logout;
 
 const detailUrl = '/ui/files/' + fileId;
 $('back-detail').href = detailUrl;
@@ -121,12 +49,8 @@ $('back-link').href = detailUrl;
 $('fc-raw').href = `/api/files/${fileId}/commits/${commitId}`;
 
 async function init() {
-  if (!token) { redirectToLogin(); return; }
-  try {
-    const me = await json('/api/auth/me');
-    if (me.anonymous) { logout(); return; }
-    $('me').textContent = me.user.display_name || me.user.username;
-  } catch (e) { redirectToLogin(); return; }
+  const me = await requireAuth();
+  if (!me) return;
 
   let file, history, content;
   try {
@@ -175,13 +99,13 @@ async function init() {
     const btn = $('fc-rollback');
     btn.classList.remove('hidden');
     btn.onclick = async () => {
-      if (!confirm(`"${file.display_name}" をこのバージョン (${time}) に戻しますか？\n(新しいコミットとして記録されます)`)) return;
+      if (!await uiConfirm(`"${file.display_name}" をこのバージョン (${time}) に戻しますか？\n(新しいコミットとして記録されます)`, { danger: true, okText: '戻す' })) return;
       const r = await api(
         `/api/files/${fileId}/rollback/${commitId}?message=` +
           encodeURIComponent(`rollback to ${time}`),
         { method: 'POST' }
       );
-      if (!r.ok) return alert('rollback失敗: ' + await r.text());
+      if (!r.ok) { uiToast('rollback に失敗しました: ' + await r.text(), 'error'); return; }
       location.href = detailUrl;
     };
   }
@@ -189,5 +113,4 @@ async function init() {
 
 init();
 </script>
-</body>
-</html>
+{% endblock %}
