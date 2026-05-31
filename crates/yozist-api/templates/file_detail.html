@@ -1,40 +1,8 @@
-<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>yozist - file</title>
-<script>
-  document.documentElement.setAttribute(
-    'data-theme',
-    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
-  );
-</script>
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-<style>
-  .hidden { display: none !important; }
-  .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
-  .row-compact:hover { background: rgba(127,127,127,0.12); }
-</style>
-</head>
-<body class="min-h-screen bg-base-200 text-base-content">
+{% extends "base.html" %}
+{% block title %}yozist - file{% endblock %}
+{% block subtabs %}<span class="tab tab-active">詳細</span>{% endblock %}
 
-<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2 flex items-center gap-3">
-    <a href="/ui" class="text-xl font-bold">yozist</a>
-    <div class="tabs tabs-boxed tabs-sm">
-      <a href="/ui/files" class="tab">files</a>
-      <span class="tab tab-active">detail</span>
-    </div>
-  </div>
-  <div class="flex-none flex items-center gap-3 px-2">
-    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
-    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
-  </div>
-</div>
-
+{% block content %}
 <div id="not-found" class="hidden max-w-md mx-auto mt-24">
   <div class="alert alert-error">
     <span>ファイルが見つかりません。<a href="/ui/files" class="link">一覧へ戻る</a></span>
@@ -111,65 +79,54 @@
   </div>
 </div>
 
+<!-- 権限付与モーダル -->
+<dialog id="perm-modal" class="modal">
+  <form id="perm-form" class="modal-box max-w-md">
+    <h3 class="font-bold text-lg">権限を付与</h3>
+    <div class="mt-3 space-y-3">
+      <div>
+        <label class="block text-sm mb-1">ユーザー</label>
+        <select id="perm-user" class="select select-bordered select-sm w-full"></select>
+      </div>
+      <div>
+        <label class="block text-sm mb-1">権限レベル</label>
+        <select id="perm-mask" class="select select-bordered select-sm w-full">
+          <option value="1">閲覧のみ (VIEW)</option>
+          <option value="3" selected>読取 (VIEW + READ)</option>
+          <option value="7">書込 (VIEW + READ + WRITE)</option>
+          <option value="15">管理 (フル権限)</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-sm mb-1">種別</label>
+        <div class="flex gap-4">
+          <label class="flex items-center gap-1 text-sm">
+            <input type="radio" name="perm-allow" value="allow" class="radio radio-sm" checked> 許可 (allow)
+          </label>
+          <label class="flex items-center gap-1 text-sm">
+            <input type="radio" name="perm-allow" value="deny" class="radio radio-sm"> 拒否 (deny)
+          </label>
+        </div>
+      </div>
+    </div>
+    <div class="modal-action">
+      <button type="button" id="perm-cancel" class="btn btn-sm">キャンセル</button>
+      <button type="submit" class="btn btn-sm btn-primary">付与</button>
+    </div>
+  </form>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+{% endblock %}
+
+{% block script %}
 <script>
-const $ = id => document.getElementById(id);
-let token = localStorage.getItem('yozist_token') || '';
 const fileId = location.pathname.split('/').pop();
 let currentFile = null;
 let currentContent = '';
 
-function api(path, opts = {}) {
-  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
-  return fetch(path, opts);
-}
-function json(path, opts) {
-  opts = opts || {};
-  if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof ArrayBuffer)) {
-    opts.body = JSON.stringify(opts.body);
-    opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
-  }
-  return api(path, opts).then(async r => {
-    if (!r.ok) return Promise.reject(r);
-    if (r.status === 204) return null;
-    const text = await r.text();
-    return text ? JSON.parse(text) : null;
-  });
-}
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-  })[c]);
-}
-function fmtTs(ts) {
-  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
-  if (Array.isArray(ts) && ts.length >= 5) {
-    const [y, doy, h, m, s] = ts;
-    const d = new Date(Date.UTC(y, 0, doy));
-    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(d.getUTCDate()).padStart(2, '0');
-    const pad = n => String(n).padStart(2, '0');
-    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
-  }
-  return String(ts ?? '');
-}
-function redirectToLogin() {
-  const next = encodeURIComponent(location.pathname + location.search);
-  location.href = '/ui/login?next=' + next;
-}
-function logout() {
-  localStorage.removeItem('yozist_token');
-  redirectToLogin();
-}
-$('logout').onclick = logout;
-
 async function init() {
-  if (!token) { redirectToLogin(); return; }
-  try {
-    const me = await json('/api/auth/me');
-    if (me.anonymous) { logout(); return; }
-    $('me').textContent = me.user.display_name || me.user.username;
-  } catch (e) { redirectToLogin(); return; }
-
+  const me = await requireAuth();
+  if (!me) return;
   try {
     currentFile = await json('/api/files/' + fileId);
   } catch (e) {
@@ -237,13 +194,14 @@ async function loadDetail() {
 }
 
 async function rollback(commitId, time) {
-  if (!confirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(新しいコミットとして記録されます)`)) return;
+  if (!await uiConfirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(新しいコミットとして記録されます)`, { danger: true, okText: '戻す' })) return;
   const r = await api(
     `/api/files/${fileId}/rollback/${commitId}?message=` +
       encodeURIComponent(`rollback to ${time}`),
     { method: 'POST' }
   );
-  if (!r.ok) return alert('rollback失敗: ' + await r.text());
+  if (!r.ok) { uiToast('rollback に失敗しました: ' + await r.text(), 'error'); return; }
+  uiToast('指定バージョンに戻しました', 'success');
   currentFile = await json('/api/files/' + fileId);
   await loadDetail();
 }
@@ -268,7 +226,8 @@ async function saveEdit() {
     body: new TextEncoder().encode(newContent).buffer,
     headers: { 'content-type': 'application/octet-stream' },
   });
-  if (!r.ok) return alert('保存失敗: ' + await r.text());
+  if (!r.ok) { uiToast('保存に失敗しました: ' + await r.text(), 'error'); return; }
+  uiToast('保存しました', 'success');
   currentFile = await json('/api/files/' + fileId);
   $('fd-editor').classList.add('hidden');
   await loadDetail();
@@ -282,74 +241,83 @@ async function addTag() {
     method: 'POST', body: JSON.stringify({ tag_id: created.id }),
     headers: { 'content-type': 'application/json' },
   });
-  if (!r.ok) return alert('タグ追加失敗: ' + await r.text());
+  if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
   $('fd-add-tag').value = '';
   await loadDetail();
 }
 
 async function detachTag(tagId) {
   const r = await api(`/api/files/${fileId}/tags/${tagId}`, { method: 'DELETE' });
-  if (!r.ok) return alert('タグ取り外し失敗');
+  if (!r.ok) { uiToast('タグの取り外しに失敗しました', 'error'); return; }
   await loadDetail();
 }
 
 async function addToSeries() {
   const sid = $('fd-add-series').value;
-  if (!sid) return alert('シリーズを選択してください');
-  await json(`/api/series/${sid}/members`, {
-    method: 'POST',
-    body: { file_id: fileId },
-  });
-  alert('追加しました');
+  if (!sid) { uiToast('シリーズを選択してください', 'warning'); return; }
+  try {
+    await json(`/api/series/${sid}/members`, { method: 'POST', body: { file_id: fileId } });
+    uiToast('シリーズに追加しました', 'success');
+  } catch (e) {
+    uiToast('シリーズ追加に失敗しました: ' + e.message, 'error');
+  }
 }
 
 async function issueShare() {
-  const ttl = prompt('有効秒数を入力してください', '3600');
-  if (!ttl) return;
-  const r = await json(`/api/files/${fileId}/share`, {
-    method: 'POST',
-    body: { ttl_secs: parseInt(ttl, 10) },
+  const r = await uiPrompt({
+    title: '共有URLの発行', okText: '発行',
+    fields: [{ name: 'ttl', label: '有効期限 (秒)', type: 'number', value: '3600' }],
   });
-  const fullUrl = location.origin + r.url;
-  $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${fullUrl}</a>`;
+  if (!r) return;
+  const ttl = parseInt(r.ttl, 10);
+  if (!ttl) { uiToast('有効期限を正しく入力してください', 'warning'); return; }
+  try {
+    const res = await json(`/api/files/${fileId}/share`, { method: 'POST', body: { ttl_secs: ttl } });
+    const fullUrl = location.origin + res.url;
+    $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${escapeHtml(fullUrl)}</a>`;
+    await uiCopyUrl(fullUrl, 'ファイル共有URL');
+  } catch (e) {
+    uiToast('共有URL発行に失敗しました: ' + e.message, 'error');
+  }
 }
 
 async function grantPermission() {
-  const users = await json('/api/users');
-  if (users.length === 0) return alert('ユーザーが存在しません');
-  const userListStr = users.map((u, i) => `${i + 1}: ${u.username}`).join('\n');
-  const sel = prompt(`権限を付与するユーザー番号:\n${userListStr}`, '1');
-  if (!sel) return;
-  const idx = parseInt(sel, 10) - 1;
-  if (isNaN(idx) || idx < 0 || idx >= users.length) return alert('無効な選択');
-  const target = users[idx];
-  const maskStr = prompt(
-    '権限マスク (VIEW=1 READ=2 WRITE=4 ADMIN=8 を合算):\nread=3, write=7, admin=15',
-    '3'
-  );
-  if (!maskStr) return;
-  const mask = parseInt(maskStr, 10);
-  if (isNaN(mask)) return alert('無効なマスク');
-  const allow = confirm('OK=allow / Cancel=deny');
-  await json('/api/acl', {
-    method: 'POST',
-    body: {
-      subject: `user:${target.id}`,
-      target: `file:${fileId}`,
-      mask, allow, priority: 10,
-    },
-  });
-  alert(`付与しました: ${target.username} に ${allow ? 'allow' : 'deny'} mask=${mask}`);
+  let users;
+  try { users = await json('/api/users'); }
+  catch (e) { uiToast('ユーザー取得に失敗しました', 'error'); return; }
+  if (users.length === 0) { uiToast('ユーザーが存在しません', 'warning'); return; }
+  $('perm-user').innerHTML = users.map(u =>
+    `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
+  $('perm-modal').showModal();
 }
 
+$('perm-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const sel = $('perm-user');
+  const userId = sel.value;
+  const uname = sel.options[sel.selectedIndex].text;
+  const mask = parseInt($('perm-mask').value, 10);
+  const allow = document.querySelector('input[name="perm-allow"]:checked').value === 'allow';
+  try {
+    await json('/api/acl', {
+      method: 'POST',
+      body: { subject: `user:${userId}`, target: `file:${fileId}`, mask, allow, priority: 10 },
+    });
+    $('perm-modal').close();
+    uiToast(`${uname} に ${allow ? '許可' : '拒否'} (mask=${mask}) を付与しました`, 'success');
+  } catch (err) {
+    uiToast('権限付与に失敗しました: ' + err.message, 'error');
+  }
+};
+$('perm-cancel').onclick = () => $('perm-modal').close();
+
 async function deleteFile() {
-  if (!confirm(`"${currentFile.display_name}" を削除しますか？`)) return;
+  if (!await uiConfirm(`"${currentFile.display_name}" を削除しますか？`, { danger: true, okText: '削除' })) return;
   const r = await api(`/api/files/${fileId}`, { method: 'DELETE' });
-  if (!r.ok) return alert('削除失敗: ' + await r.text());
+  if (!r.ok) { uiToast('削除に失敗しました: ' + await r.text(), 'error'); return; }
   location.href = '/ui/files';
 }
 
 init();
 </script>
-</body>
-</html>
+{% endblock %}

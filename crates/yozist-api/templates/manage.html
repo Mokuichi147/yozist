@@ -1,0 +1,290 @@
+{% extends "base.html" %}
+{% block title %}yozist - 管理{% endblock %}
+
+{% block content %}
+<div id="main" class="hidden max-w-3xl mx-auto p-4 space-y-4">
+
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">groups</h2>
+        <button class="btn btn-xs" onclick="createGroup()">+ 新規</button>
+      </div>
+      <div id="group-list" class="text-sm space-y-1">…</div>
+    </div>
+  </div>
+
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">saved queries</h2>
+        <button class="btn btn-xs" onclick="createQuery()">+ 新規</button>
+      </div>
+      <div id="query-list" class="text-sm space-y-1">…</div>
+    </div>
+  </div>
+
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">active shares</h2>
+        <button class="btn btn-xs btn-ghost" onclick="loadShares()">refresh</button>
+      </div>
+      <div id="share-list" class="text-sm space-y-1">…</div>
+    </div>
+  </div>
+
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">audit log</h2>
+        <button class="btn btn-xs btn-ghost" onclick="loadAudit()">refresh</button>
+      </div>
+      <div id="audit-list" class="text-sm space-y-1">…</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- グループメンバー管理モーダル -->
+<dialog id="gm-modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg break-all">グループ「<span id="gm-name"></span>」のメンバー</h3>
+    <div class="mt-3">
+      <h4 class="text-xs uppercase tracking-wider opacity-60 mb-1">現在のメンバー</h4>
+      <div id="gm-members" class="space-y-1">…</div>
+    </div>
+    <div class="mt-4">
+      <h4 class="text-xs uppercase tracking-wider opacity-60 mb-1">ユーザーを追加</h4>
+      <div class="join w-full">
+        <select id="gm-add-select" class="select select-bordered select-sm join-item w-full"></select>
+        <button id="gm-add-btn" class="btn btn-sm join-item btn-primary">追加</button>
+      </div>
+    </div>
+    <div class="modal-action">
+      <button id="gm-close" class="btn btn-sm">閉じる</button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+{% endblock %}
+
+{% block script %}
+<script>
+async function init() {
+  const me = await requireAuth();
+  if (!me) return;
+  $('main').classList.remove('hidden');
+  await refresh();
+}
+
+async function refresh() {
+  await Promise.all([loadGroups(), loadQueries(), loadShares(), loadAudit()]);
+}
+
+// ---- groups ----
+async function loadGroups() {
+  const el = $('group-list');
+  try {
+    const list = await json('/api/groups');
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">グループなし</div>'; return; }
+    el.innerHTML = list.map(g => {
+      return `<div class="flex items-center justify-between row-compact">
+        <div><span class="font-semibold">${escapeHtml(g.name)}</span></div>
+        <button class="btn btn-xs" onclick="manageGroupMembers('${g.id}','${escapeHtml(g.name)}')">メンバー</button>
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+}
+
+async function createGroup() {
+  const r = await uiPrompt({
+    title: 'グループの作成', okText: '作成',
+    fields: [{ name: 'name', label: 'グループ名', placeholder: '例: 編集チーム' }],
+  });
+  if (!r || !r.name.trim()) return;
+  try {
+    await json('/api/groups', { method: 'POST', body: { name: r.name.trim() } });
+    uiToast('グループを作成しました', 'success');
+    await loadGroups();
+  } catch (e) { uiToast('作成に失敗しました: ' + e.message, 'error'); }
+}
+
+let gmGroupId = null;
+async function manageGroupMembers(groupId, groupName) {
+  gmGroupId = groupId;
+  $('gm-name').textContent = groupName;
+  await renderGroupMembers();
+  $('gm-modal').showModal();
+}
+
+async function renderGroupMembers() {
+  const [members, users] = await Promise.all([
+    json(`/api/groups/${gmGroupId}/members`),
+    json('/api/users'),
+  ]);
+  const usersById = Object.fromEntries(users.map(u => [u.id, u.username]));
+  const mEl = $('gm-members');
+  mEl.innerHTML = members.length === 0
+    ? '<div class="opacity-50 text-xs">メンバーなし</div>'
+    : members.map(uid => `<div class="flex items-center justify-between row-compact">
+        <span>${escapeHtml(usersById[uid] || uid.slice(0, 8))}</span>
+        <button class="btn btn-xs btn-error btn-outline" onclick="removeMember('${uid}')">除外</button>
+      </div>`).join('');
+  // 追加候補 = 未所属ユーザー
+  const memberSet = new Set(members);
+  const candidates = users.filter(u => !memberSet.has(u.id));
+  const sel = $('gm-add-select');
+  sel.innerHTML = candidates.length === 0
+    ? '<option value="">(追加できるユーザーなし)</option>'
+    : candidates.map(u => `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
+  sel.disabled = candidates.length === 0;
+  $('gm-add-btn').disabled = candidates.length === 0;
+}
+
+async function addMember() {
+  const uid = $('gm-add-select').value;
+  if (!uid) return;
+  try {
+    await api(`/api/groups/${gmGroupId}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ user_id: uid }),
+      headers: { 'content-type': 'application/json' },
+    });
+    uiToast('追加しました', 'success');
+    await renderGroupMembers();
+  } catch (e) { uiToast('追加に失敗しました', 'error'); }
+}
+
+async function removeMember(uid) {
+  if (!await uiConfirm('このメンバーを除外しますか？', { danger: true })) return;
+  try {
+    await api(`/api/groups/${gmGroupId}/members/${uid}`, { method: 'DELETE' });
+    uiToast('除外しました', 'success');
+    await renderGroupMembers();
+  } catch (e) { uiToast('除外に失敗しました', 'error'); }
+}
+
+// ---- saved queries ----
+async function loadQueries() {
+  const el = $('query-list');
+  try {
+    const list = await json('/api/queries');
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">保存クエリなし</div>'; return; }
+    el.innerHTML = list.map(q => {
+      const cond = [];
+      if (q.query.tags_and && q.query.tags_and.length) cond.push('AND: ' + q.query.tags_and.join(','));
+      if (q.query.tags_not && q.query.tags_not.length) cond.push('NOT: ' + q.query.tags_not.join(','));
+      return `<div class="flex items-center justify-between row-compact">
+        <div>
+          <span class="font-semibold">${escapeHtml(q.name)}</span>
+          <span class="text-xs opacity-60 ml-1">${cond.join(' / ') || '全件'}</span>
+        </div>
+        <div class="flex gap-1">
+          <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
+          <button class="btn btn-xs btn-error btn-outline" onclick="deleteQuery('${q.id}')">削除</button>
+        </div>
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+}
+
+async function createQuery() {
+  const r = await uiPrompt({
+    title: '保存クエリの作成', okText: '作成',
+    fields: [
+      { name: 'name', label: 'クエリ名', placeholder: '例: 仕事メモ' },
+      { name: 'and', label: 'ANDタグ (カンマ区切り、空可)', placeholder: '仕事, 2026' },
+      { name: 'not', label: 'NOTタグ (カンマ区切り、空可)' },
+    ],
+  });
+  if (!r || !r.name.trim()) return;
+  const body = {
+    name: r.name.trim(),
+    tags_and: r.and ? r.and.split(',').map(s => s.trim()).filter(Boolean) : [],
+    tags_not: r.not ? r.not.split(',').map(s => s.trim()).filter(Boolean) : [],
+  };
+  try {
+    await json('/api/queries', { method: 'POST', body });
+    uiToast('保存クエリを作成しました', 'success');
+    await loadQueries();
+  } catch (e) { uiToast('作成に失敗しました: ' + e.message, 'error'); }
+}
+
+async function deleteQuery(id) {
+  if (!await uiConfirm('この保存クエリを削除しますか？', { danger: true })) return;
+  try {
+    await api(`/api/queries/${id}`, { method: 'DELETE' });
+    uiToast('削除しました', 'success');
+    await loadQueries();
+  } catch (e) { uiToast('削除に失敗しました', 'error'); }
+}
+
+async function shareQuery(id, name) {
+  const r = await uiPrompt({
+    title: `「${name}」の共有URLを発行`, okText: '発行',
+    fields: [{ name: 'ttl', label: '有効期限 (秒)', type: 'number', value: '3600' }],
+  });
+  if (!r) return;
+  const ttl = parseInt(r.ttl, 10);
+  if (!ttl) { uiToast('有効期限を正しく入力してください', 'warning'); return; }
+  try {
+    const res = await json(`/api/queries/${id}/share`, { method: 'POST', body: { ttl_secs: ttl } });
+    await loadShares();
+    await uiCopyUrl(location.origin + res.url, 'クエリ共有URL');
+  } catch (e) { uiToast('共有URL発行に失敗しました: ' + e.message, 'error'); }
+}
+
+// ---- active shares ----
+async function loadShares() {
+  const el = $('share-list');
+  try {
+    const list = await json('/api/shares');
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">発行済み共有なし</div>'; return; }
+    el.innerHTML = list.map(s => {
+      const revoked = s.revoked_at ? ' <span class="badge badge-error badge-sm">失効</span>' : '';
+      const fullJti = s.jti;
+      return `<div class="flex items-center justify-between row-compact">
+        <span><span class="badge badge-ghost badge-sm">${escapeHtml(s.kind)}</span>
+          <span class="opacity-70">${s.target_id.slice(0,8)}…</span>${revoked}</span>
+        ${!s.revoked_at ? `<button class="btn btn-xs btn-error btn-outline" onclick="revokeShare('${fullJti}')">失効</button>` : ''}
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+}
+
+async function revokeShare(jti) {
+  if (!await uiConfirm('この共有を失効しますか？', { danger: true })) return;
+  const r = await api(`/api/shares/${jti}`, { method: 'DELETE' });
+  if (!r.ok) { uiToast('失効に失敗しました', 'error'); return; }
+  uiToast('失効しました', 'success');
+  await loadShares();
+}
+
+// ---- audit log ----
+async function loadAudit() {
+  const el = $('audit-list');
+  try {
+    const list = await json('/api/audit?limit=15');
+    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">監査記録なし</div>'; return; }
+    el.innerHTML = list.map(a => {
+      const ok = a.result.startsWith('ok');
+      const status = ok
+        ? '<span class="text-success">✓</span>'
+        : '<span class="text-error">✗</span>';
+      const time = fmtTs(a.timestamp);
+      return `<div class="row-compact text-xs">
+        ${status} <span class="opacity-70">${time}</span>
+        <span class="font-semibold">${escapeHtml(a.actor_label || '-')}</span>
+        ${escapeHtml(a.action)} ${escapeHtml(a.target_type || '')}
+        ${a.target_ref ? '<span class="opacity-60">'+a.target_ref.slice(0,8)+'…</span>' : ''}
+      </div>`;
+    }).join('');
+  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+}
+
+$('gm-close').onclick = () => $('gm-modal').close();
+$('gm-add-btn').onclick = addMember;
+init();
+</script>
+{% endblock %}

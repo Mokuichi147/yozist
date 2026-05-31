@@ -1,15 +1,13 @@
-//! 最小 WebUI。`/ui` 配下にブラウザから閲覧・操作可能な単一ページを提供する。
+//! WebUI。`/ui` 配下にブラウザから閲覧・操作可能なページ群を提供する。
 //!
-//! - SSR は使わず、静的 HTML + JS で REST API を叩く SPA 風実装。
-//! - SMB / REST / WebUI のいずれも同じ MetaStore を参照することを実証する。
-//!
-//! # TODO
-//! - [ ] leptos / askama 等のテンプレートエンジン統合
-//! - [ ] ファイルアップロード UI
-//! - [ ] タグ・シリーズの GUI 編集
-//! - [ ] 共有 URL（期限付き）の発行 UI
+//! - HTML は askama テンプレート (`templates/`) で生成し、共通レイアウト・ナビゲーション・
+//!   ダイアログ基盤を `base.html` に集約する。各ページはそれを `extends` した静的シェル + JS。
+//! - JS から REST API を叩く SPA 風実装。SMB / REST / WebUI のいずれも同じ MetaStore を参照する。
+//! - ダイアログは daisyUI のモーダル / トーストで実装し、ブラウザの prompt/confirm/alert は使わない。
 
+use askama::Template;
 use axum::{
+    http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
@@ -20,44 +18,102 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/", get(index))
         .route("/login", get(login_page))
         .route("/settings", get(settings_page))
+        .route("/manage", get(manage_page))
         .route("/files", get(files_page))
         .route("/files/:id", get(file_detail_page))
         .route("/files/:id/compare", get(file_compare_page))
         .route("/files/:id/histories/:cid", get(file_commit_page))
 }
 
+/// askama テンプレートを描画して HTML レスポンスにする。
+fn render(tpl: impl Template) -> Response {
+    match tpl.render() {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => {
+            tracing::error!("template render error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "template error").into_response()
+        }
+    }
+}
+
+/// 各ページは `base.html` を extends した askama テンプレート。
+/// `active` は navbar のタブ強調用 ("" = 強調なし)。
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "settings.html")]
+struct SettingsTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "manage.html")]
+struct ManageTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "files.html")]
+struct FilesTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "file_detail.html")]
+struct FileDetailTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "compare.html")]
+struct FileCompareTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "file_commit.html")]
+struct FileCommitTemplate {
+    active: &'static str,
+}
+
 async fn index() -> Response {
-    Html(INDEX_HTML).into_response()
+    render(IndexTemplate { active: "" })
 }
 
 async fn login_page() -> Response {
-    Html(LOGIN_HTML).into_response()
+    render(LoginTemplate { active: "login" })
 }
 
 async fn settings_page() -> Response {
-    Html(SETTINGS_HTML).into_response()
+    render(SettingsTemplate { active: "settings" })
+}
+
+async fn manage_page() -> Response {
+    render(ManageTemplate { active: "manage" })
 }
 
 async fn files_page() -> Response {
-    Html(FILES_HTML).into_response()
+    render(FilesTemplate { active: "files" })
 }
 
 async fn file_detail_page() -> Response {
-    Html(FILE_DETAIL_HTML).into_response()
+    render(FileDetailTemplate { active: "" })
 }
 
 async fn file_compare_page() -> Response {
-    Html(FILE_COMPARE_HTML).into_response()
+    render(FileCompareTemplate { active: "" })
 }
 
 async fn file_commit_page() -> Response {
-    Html(FILE_COMMIT_HTML).into_response()
+    render(FileCommitTemplate { active: "" })
 }
-
-const INDEX_HTML: &str = include_str!("ui/index.html");
-const LOGIN_HTML: &str = include_str!("ui/login.html");
-const SETTINGS_HTML: &str = include_str!("ui/settings.html");
-const FILES_HTML: &str = include_str!("ui/files.html");
-const FILE_DETAIL_HTML: &str = include_str!("ui/file_detail.html");
-const FILE_COMPARE_HTML: &str = include_str!("ui/compare.html");
-const FILE_COMMIT_HTML: &str = include_str!("ui/file_commit.html");

@@ -72,6 +72,9 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 
+# テンプレートエンジン (WebUI の HTML 生成)
+askama = "0.16"
+
 # Auth
 # 認証・ユーザー/グループ管理は upstream user-permission-core (crates.io) に委譲する。
 # サーバ本体 (user-permission クレート) は中継先として別プロセスで動かす想定のため

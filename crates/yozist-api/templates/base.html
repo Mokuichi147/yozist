@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}yozist{% endblock %}</title>
+<script>
+  // OS のダーク設定に追従 (Tailwind/daisyUI が DOM を見る前に data-theme を確定させる)
+  document.documentElement.setAttribute(
+    'data-theme',
+    window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  );
+</script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/daisyui.css" rel="stylesheet" type="text/css" />
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  /* CDN ロード完了前のフラッシュ防止 */
+  .hidden { display: none !important; }
+  /* row-compact: Tailwind 拡張に頼らず純 CSS で */
+  .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
+  .row-compact:hover { background: rgba(127,127,127,0.12); }
+{% block style %}{% endblock %}
+</style>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
+  <div class="flex-1 px-2 flex items-center gap-3">
+    <a href="/ui" class="text-xl font-bold">yozist</a>
+    {% if active != "login" %}
+    <div class="tabs tabs-boxed tabs-sm">
+      <a href="/ui/files" class="tab {% if active == "files" %}tab-active{% endif %}">ファイル</a>
+      <a href="/ui/manage" class="tab {% if active == "manage" %}tab-active{% endif %}">管理</a>
+      {% block subtabs %}{% endblock %}
+    </div>
+    {% endif %}
+  </div>
+  {% if active != "login" %}
+  <div class="flex-none flex items-center gap-3 px-2">
+    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
+    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  </div>
+  {% endif %}
+</div>
+
+{% block content %}{% endblock %}
+
+<!-- ===== 共通ダイアログ基盤 (daisyUI ネイティブ modal / toast) ===== -->
+<dialog id="ui-confirm" class="modal">
+  <div class="modal-box max-w-sm">
+    <h3 id="ui-confirm-title" class="font-bold text-lg"></h3>
+    <p id="ui-confirm-msg" class="py-3 whitespace-pre-wrap text-sm"></p>
+    <div class="modal-action">
+      <button id="ui-confirm-cancel" class="btn btn-sm">キャンセル</button>
+      <button id="ui-confirm-ok" class="btn btn-sm btn-primary">OK</button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<dialog id="ui-prompt" class="modal">
+  <form id="ui-prompt-form" class="modal-box max-w-md">
+    <h3 id="ui-prompt-title" class="font-bold text-lg mb-3"></h3>
+    <div id="ui-prompt-fields" class="space-y-3"></div>
+    <div class="modal-action">
+      <button type="button" id="ui-prompt-cancel" class="btn btn-sm">キャンセル</button>
+      <button type="submit" id="ui-prompt-ok" class="btn btn-sm btn-primary">OK</button>
+    </div>
+  </form>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<div id="ui-toasts" class="toast toast-top toast-end z-50"></div>
+
+<!-- ===== 共通スクリプト (全ページ共有) ===== -->
+<script>
+const $ = id => document.getElementById(id);
+let token = localStorage.getItem('yozist_token') || '';
+
+function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
+  return fetch(path, opts);
+}
+function json(path, opts) {
+  opts = opts || {};
+  if (opts.body && typeof opts.body === 'object' && !(opts.body instanceof ArrayBuffer)) {
+    opts.body = JSON.stringify(opts.body);
+    opts.headers = Object.assign({}, opts.headers, { 'content-type': 'application/json' });
+  }
+  return api(path, opts).then(async r => {
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      const err = new Error(text || r.statusText);
+      err.status = r.status;
+      err.response = r;
+      return Promise.reject(err);
+    }
+    if (r.status === 204) return null;
+    const text = await r.text();
+    return text ? JSON.parse(text) : null;
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+
+// API は timestamp を ISO 文字列で返す場合と
+// time::OffsetDateTime のシリアライズ形式 ([year, day_of_year, h, m, s, ns, ...]) で返す場合がある
+function fmtTs(ts) {
+  if (typeof ts === 'string') return ts.replace('T', ' ').slice(0, 19);
+  if (Array.isArray(ts) && ts.length >= 5) {
+    const [y, doy, h, m, s] = ts;
+    const d = new Date(Date.UTC(y, 0, doy));
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const pad = n => String(n).padStart(2, '0');
+    return `${y}-${mm}-${dd} ${pad(h)}:${pad(m)}:${pad(s)}`;
+  }
+  return String(ts ?? '');
+}
+
+function redirectToLogin() {
+  const next = encodeURIComponent(location.pathname + location.search);
+  location.href = '/ui/login?next=' + next;
+}
+function logout() {
+  localStorage.removeItem('yozist_token');
+  token = '';
+  redirectToLogin();
+}
+if ($('logout')) $('logout').onclick = logout;
+
+// ログイン必須ページの共通初期化。認証OKなら me を返し、navbar のユーザー名を反映する。
+async function requireAuth() {
+  if (!token) { redirectToLogin(); return null; }
+  try {
+    const me = await json('/api/auth/me');
+    if (me.anonymous) { logout(); return null; }
+    const meEl = $('me');
+    if (meEl) meEl.textContent = me.user.display_name || me.user.username;
+    return me;
+  } catch (e) { logout(); return null; }
+}
+
+// ---- トースト通知 (alert の置換) ----
+function uiToast(msg, type = 'info') {
+  const cont = $('ui-toasts');
+  const cls = type === 'success' ? 'alert-success'
+            : type === 'error' ? 'alert-error'
+            : type === 'warning' ? 'alert-warning' : 'alert-info';
+  const el = document.createElement('div');
+  el.className = 'alert ' + cls + ' py-2 text-sm shadow';
+  el.setAttribute('role', 'alert');
+  el.textContent = msg;
+  cont.appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+
+// ---- 確認ダイアログ (confirm の置換) → Promise<boolean> ----
+function uiConfirm(message, opts = {}) {
+  return new Promise(resolve => {
+    const dlg = $('ui-confirm');
+    $('ui-confirm-title').textContent = opts.title || '確認';
+    $('ui-confirm-msg').textContent = message;
+    const okBtn = $('ui-confirm-ok');
+    okBtn.className = 'btn btn-sm ' + (opts.danger ? 'btn-error' : 'btn-primary');
+    okBtn.textContent = opts.okText || 'OK';
+    let done = false;
+    const finish = v => { if (done) return; done = true; dlg.close(); resolve(v); };
+    okBtn.onclick = () => finish(true);
+    $('ui-confirm-cancel').onclick = () => finish(false);
+    dlg.onclose = () => finish(false);
+    dlg.showModal();
+  });
+}
+
+// ---- 入力ダイアログ (prompt の置換) → Promise<object|null> ----
+// fields: [{ name, label, type?('text'|'textarea'|'select'|'password'), value?, placeholder?, hint?, options?, readonly? }]
+function uiPrompt(opts) {
+  return new Promise(resolve => {
+    const dlg = $('ui-prompt');
+    $('ui-prompt-title').textContent = opts.title || '';
+    $('ui-prompt-ok').textContent = opts.okText || 'OK';
+    const fieldsEl = $('ui-prompt-fields');
+    fieldsEl.innerHTML = '';
+    const inputs = {};
+    (opts.fields || []).forEach(f => {
+      const wrap = document.createElement('div');
+      const label = document.createElement('label');
+      label.className = 'block text-sm mb-1';
+      label.textContent = f.label || f.name;
+      wrap.appendChild(label);
+      let input;
+      if (f.type === 'textarea') {
+        input = document.createElement('textarea');
+        input.className = 'textarea textarea-bordered w-full text-sm';
+        input.rows = f.rows || 3;
+      } else if (f.type === 'select') {
+        input = document.createElement('select');
+        input.className = 'select select-bordered select-sm w-full';
+        (f.options || []).forEach(o => {
+          const opt = document.createElement('option');
+          opt.value = o.value;
+          opt.textContent = o.label;
+          input.appendChild(opt);
+        });
+      } else {
+        input = document.createElement('input');
+        input.type = f.type || 'text';
+        input.className = 'input input-bordered input-sm w-full';
+      }
+      if (f.placeholder) input.placeholder = f.placeholder;
+      if (f.value != null) input.value = f.value;
+      if (f.readonly) input.readOnly = true;
+      inputs[f.name] = input;
+      wrap.appendChild(input);
+      if (f.hint) {
+        const h = document.createElement('p');
+        h.className = 'text-xs opacity-60 mt-1';
+        h.textContent = f.hint;
+        wrap.appendChild(h);
+      }
+      fieldsEl.appendChild(wrap);
+    });
+    const form = $('ui-prompt-form');
+    let done = false;
+    const finish = v => { if (done) return; done = true; dlg.close(); resolve(v); };
+    form.onsubmit = e => {
+      e.preventDefault();
+      const out = {};
+      for (const k in inputs) out[k] = inputs[k].value;
+      finish(out);
+    };
+    $('ui-prompt-cancel').onclick = () => finish(null);
+    dlg.onclose = () => finish(null);
+    dlg.showModal();
+    const first = fieldsEl.querySelector('input,textarea,select');
+    if (first) setTimeout(() => { first.focus(); if (first.readOnly) first.select(); }, 50);
+  });
+}
+
+// ---- 共有URL 表示＋コピー (旧 prompt によるURL表示の置換) ----
+async function uiCopyUrl(url, title) {
+  const r = await uiPrompt({
+    title: title || '共有URL',
+    okText: 'コピー',
+    fields: [{ name: 'url', label: '以下のURLをコピーしてください', value: url, readonly: true }],
+  });
+  if (r) {
+    try {
+      await navigator.clipboard.writeText(url);
+      uiToast('URLをコピーしました', 'success');
+    } catch (e) {
+      uiToast('コピーに失敗しました。手動で選択してください。', 'warning');
+    }
+  }
+}
+</script>
+{% block script %}{% endblock %}
+</body>
+</html>
