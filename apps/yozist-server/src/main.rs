@@ -11,6 +11,7 @@
 //! 3. 設定ファイル（`--config` で指定）
 //! 4. デフォルト値
 
+use axum::extract::DefaultBodyLimit;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -157,7 +158,10 @@ async fn main() -> anyhow::Result<()> {
                 share_admin,
                 smb_creds,
             };
-            let app = yozist_api::router(state);
+            // 動画・zip など大容量ファイルの登録を許可するため、axum のリクエスト
+            // ボディ上限（既定 2MB）を撤廃する。バッファリング系エクストラクタ
+            // （`Bytes` 等）の length-limit チェックを無効化する。
+            let app = yozist_api::router(state).layer(DefaultBodyLimit::disable());
 
             // SMB を別タスクで起動
             let smb_task = smb_built.map(|built| {
