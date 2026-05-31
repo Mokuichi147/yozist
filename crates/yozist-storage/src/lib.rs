@@ -15,12 +15,18 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use yozist_core::BlobId;
 
 pub mod fs;
 pub use fs::FsBlobStore;
+
+/// blob をストリーミング保存する際の入力ストリーム。
+/// HTTP ボディ等を 1 チャンクずつ流し込み、メモリに全体を載せずに保存する。
+pub type ByteStream = BoxStream<'static, Result<Bytes, StorageError>>;
 
 /// blob 保存のための統一インターフェース。
 #[async_trait]
@@ -31,6 +37,20 @@ pub trait BlobStore: Send + Sync {
     async fn get(&self, id: &BlobId) -> Result<Bytes, StorageError>;
     /// blob の存在確認。
     async fn exists(&self, id: &BlobId) -> Result<bool, StorageError>;
+
+    /// ストリームを逐次保存し、`(コンテンツアドレス, 生バイト長)` を返す。
+    ///
+    /// デフォルト実装はストリームをメモリに集約してから `put` を呼ぶ
+    /// （後方互換のためのフォールバック）。大容量を一定メモリで扱う実装は
+    /// このメソッドをオーバーライドする（`FsBlobStore` 参照）。
+    async fn put_stream(&self, mut stream: ByteStream) -> Result<(BlobId, u64), StorageError> {
+        let mut buf = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk?);
+        }
+        let id = self.put(&buf).await?;
+        Ok((id, buf.len() as u64))
+    }
 }
 
 /// 動的ディスパッチ用の共有エイリアス。

@@ -65,6 +65,11 @@ impl CrdtFormat for LwwFormat {
     fn detect(&self, _hint: &FormatHint) -> bool {
         true // フォールバックなので常に true
     }
+    fn supports_streaming(&self) -> bool {
+        // LWW は load→serialize が恒等なので、正規化を介さず生バイトを
+        // そのまま blob へストリーム保存してよい。
+        true
+    }
     async fn load(&self, bytes: &[u8]) -> Result<CrdtState, VersioningError> {
         Ok(CrdtState {
             inner: Box::new(bytes.to_vec()),

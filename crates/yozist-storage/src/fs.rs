@@ -9,17 +9,24 @@
 //! - [ ] 既圧縮ファイル（mp4/zip 等）の検出と無圧縮保存
 //! - [ ] ファイルロック（複数プロセス起動時）
 
+use async_compression::tokio::write::ZstdEncoder;
+use async_compression::Level;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use yozist_core::BlobId;
 
-use crate::{BlobStore, StorageError};
+use crate::{BlobStore, ByteStream, StorageError};
 
 const ZSTD_LEVEL: i32 = 3;
+
+/// `put_stream` の一時ファイル名を同一プロセス内で衝突させないための連番。
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// ローカルファイルシステム上の CAS 実装。
 pub struct FsBlobStore {
@@ -42,6 +49,22 @@ impl FsBlobStore {
     fn hash(content: &[u8]) -> BlobId {
         let digest = Sha256::digest(content);
         BlobId::from_hex(hex_encode(&digest))
+    }
+
+    /// `put_stream` 用の一時ファイル置き場（`<root>/.tmp`）。
+    fn tmp_dir(&self) -> PathBuf {
+        self.root.join(".tmp")
+    }
+
+    /// 同一プロセス内で衝突しない一時ファイルパスを返す。
+    fn unique_tmp_path(&self) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.tmp_dir()
+            .join(format!("{}-{}-{}.tmp", std::process::id(), nanos, seq))
     }
 }
 
@@ -85,6 +108,52 @@ impl BlobStore for FsBlobStore {
 
     async fn exists(&self, id: &BlobId) -> Result<bool, StorageError> {
         Ok(fs::try_exists(self.blob_path(id)).await.unwrap_or(false))
+    }
+
+    /// ストリームを逐次 zstd 圧縮しながら一時ファイルへ書き込み、生バイトの
+    /// sha256 を逐次計算する。完了後にコンテンツアドレスへ rename する。
+    /// オンディスク形式は `put` と同じ単一 zstd フレームなので `get` は無変更。
+    async fn put_stream(&self, mut stream: ByteStream) -> Result<(BlobId, u64), StorageError> {
+        let tmp_dir = self.tmp_dir();
+        fs::create_dir_all(&tmp_dir).await?;
+        let tmp = self.unique_tmp_path();
+
+        let file = fs::File::create(&tmp).await?;
+        let mut encoder = ZstdEncoder::with_quality(file, Level::Precise(ZSTD_LEVEL));
+        let mut hasher = Sha256::new();
+        let mut total: u64 = 0;
+
+        // 書き込みループ。途中失敗時は一時ファイルを掃除して返す。
+        let write_result = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                hasher.update(&chunk);
+                total += chunk.len() as u64;
+                encoder.write_all(&chunk).await?;
+            }
+            encoder.shutdown().await?;
+            Ok::<(), StorageError>(())
+        }
+        .await;
+
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+
+        let id = BlobId::from_hex(hex_encode(&hasher.finalize()));
+        let path = self.blob_path(&id);
+
+        // 既存（同一内容）なら一時ファイルを破棄して冪等に返す。
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            let _ = fs::remove_file(&tmp).await;
+            return Ok((id, total));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::rename(&tmp, &path).await?;
+        Ok((id, total))
     }
 }
 
@@ -131,6 +200,38 @@ mod tests {
         let store = FsBlobStore::new(dir.path()).await.unwrap();
         let a = store.put(b"same").await.unwrap();
         let b = store.put(b"same").await.unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn put_stream_roundtrip_matches_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).await.unwrap();
+
+        // 複数チャンクに分割したストリームを保存。
+        let chunks: Vec<Result<Bytes, StorageError>> = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"streamed ")),
+            Ok(Bytes::from_static(b"yozist")),
+        ];
+        let stream = futures::stream::iter(chunks).boxed();
+        let (id, size) = store.put_stream(stream).await.unwrap();
+
+        // 内容・サイズが復元でき、同一バイトを `put` した結果と同じアドレスになる。
+        let got = store.get(&id).await.unwrap();
+        assert_eq!(&got[..], b"hello streamed yozist");
+        assert_eq!(size, b"hello streamed yozist".len() as u64);
+        let put_id = store.put(b"hello streamed yozist").await.unwrap();
+        assert_eq!(id, put_id);
+    }
+
+    #[tokio::test]
+    async fn put_stream_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).await.unwrap();
+        let mk = || futures::stream::iter(vec![Ok::<_, StorageError>(Bytes::from_static(b"dup"))]).boxed();
+        let (a, _) = store.put_stream(mk()).await.unwrap();
+        let (b, _) = store.put_stream(mk()).await.unwrap();
         assert_eq!(a, b);
     }
 }
