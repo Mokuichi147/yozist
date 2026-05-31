@@ -19,7 +19,8 @@
       <div class="flex items-start justify-between gap-2">
         <h2 id="fd-name" class="card-title text-lg break-all">…</h2>
         <div class="flex flex-wrap gap-2 shrink-0">
-          <button class="btn btn-sm" onclick="toggleEdit()">編集</button>
+          <button id="fd-edit-btn" class="btn btn-sm hidden" onclick="toggleEdit()">編集</button>
+          <button class="btn btn-sm" onclick="downloadContent()">ダウンロード</button>
           <button class="btn btn-sm" onclick="issueShare()">共有URL</button>
           <button class="btn btn-sm" onclick="grantPermission()">権限付与</button>
           <button class="btn btn-sm btn-error btn-outline" onclick="deleteFile()">削除</button>
@@ -63,8 +64,7 @@
         <input type="checkbox" checked>
         <div class="collapse-title text-sm font-semibold py-2 min-h-0">content</div>
         <div class="collapse-content">
-          <pre id="fd-content"
-               class="bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[60vh] whitespace-pre-wrap break-words">…</pre>
+          <div id="fd-content" class="min-h-[2rem]">…</div>
         </div>
       </div>
 
@@ -123,6 +123,50 @@
 const fileId = location.pathname.split('/').pop();
 let currentFile = null;
 let currentContent = '';
+let canEdit = false;          // 現在の content がテキスト編集可能か
+let contentObjectUrl = null;  // メディアプレビュー用の object URL
+
+// 拡張子 → MIME（mime 未設定ファイルのフォールバック）
+const EXT_MIME = {
+  png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif',
+  webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp', ico:'image/x-icon', avif:'image/avif',
+  mp4:'video/mp4', webm:'video/webm', ogv:'video/ogg', mov:'video/quicktime', m4v:'video/x-m4v', mkv:'video/x-matroska',
+  mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg', flac:'audio/flac', m4a:'audio/mp4', aac:'audio/aac',
+  pdf:'application/pdf',
+};
+// 拡張子だけでテキストと判断できるもの（mime 未設定でもプレビューする）
+const TEXT_EXT = new Set([
+  'txt','md','markdown','json','xml','html','htm','css','js','mjs','ts','tsx','jsx',
+  'csv','tsv','yaml','yml','toml','ini','cfg','conf','log','sh','bash','zsh','py',
+  'rs','go','c','h','cpp','hpp','cc','java','kt','rb','php','sql','svg',
+]);
+
+function extOf(name) { return (name.split('.').pop() || '').toLowerCase(); }
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+}
+
+// content の表示種別を判定（mime 優先、なければ拡張子）
+function mediaKind(mime, name) {
+  const m = (mime || '').toLowerCase();
+  const ext = extOf(name);
+  if (m.startsWith('image/') || /^(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/.test(ext)) return 'image';
+  if (m.startsWith('video/') || /^(mp4|webm|ogv|mov|m4v|mkv)$/.test(ext)) return 'video';
+  if (m.startsWith('audio/') || /^(mp3|wav|ogg|oga|flac|m4a|aac)$/.test(ext)) return 'audio';
+  if (m === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (m.startsWith('text/') || /(json|xml|javascript|csv|yaml|x-sh)/.test(m) || TEXT_EXT.has(ext)) return 'text';
+  return 'unknown';
+}
+
+// レンダリングや Blob 生成に使う MIME を決める
+function effectiveMime() {
+  return currentFile.mime || EXT_MIME[extOf(currentFile.display_name)] || 'application/octet-stream';
+}
 
 async function init() {
   const me = await requireAuth();
@@ -148,15 +192,15 @@ async function loadSeriesOptions() {
 
 async function loadDetail() {
   $('fd-name').textContent = currentFile.display_name;
-  $('fd-meta').textContent = `id=${currentFile.id}, size=${currentFile.size}B, current_commit=${currentFile.current_commit}`;
+  $('fd-meta').textContent =
+    `id=${currentFile.id}, size=${fmtSize(currentFile.size)}, ` +
+    `mime=${currentFile.mime || '—'}, current_commit=${currentFile.current_commit}`;
   $('fd-share').textContent = '';
+  await Promise.all([loadTags(), loadHistory(), renderContent()]);
+}
 
-  const [tags, content, history] = await Promise.all([
-    json(`/api/files/${fileId}/tags`),
-    api(`/api/files/${fileId}/content`).then(r => r.text()),
-    json(`/api/files/${fileId}/history`),
-  ]);
-  currentContent = content;
+async function loadTags() {
+  const tags = await json(`/api/files/${fileId}/tags`);
   $('fd-tags').innerHTML = tags.length === 0
     ? '<span class="opacity-50 text-xs">タグなし</span>'
     : tags.map(t => {
@@ -168,8 +212,10 @@ async function loadDetail() {
           <a href="#" class="text-error" onclick="event.preventDefault(); detachTag('${t.id}')">×</a>
         </span>`;
       }).join('');
-  $('fd-content').textContent = content.length > 20000 ? content.slice(0, 20000) + '\n…' : content;
+}
 
+async function loadHistory() {
+  const history = await json(`/api/files/${fileId}/history`);
   const currentCommitId = currentFile.current_commit;
   $('fd-history').innerHTML = history.length === 0
     ? '<div class="opacity-50 text-xs">履歴なし</div>'
@@ -193,6 +239,103 @@ async function loadDetail() {
       }).join('');
 }
 
+function revokeContentUrl() {
+  if (contentObjectUrl) { URL.revokeObjectURL(contentObjectUrl); contentObjectUrl = null; }
+}
+
+// 認証付きで content を取得し、正しい MIME を付与した object URL にする。
+// （Bearer 認証のため <img src> 等で直接参照できず、fetch + Blob が必要）
+async function fetchContentBytes() {
+  const r = await api(`/api/files/${fileId}/content`);
+  if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+  return r.arrayBuffer();
+}
+
+async function objectUrlFor(mime) {
+  const buf = await fetchContentBytes();
+  revokeContentUrl();
+  contentObjectUrl = URL.createObjectURL(new Blob([buf], { type: mime }));
+  return contentObjectUrl;
+}
+
+// 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）
+function looksBinary(buf) {
+  const bytes = new Uint8Array(buf.slice(0, 8192));
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) return true;
+  return false;
+}
+
+// content をデータ種別に応じた要素で描画する
+async function renderContent() {
+  revokeContentUrl();
+  canEdit = false;
+  const cont = $('fd-content');
+  cont.innerHTML = '<span class="opacity-50 text-xs">読み込み中…</span>';
+  const kind = mediaKind(currentFile.mime, currentFile.display_name);
+  const mime = effectiveMime();
+  try {
+    if (kind === 'image') {
+      const url = await objectUrlFor(mime);
+      cont.innerHTML = `<img src="${url}" alt="${escapeHtml(currentFile.display_name)}"
+        class="max-w-full max-h-[70vh] object-contain mx-auto block rounded bg-base-300/30">`;
+    } else if (kind === 'video') {
+      const url = await objectUrlFor(mime);
+      cont.innerHTML = `<video src="${url}" controls
+        class="max-w-full max-h-[70vh] mx-auto block rounded bg-black"></video>`;
+    } else if (kind === 'audio') {
+      const url = await objectUrlFor(mime);
+      cont.innerHTML = `<audio src="${url}" controls class="w-full mt-2"></audio>`;
+    } else if (kind === 'pdf') {
+      const url = await objectUrlFor(mime);
+      cont.innerHTML = `<iframe src="${url}" title="${escapeHtml(currentFile.display_name)}"
+        class="w-full h-[70vh] rounded border border-base-300"></iframe>`;
+    } else {
+      // text / unknown: バイト列を取得し、バイナリらしければプレビュー不可表示
+      const buf = await fetchContentBytes();
+      if (kind === 'unknown' && looksBinary(buf)) {
+        renderBinary(cont);
+      } else {
+        const text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+        currentContent = text;
+        canEdit = true;
+        const pre = document.createElement('pre');
+        pre.className = 'bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[60vh] whitespace-pre-wrap break-words';
+        pre.textContent = text.length > 20000 ? text.slice(0, 20000) + '\n…' : text;
+        cont.replaceChildren(pre);
+      }
+    }
+  } catch (e) {
+    cont.innerHTML = `<span class="text-error text-xs">content の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
+  }
+  $('fd-edit-btn').classList.toggle('hidden', !canEdit);
+}
+
+function renderBinary(cont) {
+  cont.innerHTML = `
+    <div class="flex flex-col items-center gap-3 py-10 text-center">
+      <div class="text-4xl opacity-30">🗎</div>
+      <div class="text-sm opacity-70">このファイルはプレビューに対応していません。</div>
+      <div class="text-xs opacity-50 break-all">${escapeHtml(currentFile.mime || '不明な形式')} · ${fmtSize(currentFile.size)}</div>
+      <button class="btn btn-sm btn-primary" onclick="downloadContent()">ダウンロード</button>
+    </div>`;
+}
+
+async function downloadContent() {
+  try {
+    const blob = new Blob([await fetchContentBytes()], { type: effectiveMime() });
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = u;
+    a.download = currentFile.display_name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 1000);
+  } catch (e) {
+    uiToast('ダウンロードに失敗しました: ' + e.message, 'error');
+  }
+}
+
 async function rollback(commitId, time) {
   if (!await uiConfirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(新しいコミットとして記録されます)`, { danger: true, okText: '戻す' })) return;
   const r = await api(
@@ -207,6 +350,7 @@ async function rollback(commitId, time) {
 }
 
 function toggleEdit() {
+  if (!canEdit) { uiToast('このファイルはテキスト編集に対応していません', 'warning'); return; }
   const ed = $('fd-editor');
   if (ed.classList.contains('hidden')) {
     $('fd-edit-textarea').value = currentContent;
@@ -243,13 +387,13 @@ async function addTag() {
   });
   if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
   $('fd-add-tag').value = '';
-  await loadDetail();
+  await loadTags();
 }
 
 async function detachTag(tagId) {
   const r = await api(`/api/files/${fileId}/tags/${tagId}`, { method: 'DELETE' });
   if (!r.ok) { uiToast('タグの取り外しに失敗しました', 'error'); return; }
-  await loadDetail();
+  await loadTags();
 }
 
 async function addToSeries() {
