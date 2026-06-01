@@ -156,9 +156,10 @@ impl CrdtFormat for PlainTextCrdt {
     }
 
     async fn load(&self, bytes: &[u8]) -> Result<CrdtState, VersioningError> {
-        let s = std::str::from_utf8(bytes)
-            .map_err(|e| VersioningError::FormatMismatch(format!("invalid utf-8: {e}")))?;
-        let doc = make_doc_with_text(s);
+        // Shift-JIS/EUC-JP/UTF-16 等を含む任意のテキストを UTF-8 へデコードして取り込む。
+        // 元 charset の保持は呼び出し側（VersioningEngine）が FileMeta に記録する。
+        let s = crate::text::decode_text(bytes);
+        let doc = make_doc_with_text(&s);
         Ok(CrdtState { inner: Box::new(doc) })
     }
 
@@ -175,15 +176,15 @@ impl CrdtFormat for PlainTextCrdt {
             .ok_or_else(|| VersioningError::FormatMismatch("yrs::Doc".into()))?;
 
         for op in ops {
-            let new_text = std::str::from_utf8(&op.bytes)
-                .map_err(|e| VersioningError::FormatMismatch(e.to_string()))?;
+            // op の本文も任意エンコーディングを許容し UTF-8 へデコードしてから差分計算。
+            let new_text = crate::text::decode_text(&op.bytes);
             let text = doc.get_or_insert_text("content");
             let current = {
                 let txn = doc.transact();
                 text.get_string(&txn)
             };
             // 差分を計算して挿入・削除に翻訳。
-            apply_diff_to_text(doc, &text, &current, new_text, op.actor);
+            apply_diff_to_text(doc, &text, &current, &new_text, op.actor);
         }
         Ok(())
     }

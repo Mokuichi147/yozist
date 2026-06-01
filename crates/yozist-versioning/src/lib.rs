@@ -23,7 +23,9 @@ use yozist_db::SharedMetaStore;
 use yozist_storage::{ByteStream, SharedBlobStore, StorageError};
 
 pub mod registry;
+pub mod text;
 pub use registry::{CrdtRegistry, LwwFormat, PlainTextCrdt};
+pub use text::{decode_text, detect_charset, encode_text, http_charset};
 
 /// CRDT 状態。フォーマット実装側が任意の内部表現を保持する。
 pub struct CrdtState {
@@ -122,6 +124,13 @@ impl VersioningEngine {
         }
         let fmt = self.registry.resolve(&hint);
         let mime = hint.mime.clone();
+        // テキストは元エンコーディングを判定して保持する。blob には UTF-8 で
+        // 正規化保存し、ダウンロード時にこの charset へ再エンコードして返す。
+        let charset = if fmt.format_id() == "text/plain" {
+            Some(text::detect_charset(content))
+        } else {
+            None
+        };
 
         // 内容を一度フォーマット経由で正規化 (load -> apply -> serialize)
         let normalized = self.normalize(&fmt, content, actor).await?;
@@ -136,6 +145,7 @@ impl VersioningEngine {
         self.persist_create(
             display_name,
             mime,
+            charset,
             blob_id,
             normalized.len() as u64,
             fmt.format_id(),
@@ -202,6 +212,13 @@ impl VersioningEngine {
         } else {
             String::new()
         };
+        // charset 未設定（この機能以前に作られた等）のテキストは新内容から補完する。
+        // 既に確定済みの charset は「元の形式」を保つため上書きしない。
+        let charset = if fmt.format_id() == "text/plain" {
+            Some(text::detect_charset(new_content))
+        } else {
+            None
+        };
         self.persist_commit(
             &mut file,
             blob_id,
@@ -209,6 +226,7 @@ impl VersioningEngine {
             fmt.format_id(),
             actor,
             message,
+            charset,
             &content_str,
             now,
             &hint,
@@ -255,6 +273,7 @@ impl VersioningEngine {
             self.persist_create(
                 display_name,
                 hint.mime.clone(),
+                None, // ストリーミング経路は LWW（バイナリ）のみ。charset は持たない。
                 blob_id,
                 size,
                 fmt.format_id(),
@@ -312,6 +331,7 @@ impl VersioningEngine {
                 fmt.format_id(),
                 actor,
                 message,
+                None, // ストリーミング経路は LWW（バイナリ）のみ。charset は持たない。
                 "",
                 now,
                 &hint,
@@ -330,6 +350,7 @@ impl VersioningEngine {
         &self,
         display_name: String,
         mime: Option<String>,
+        charset: Option<String>,
         blob_id: BlobId,
         size: u64,
         format_id: &str,
@@ -343,6 +364,7 @@ impl VersioningEngine {
             display_name,
             size,
             mime,
+            charset,
             current_commit: None,
             created_at: now,
             updated_at: now,
@@ -409,6 +431,7 @@ impl VersioningEngine {
         format_id: &str,
         actor: ActorId,
         message: Option<String>,
+        charset: Option<String>,
         fts_content: &str,
         now: time::OffsetDateTime,
         hint: &FormatHint,
@@ -431,6 +454,11 @@ impl VersioningEngine {
         // mime 未設定だった既存ファイルを確定済み hint で補完する。
         if file.mime.is_none() {
             file.mime = hint.mime.clone();
+        }
+        // charset 未設定のテキストファイルのみ補完する。確定済みは「元の形式」を
+        // 保つため上書きしない（後続コミットが別エンコーディングでも維持）。
+        if file.charset.is_none() {
+            file.charset = charset;
         }
         self.meta.update_file(file).await?;
 
@@ -789,6 +817,7 @@ mod engine_tests {
             display_name: "photo.jpg".into(),
             size: 0,
             mime: None,
+            charset: None,
             current_commit: None,
             created_at: now,
             updated_at: now,
@@ -867,6 +896,62 @@ mod engine_tests {
             .unwrap();
         assert_eq!(commit.format_id, "text/plain");
         assert_eq!(file.mime.as_deref(), Some("text/vtt"));
+    }
+
+    #[tokio::test]
+    async fn shift_jis_text_is_decoded_stored_utf8_and_charset_recorded() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let text = "こんにちは、世界";
+        let (sjis, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+        assert!(sjis.iter().any(|b| *b >= 0x80), "Shift-JIS のはず");
+
+        // 以前は from_utf8 で失敗していたケース。今は取り込めて charset が記録される。
+        let (file, commit) = eng
+            .create_file("memo.txt", &sjis, actor, None)
+            .await
+            .unwrap();
+        assert_eq!(commit.format_id, "text/plain");
+        assert_eq!(file.charset.as_deref(), Some("Shift_JIS"));
+
+        // blob は UTF-8 平文で保存される（他ツール互換）。
+        let stored = eng.read_current(file.id).await.unwrap();
+        assert_eq!(std::str::from_utf8(&stored).unwrap(), text);
+
+        // ダウンロード相当の再エンコードで元の Shift-JIS バイト列に戻る。
+        let restored = encode_text(&String::from_utf8_lossy(&stored), "Shift_JIS");
+        assert_eq!(restored, sjis.to_vec());
+    }
+
+    #[tokio::test]
+    async fn utf16le_text_roundtrips_via_charset() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let text = "日本語 mixed テキスト";
+        let mut bytes = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let (file, _commit) = eng
+            .create_file("note.txt", &bytes, actor, None)
+            .await
+            .unwrap();
+        assert_eq!(file.charset.as_deref(), Some("UTF-16LE"));
+        let stored = eng.read_current(file.id).await.unwrap();
+        assert_eq!(std::str::from_utf8(&stored).unwrap(), text);
+        let restored = encode_text(&String::from_utf8_lossy(&stored), "UTF-16LE");
+        assert_eq!(restored, bytes);
+    }
+
+    #[tokio::test]
+    async fn binary_has_no_charset() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let (file, _c) = eng
+            .create_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], actor, None)
+            .await
+            .unwrap();
+        assert_eq!(file.charset, None);
     }
 
     #[tokio::test]
