@@ -20,7 +20,7 @@ use yozist_core::{
     ActorId, BlobId, Commit, CommitId, FileId, FileMeta, FormatHint,
 };
 use yozist_db::SharedMetaStore;
-use yozist_storage::{ByteStream, SharedBlobStore};
+use yozist_storage::{ByteStream, SharedBlobStore, StorageError};
 
 pub mod registry;
 pub use registry::{CrdtRegistry, LwwFormat, PlainTextCrdt};
@@ -109,13 +109,19 @@ impl VersioningEngine {
         let display_name = display_name.into();
         let now = time::OffsetDateTime::now_utc();
 
-        let hint = hint_override.unwrap_or_else(|| FormatHint {
+        let mut hint = hint_override.unwrap_or_else(|| FormatHint {
             extension: ext_of(&display_name),
             mime: None,
             first_bytes: Some(content.iter().take(64).copied().collect()),
             display_name: Some(display_name.clone()),
         });
+        // フォーマット判定(resolve)の前に MIME を確定する。PlainTextCrdt::detect は
+        // text/* を最優先で見るため、ここで埋めれば保存形式(CRDT/LWW)の選択にも効く。
+        if hint.mime.is_none() {
+            hint.mime = guess_mime(&display_name, content);
+        }
         let fmt = self.registry.resolve(&hint);
+        let mime = hint.mime.clone();
 
         // 内容を一度フォーマット経由で正規化 (load -> apply -> serialize)
         let normalized = self.normalize(&fmt, content, actor).await?;
@@ -129,13 +135,14 @@ impl VersioningEngine {
         };
         self.persist_create(
             display_name,
-            hint.mime.clone(),
+            mime,
             blob_id,
             normalized.len() as u64,
             fmt.format_id(),
             actor,
             &content_str,
             now,
+            &hint,
         )
         .await
     }
@@ -218,12 +225,23 @@ impl VersioningEngine {
         hint_override: Option<FormatHint>,
     ) -> Result<(FileMeta, Commit), VersioningError> {
         let display_name = display_name.into();
-        let hint = hint_override.clone().unwrap_or_else(|| FormatHint {
+        let mut hint = hint_override.unwrap_or_else(|| FormatHint {
             extension: ext_of(&display_name),
             mime: None,
             first_bytes: None,
             display_name: Some(display_name.clone()),
         });
+        // フォーマット判定(resolve)の前に MIME を確定する。detect が text/* を
+        // 最優先で見るため、保存形式(CRDT/LWW)の選択に MIME を反映できる。
+        // 本文はバッファせず、拡張子で決まらない場合のみ先頭バイトを覗き、
+        // 覗いた分は失わないようストリームへ連結し直す。
+        let stream = if hint.mime.is_none() {
+            let (mime, rewound) = resolve_stream_mime(&display_name, None, stream).await?;
+            hint.mime = mime;
+            rewound
+        } else {
+            stream
+        };
         let fmt = self.registry.resolve(&hint);
 
         if fmt.supports_streaming() {
@@ -238,12 +256,13 @@ impl VersioningEngine {
                 actor,
                 "",
                 now,
+                &hint,
             )
             .await
         } else {
+            // CRDT 経路へフォールバック。MIME 確定済みの hint を渡し二重推測を避ける。
             let buf = collect_stream(stream).await?;
-            self.create_file(display_name, &buf, actor, hint_override)
-                .await
+            self.create_file(display_name, &buf, actor, Some(hint)).await
         }
     }
 
@@ -303,6 +322,7 @@ impl VersioningEngine {
         actor: ActorId,
         fts_content: &str,
         now: time::OffsetDateTime,
+        hint: &FormatHint,
     ) -> Result<(FileMeta, Commit), VersioningError> {
         let file = FileMeta {
             id: FileId::new(),
@@ -333,9 +353,32 @@ impl VersioningEngine {
         updated.updated_at = now;
         self.meta.update_file(&updated).await?;
 
+        // システムタグ（ext:/type:）を拡張子・MIME から自動付与する。
+        // 付与失敗はファイル作成を妨げないよう警告に留める。
+        for tag in yozist_tagging::system_tags_for(hint) {
+            match self.meta.upsert_tag(&tag).await {
+                Ok(tag_id) => {
+                    if let Err(e) = self.meta.attach_tag(&updated.id, &tag_id).await {
+                        tracing::warn!("システムタグの付与に失敗: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("システムタグの登録に失敗: {e}"),
+            }
+        }
+
+        // FTS には付与済みタグ名も含める。
+        let tag_names = self
+            .meta
+            .list_tags_of(&updated.id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>()
+            .join(" ");
         let _ = self
             .meta
-            .upsert_fts(&updated.id, &updated.display_name, "", fts_content)
+            .upsert_fts(&updated.id, &updated.display_name, &tag_names, fts_content)
             .await;
 
         Ok((updated, commit))
@@ -469,6 +512,80 @@ fn ext_of(name: &str) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
+/// ファイル名と先頭バイトから MIME タイプを推測する。
+///
+/// 拡張子（`mime_guess`）からの具体的な判定を優先し、拡張子が未知、
+/// または汎用の `application/octet-stream` にしかならない場合は先頭バイトの
+/// マジックナンバー（`infer`）で補う。どちらでも不明なら `None`。
+fn guess_mime(name: &str, head: &[u8]) -> Option<String> {
+    let by_ext = mime_guess::from_path(name)
+        .first()
+        .map(|m| m.essence_str().to_string());
+    if let Some(m) = &by_ext {
+        if m != "application/octet-stream" {
+            return by_ext;
+        }
+    }
+    // 拡張子が未知 / 汎用バイナリ → 中身のマジックナンバーで判定。
+    // それも不明なら拡張子由来（octet-stream）にフォールバック。
+    infer::get(head)
+        .map(|k| k.mime_type().to_string())
+        .or(by_ext)
+}
+
+/// ストリーム本文をバッファせずに MIME を判定する。
+///
+/// ヒント → 拡張子の順に確定できればストリームに触れず返す。どちらでも
+/// 確定できない場合のみ先頭バイトを覗き、覗いたチャンクは失わないよう
+/// 連結し直したストリームと共に返す。
+async fn resolve_stream_mime(
+    name: &str,
+    hint_mime: Option<String>,
+    stream: ByteStream,
+) -> Result<(Option<String>, ByteStream), StorageError> {
+    if let Some(m) = hint_mime {
+        return Ok((Some(m), stream));
+    }
+    let by_ext = mime_guess::from_path(name)
+        .first()
+        .map(|m| m.essence_str().to_string());
+    if let Some(m) = &by_ext {
+        if m != "application/octet-stream" {
+            return Ok((by_ext, stream));
+        }
+    }
+    // 拡張子が未知 / 汎用バイナリ → 先頭バイトを覗いて判定。
+    let (head, stream) = peek_head(stream, 512).await?;
+    let mime = infer::get(&head)
+        .map(|k| k.mime_type().to_string())
+        .or(by_ext);
+    Ok((mime, stream))
+}
+
+/// ストリーム先頭を最大 `limit` バイト読み取り、読み取ったチャンクを
+/// 先頭に連結し直したストリームと、判定用のバイト列を返す。
+/// 本文をメモリへ全展開しないための覗き見ヘルパー。
+async fn peek_head(
+    mut stream: ByteStream,
+    limit: usize,
+) -> Result<(Vec<u8>, ByteStream), StorageError> {
+    let mut head = Vec::new();
+    let mut buffered: Vec<bytes::Bytes> = Vec::new();
+    while head.len() < limit {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                head.extend_from_slice(&chunk);
+                buffered.push(chunk);
+            }
+            Some(Err(e)) => return Err(e),
+            None => break,
+        }
+    }
+    let prefix = futures::stream::iter(buffered.into_iter().map(Ok));
+    let combined = prefix.chain(stream).boxed();
+    Ok((head, combined))
+}
+
 /// ストリームをメモリへ集約する（CRDT/テキスト経路用フォールバック）。
 async fn collect_stream(mut stream: ByteStream) -> Result<Vec<u8>, VersioningError> {
     let mut buf = Vec::new();
@@ -595,6 +712,94 @@ mod engine_tests {
             .unwrap();
         assert_eq!(c2.parent, Some(commit.id));
         assert_eq!(eng.read_current(file.id).await.unwrap(), vec![0xAA, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn create_file_sets_mime_from_extension() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // JPEG マジックを持つ .jpg。拡張子から image/jpeg を確定する。
+        let bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        let (file, _c) = eng
+            .create_file("photo.jpg", &bytes, actor, None)
+            .await
+            .unwrap();
+        assert_eq!(file.mime.as_deref(), Some("image/jpeg"));
+    }
+
+    #[tokio::test]
+    async fn streaming_sets_mime_from_magic_number_when_extension_unknown() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // 拡張子なしのファイル名。先頭の PNG マジックから image/png を判定する。
+        let stream = byte_stream(vec![b"\x89PNG\r\n\x1a\n", b"\x00\x00rest"]);
+        let (file, commit) = eng
+            .create_file_streaming("blob", stream, actor, None)
+            .await
+            .unwrap();
+        // LWW 経路を通り、本文は欠落せず保存される。
+        assert_eq!(commit.format_id, "_/lww");
+        assert_eq!(
+            eng.read_current(file.id).await.unwrap(),
+            b"\x89PNG\r\n\x1a\n\x00\x00rest"
+        );
+        assert_eq!(file.mime.as_deref(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn create_file_attaches_system_tags() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let (file, _c) = eng
+            .create_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], actor, None)
+            .await
+            .unwrap();
+        let names: Vec<String> = eng
+            .meta
+            .list_tags_of(&file.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        // 拡張子と MIME カテゴリのシステムタグが自動付与される。
+        assert!(names.contains(&"ext:jpg".to_string()), "tags={names:?}");
+        assert!(names.contains(&"type:image".to_string()), "tags={names:?}");
+    }
+
+    #[tokio::test]
+    async fn mime_hint_drives_crdt_format_selection() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // 拡張子が無くても MIME が text/* なら CRDT(text/plain) 経路で保存される。
+        // = 保存形式の選択に MIME が効いていることの確認。
+        let hint = FormatHint {
+            extension: None,
+            mime: Some("text/x-custom".into()),
+            first_bytes: None,
+            display_name: None,
+        };
+        let (file, commit) = eng
+            .create_file("data", b"hello", actor, Some(hint))
+            .await
+            .unwrap();
+        assert_eq!(commit.format_id, "text/plain");
+        assert_eq!(file.mime.as_deref(), Some("text/x-custom"));
+    }
+
+    #[tokio::test]
+    async fn guessed_text_mime_drives_crdt_for_unlisted_extension() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // .vtt は detect の拡張子リストに無いが mime_guess は text/vtt を返すため、
+        // resolve 前に確定した MIME により CRDT 経路が選ばれる。
+        let stream = byte_stream(vec![b"WEBVTT\n\n", b"00:00.000 --> 00:01.000\nhi"]);
+        let (file, commit) = eng
+            .create_file_streaming("subtitle.vtt", stream, actor, None)
+            .await
+            .unwrap();
+        assert_eq!(commit.format_id, "text/plain");
+        assert_eq!(file.mime.as_deref(), Some("text/vtt"));
     }
 
     #[tokio::test]
