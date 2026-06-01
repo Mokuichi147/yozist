@@ -372,17 +372,31 @@ async fn delete_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 保存済み MIME を Content-Type に設定して本文を返す。未設定なら octet-stream。
+fn content_response(mime: Option<String>, bytes: Vec<u8>) -> impl IntoResponse {
+    let ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
+    ([(axum::http::header::CONTENT_TYPE, ct)], bytes)
+}
+
 async fn get_content(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
-    s.engine
+    let file = s
+        .meta
+        .get_file(&id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let bytes = s
+        .engine
         .read_current(id)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(content_response(file.mime, bytes))
 }
 
 #[derive(Deserialize)]
@@ -450,19 +464,27 @@ async fn read_commit(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path((id, cid)): Path<(String, String)>,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let file_id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(file_id), PermissionMask::READ).await?;
     let commit_id = uuid::Uuid::parse_str(&cid)
         .map(yozist_core::CommitId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("commit id: {e}")))?;
-    s.engine
+    let file = s
+        .meta
+        .get_file(&file_id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let bytes = s
+        .engine
         .read_at_commit(file_id, commit_id)
         .await
         .map_err(|e| match e {
             yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
             other => ApiError::Internal(other.to_string()),
-        })
+        })?;
+    Ok(content_response(file.mime, bytes))
 }
 
 #[derive(Deserialize)]
@@ -1411,13 +1433,21 @@ async fn verify_share(
 async fn get_shared(
     State(s): State<ApiState>,
     Path(token): Path<String>,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let target_id = verify_share(&s, &token, "file").await?;
     let file_id = parse_file_id(&target_id)?;
-    s.engine
+    let file = s
+        .meta
+        .get_file(&file_id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let bytes = s
+        .engine
         .read_current(file_id)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok(content_response(file.mime, bytes))
 }
 
 async fn list_share_tokens(
@@ -2018,6 +2048,24 @@ mod tests {
     use yozist_db::SqliteMetaStore;
     use yozist_storage::FsBlobStore;
     use yozist_versioning::CrdtRegistry;
+
+    #[test]
+    fn content_response_sets_content_type_from_mime() {
+        let resp = content_response(Some("image/png".into()), vec![1, 2, 3]).into_response();
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        // mime 未設定なら octet-stream にフォールバック。
+        let fallback = content_response(None, Vec::new()).into_response();
+        assert_eq!(
+            fallback
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+    }
 
     async fn make_state() -> (ApiState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

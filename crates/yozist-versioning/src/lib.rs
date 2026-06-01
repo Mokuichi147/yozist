@@ -161,12 +161,16 @@ impl VersioningEngine {
             .await?
             .ok_or_else(|| VersioningError::NotFound(file_id))?;
 
-        let hint = FormatHint {
+        let mut hint = FormatHint {
             extension: ext_of(&file.display_name),
             mime: file.mime.clone(),
             first_bytes: Some(new_content.iter().take(64).copied().collect()),
             display_name: Some(file.display_name.clone()),
         };
+        // mime 未設定の既存ファイルは、ここで拡張子/内容から補完する。
+        if hint.mime.is_none() {
+            hint.mime = guess_mime(&file.display_name, new_content);
+        }
         let fmt = self.registry.resolve(&hint);
 
         // 既存状態を読み込み、新規 op を適用してから保存。
@@ -207,6 +211,7 @@ impl VersioningEngine {
             message,
             &content_str,
             now,
+            &hint,
         )
         .await
     }
@@ -281,11 +286,19 @@ impl VersioningEngine {
             .await?
             .ok_or(VersioningError::NotFound(file_id))?;
 
-        let hint = FormatHint {
+        let mut hint = FormatHint {
             extension: ext_of(&file.display_name),
             mime: file.mime.clone(),
             first_bytes: None,
             display_name: Some(file.display_name.clone()),
+        };
+        // mime 未設定なら、本文をバッファせず先頭バイトから補完する。
+        let stream = if hint.mime.is_none() {
+            let (mime, rewound) = resolve_stream_mime(&file.display_name, None, stream).await?;
+            hint.mime = mime;
+            rewound
+        } else {
+            stream
         };
         let fmt = self.registry.resolve(&hint);
 
@@ -301,6 +314,7 @@ impl VersioningEngine {
                 message,
                 "",
                 now,
+                &hint,
             )
             .await
         } else {
@@ -397,6 +411,7 @@ impl VersioningEngine {
         message: Option<String>,
         fts_content: &str,
         now: time::OffsetDateTime,
+        hint: &FormatHint,
     ) -> Result<Commit, VersioningError> {
         let commit = Commit {
             id: CommitId::new(),
@@ -413,7 +428,24 @@ impl VersioningEngine {
         file.current_commit = Some(commit.id);
         file.size = size;
         file.updated_at = now;
+        // mime 未設定だった既存ファイルを確定済み hint で補完する。
+        if file.mime.is_none() {
+            file.mime = hint.mime.clone();
+        }
         self.meta.update_file(file).await?;
+
+        // システムタグ（ext:/type:）を補完。upsert は同名を既存IDへ集約し、
+        // attach は ON CONFLICT DO NOTHING なので冪等。付与失敗は警告に留める。
+        for tag in yozist_tagging::system_tags_for(hint) {
+            match self.meta.upsert_tag(&tag).await {
+                Ok(tag_id) => {
+                    if let Err(e) = self.meta.attach_tag(&file.id, &tag_id).await {
+                        tracing::warn!("システムタグの付与に失敗: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("システムタグの登録に失敗: {e}"),
+            }
+        }
 
         // FTS 更新 (display_name とタグ一覧と内容)
         let tag_names = self
@@ -744,6 +776,41 @@ mod engine_tests {
             b"\x89PNG\r\n\x1a\n\x00\x00rest"
         );
         assert_eq!(file.mime.as_deref(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn commit_backfills_mime_and_system_tags() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // この変更前に作られた想定の mime=None ファイルを直接用意する。
+        let now = time::OffsetDateTime::now_utc();
+        let file = FileMeta {
+            id: FileId::new(),
+            display_name: "photo.jpg".into(),
+            size: 0,
+            mime: None,
+            current_commit: None,
+            created_at: now,
+            updated_at: now,
+            deleted: false,
+        };
+        eng.meta.insert_file(&file).await.unwrap();
+        // commit すると mime が補完され ext:/type: タグが付く。
+        eng.commit(file.id, &[0xFF, 0xD8, 0xFF, 0xE0], actor, None)
+            .await
+            .unwrap();
+        let got = eng.meta.get_file(&file.id).await.unwrap().unwrap();
+        assert_eq!(got.mime.as_deref(), Some("image/jpeg"));
+        let names: Vec<String> = eng
+            .meta
+            .list_tags_of(&file.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"ext:jpg".to_string()), "tags={names:?}");
+        assert!(names.contains(&"type:image".to_string()), "tags={names:?}");
     }
 
     #[tokio::test]
