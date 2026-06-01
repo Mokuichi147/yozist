@@ -91,6 +91,13 @@ pub struct FileMeta {
     pub display_name: String,
     pub size: u64,
     pub mime: Option<String>,
+    /// テキストファイルの元エンコーディング（charset ラベル）。
+    /// 例: `"Shift_JIS"`, `"EUC-JP"`, `"UTF-16LE"`, `"UTF-8"`, `"UTF-8-BOM"`。
+    /// CRDT/blob は常に UTF-8 で保持し、ダウンロードや SMB read の際に
+    /// この charset へ再エンコードして「元の形式」で返す。`None` は
+    /// バイナリ（LWW）または charset 未判定を表す。
+    #[serde(default)]
+    pub charset: Option<String>,
     pub current_commit: Option<CommitId>,
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,

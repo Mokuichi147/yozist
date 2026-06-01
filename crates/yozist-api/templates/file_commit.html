@@ -72,7 +72,9 @@ async function init() {
   try {
     const r = await api(`/api/files/${fileId}/commits/${commitId}`);
     if (!r.ok) throw r;
-    content = await r.text();
+    // 元エンコーディング（file.charset）でデコードする。r.text() は UTF-8 固定で
+    // charset を無視するため Shift-JIS 等が文字化けする。
+    content = decodeBytes(await r.arrayBuffer(), file.charset);
   } catch (e) {
     $('not-found-msg').textContent = 'コミット内容の取得に失敗しました。';
     $('not-found').classList.remove('hidden');

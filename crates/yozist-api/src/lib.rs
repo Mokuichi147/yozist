@@ -373,9 +373,30 @@ async fn delete_file(
 }
 
 /// 保存済み MIME を Content-Type に設定して本文を返す。未設定なら octet-stream。
-fn content_response(mime: Option<String>, bytes: Vec<u8>) -> impl IntoResponse {
-    let ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
-    ([(axum::http::header::CONTENT_TYPE, ct)], bytes)
+///
+/// テキストファイル（`charset` あり）は blob に UTF-8 で保存されているため、
+/// 取り込み時に判定した元エンコーディングへ再エンコードして「元の形式」で返す。
+/// 併せて `Content-Type` に `charset=` を付与し、ブラウザが正しくデコードできる
+/// ようにする。`charset` が `None`（バイナリ）はそのまま返す。
+fn content_response(
+    mime: Option<String>,
+    charset: Option<String>,
+    bytes: Vec<u8>,
+) -> impl IntoResponse {
+    let mut ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
+    let body = match &charset {
+        Some(cs) => {
+            // blob は serialize 由来の妥当な UTF-8。lossy でも実質非破壊。
+            let text = String::from_utf8_lossy(&bytes);
+            let encoded = yozist_versioning::encode_text(&text, cs);
+            if !ct.to_ascii_lowercase().contains("charset=") {
+                ct = format!("{ct}; charset={}", yozist_versioning::http_charset(cs));
+            }
+            encoded
+        }
+        None => bytes,
+    };
+    ([(axum::http::header::CONTENT_TYPE, ct)], body)
 }
 
 async fn get_content(
@@ -396,7 +417,7 @@ async fn get_content(
         .read_current(id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(content_response(file.mime, bytes))
+    Ok(content_response(file.mime, file.charset, bytes))
 }
 
 #[derive(Deserialize)]
@@ -484,7 +505,7 @@ async fn read_commit(
             yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
             other => ApiError::Internal(other.to_string()),
         })?;
-    Ok(content_response(file.mime, bytes))
+    Ok(content_response(file.mime, file.charset, bytes))
 }
 
 #[derive(Deserialize)]
@@ -1447,7 +1468,7 @@ async fn get_shared(
         .read_current(file_id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(content_response(file.mime, bytes))
+    Ok(content_response(file.mime, file.charset, bytes))
 }
 
 async fn list_share_tokens(
@@ -2051,19 +2072,48 @@ mod tests {
 
     #[test]
     fn content_response_sets_content_type_from_mime() {
-        let resp = content_response(Some("image/png".into()), vec![1, 2, 3]).into_response();
+        // バイナリ（charset なし）は MIME のみ・本文はそのまま。
+        let resp =
+            content_response(Some("image/png".into()), None, vec![1, 2, 3]).into_response();
         assert_eq!(
             resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
         // mime 未設定なら octet-stream にフォールバック。
-        let fallback = content_response(None, Vec::new()).into_response();
+        let fallback = content_response(None, None, Vec::new()).into_response();
         assert_eq!(
             fallback
                 .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .unwrap(),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn content_response_appends_charset_for_text() {
+        // テキスト（charset あり）は Content-Type に charset を付与する。
+        // UTF-8-BOM は HTTP ヘッダ上は素の UTF-8 に正規化される。
+        let resp = content_response(
+            Some("text/plain".into()),
+            Some("Shift_JIS".into()),
+            "こんにちは".as_bytes().to_vec(),
+        )
+        .into_response();
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=Shift_JIS"
+        );
+
+        let bom = content_response(
+            Some("text/markdown".into()),
+            Some("UTF-8-BOM".into()),
+            "x".as_bytes().to_vec(),
+        )
+        .into_response();
+        assert_eq!(
+            bom.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "text/markdown; charset=UTF-8"
         );
     }
 

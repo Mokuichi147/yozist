@@ -95,6 +95,7 @@ const qs = new URLSearchParams(location.search);
 
 let history = [];
 let currentCommitId = null;
+let fileCharset = null; // 元エンコーディング。/commits 本文のデコードに使う。
 let viewMode = 'unified';
 const contentCache = new Map();
 const expanded = new Set(); // 展開済みの equal セグメント index
@@ -107,7 +108,9 @@ async function fetchContent(commitId) {
   if (contentCache.has(commitId)) return contentCache.get(commitId);
   const r = await api(`/api/files/${fileId}/commits/${commitId}`);
   if (!r.ok) throw r;
-  const text = await r.text();
+  // 元エンコーディング（fileCharset）でデコードする。r.text() は UTF-8 固定で
+  // charset を無視するため Shift-JIS 等が文字化けする。
+  const text = decodeBytes(await r.arrayBuffer(), fileCharset);
   contentCache.set(commitId, text);
   return text;
 }
@@ -420,6 +423,7 @@ async function init() {
     return;
   }
   currentCommitId = file.current_commit;
+  fileCharset = file.charset;
   document.title = `yozist - ${file.display_name} の比較`;
   $('main').classList.remove('hidden');
   $('cmp-name').textContent = file.display_name;

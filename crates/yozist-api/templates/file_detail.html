@@ -218,6 +218,7 @@ async function loadDetail() {
   $('fd-meta').innerHTML = `<dl class="space-y-2">
     ${metaRow('サイズ', fmtSize(currentFile.size))}
     ${metaRow('MIME', escapeHtml(currentFile.mime || '—'))}
+    ${currentFile.charset ? metaRow('文字コード', escapeHtml(currentFile.charset)) : ''}
     ${metaRow('ID', escapeHtml(currentFile.id), true)}
     ${metaRow('current_commit', escapeHtml(currentFile.current_commit), true)}
   </dl>`;
@@ -319,12 +320,14 @@ async function renderContent() {
       cont.innerHTML = `<iframe src="${url}" title="${escapeHtml(currentFile.display_name)}"
         class="w-full h-[70vh] rounded border border-base-300"></iframe>`;
     } else {
-      // text / unknown: バイト列を取得し、バイナリらしければプレビュー不可表示
+      // text / unknown: バイト列を取得し、バイナリらしければプレビュー不可表示。
+      // charset があるものはサーバがテキストとして保持しているため常にテキスト扱い
+      // （UTF-16 はヌルバイトを含み looksBinary に誤検知されるのを避ける）。
       const buf = await fetchContentBytes();
-      if (kind === 'unknown' && looksBinary(buf)) {
+      if (kind === 'unknown' && !currentFile.charset && looksBinary(buf)) {
         renderBinary(cont);
       } else {
-        const text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+        const text = decodeBytes(buf, currentFile.charset);
         currentContent = text;
         canEdit = true;
         const pre = document.createElement('pre');

@@ -73,6 +73,19 @@ impl YozistFileHandle {
             .read_current(file_id)
             .await
             .map_err(|_| smb_server::SmbError::NotFound)?;
+        // blob は UTF-8。テキストは元エンコーディング（charset）へ再エンコードして
+        // SMB クライアントへ「元の形式」で見せる。サイズ報告(snapshot_info)も
+        // この buffer 長を使うため read/サイズとも整合する。
+        let buffer = match engine.meta.get_file(&file_id).await {
+            Ok(Some(meta)) => match meta.charset {
+                Some(cs) => {
+                    let text = String::from_utf8_lossy(&buffer);
+                    yozist_versioning::encode_text(&text, &cs)
+                }
+                None => buffer,
+            },
+            _ => buffer,
+        };
         Ok(Self {
             inner: Mutex::new(HandleState {
                 file_id: Some(file_id),

@@ -108,6 +108,23 @@ function escapeHtml(s) {
   })[c]);
 }
 
+// /content・/commits は元エンコーディング（charset）で本文を返すため、その charset で
+// デコードする。Fetch の Response.text() は常に UTF-8 デコードで charset を無視するので、
+// arrayBuffer を取得して TextDecoder へ渡す必要がある。TextDecoder は既定で BOM を除去する。
+// 独自ラベル "UTF-8-BOM" は素の utf-8 に、未対応ラベルや charset 無し（旧データ・バイナリ）は
+// utf-8 にフォールバックする。
+function decodeBytes(buf, charset) {
+  let label = 'utf-8';
+  if (charset) {
+    label = (charset.toLowerCase() === 'utf-8-bom') ? 'utf-8' : charset;
+  }
+  try {
+    return new TextDecoder(label, { fatal: false }).decode(buf);
+  } catch (_) {
+    return new TextDecoder('utf-8', { fatal: false }).decode(buf);
+  }
+}
+
 // API は timestamp を ISO 文字列で返す場合と
 // time::OffsetDateTime のシリアライズ形式 ([year, day_of_year, h, m, s, ns, ...]) で返す場合がある
 function fmtTs(ts) {

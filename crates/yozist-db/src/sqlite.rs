@@ -86,6 +86,7 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
     let display_name: String = row.try_get("display_name")?;
     let size: i64 = row.try_get("size")?;
     let mime: Option<String> = row.try_get("mime")?;
+    let charset: Option<String> = row.try_get("charset")?;
     let current_commit: Option<String> = row.try_get("current_commit")?;
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
@@ -95,6 +96,7 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
         display_name,
         size: size as u64,
         mime,
+        charset,
         current_commit: current_commit
             .map(|s| parse_uuid(&s).map(CommitId::from_uuid))
             .transpose()?,
@@ -199,14 +201,15 @@ impl MetaStore for SqliteMetaStore {
     async fn insert_file(&self, meta: &FileMeta) -> Result<(), DbError> {
         sqlx::query(
             r#"INSERT INTO files
-               (id, display_name, size, mime, current_commit,
+               (id, display_name, size, mime, charset, current_commit,
                 created_at, updated_at, deleted, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(meta.id.to_string())
         .bind(&meta.display_name)
         .bind(meta.size as i64)
         .bind(&meta.mime)
+        .bind(&meta.charset)
         .bind(meta.current_commit.map(|c| c.to_string()))
         .bind(fmt_dt(meta.created_at))
         .bind(fmt_dt(meta.updated_at))
@@ -228,7 +231,7 @@ impl MetaStore for SqliteMetaStore {
         // 楽観ロック: 現行 version を取得し、+1 で更新。
         let res = sqlx::query(
             r#"UPDATE files SET
-                 display_name = ?, size = ?, mime = ?,
+                 display_name = ?, size = ?, mime = ?, charset = ?,
                  current_commit = ?, updated_at = ?, deleted = ?,
                  version = version + 1
                WHERE id = ?"#,
@@ -236,6 +239,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(&meta.display_name)
         .bind(meta.size as i64)
         .bind(&meta.mime)
+        .bind(&meta.charset)
         .bind(meta.current_commit.map(|c| c.to_string()))
         .bind(fmt_dt(meta.updated_at))
         .bind(meta.deleted as i64)
@@ -707,6 +711,7 @@ mod tests {
             display_name: "test.md".into(),
             size: 12,
             mime: Some("text/markdown".into()),
+            charset: Some("UTF-8".into()),
             current_commit: None,
             created_at: now,
             updated_at: now,

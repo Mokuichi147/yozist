@@ -21,6 +21,10 @@ tracing.workspace = true
 time.workspace = true
 mime_guess = "2.0.5"
 infer = "0.19.0"
+# テキストの文字コード判定（chardetng）と変換（encoding_rs）。
+# Shift-JIS/EUC-JP/UTF-16/UTF-8 等を UTF-8 へデコードし、元 charset へ再エンコードする。
+encoding_rs = "0.8"
+chardetng = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
