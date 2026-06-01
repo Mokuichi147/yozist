@@ -300,6 +300,7 @@ async function renderContent() {
   revokeContentUrl();
   canEdit = false;
   const cont = $('fd-content');
+  cont.classList.remove('hidden');  // 編集後の再描画時に表示専用欄を確実に復帰
   cont.innerHTML = '<span class="opacity-50 text-xs">読み込み中…</span>';
   const kind = mediaKind(currentFile.mime, currentFile.display_name);
   const mime = effectiveMime();
@@ -384,12 +385,21 @@ async function rollback(commitId, time) {
 function toggleEdit() {
   if (!canEdit) { uiToast('このファイルはテキスト編集に対応していません', 'warning'); return; }
   const ed = $('fd-editor');
+  const cont = $('fd-content');
   if (ed.classList.contains('hidden')) {
-    $('fd-edit-textarea').value = currentContent;
+    const ta = $('fd-edit-textarea');
+    ta.value = currentContent;
     $('fd-edit-message').value = '';
+    // 表示専用欄と同じ高さで編集できるよう、隠す前に現在の表示高さを引き継ぐ
+    // （rows 固定だと内容に対して欄サイズが飛んでしまうのを防ぐ）
+    const h = cont.offsetHeight;
+    if (h > 0) ta.style.height = h + 'px';
     ed.classList.remove('hidden');
+    // 表示専用欄を隠し、編集ボックスとの2重表示を防ぐ
+    cont.classList.add('hidden');
   } else {
     ed.classList.add('hidden');
+    cont.classList.remove('hidden');
   }
 }
 
