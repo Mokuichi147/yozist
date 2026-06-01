@@ -230,12 +230,15 @@ async function loadTags() {
   $('fd-tags').innerHTML = tags.length === 0
     ? '<span class="opacity-50 text-xs">タグなし</span>'
     : tags.map(t => {
+        // files 一覧と同じく種別は塗りつぶしバッジ + 絵文字で表現（ダークでも視認できるよう outline を使わない）
         const variant = t.kind === 'system' ? 'badge-neutral'
                       : t.kind === 'ai' ? 'badge-warning'
                       : 'badge-primary';
-        return `<span class="badge ${variant} badge-outline gap-1">
-          ${escapeHtml(t.name)}
-          <a href="#" class="text-error" onclick="event.preventDefault(); detachTag('${t.id}')">×</a>
+        const icon = t.kind === 'system' ? ' ⚙' : t.kind === 'ai' ? ' 🤖' : '';
+        return `<span class="badge badge-sm ${variant} gap-1">
+          ${escapeHtml(t.name)}${icon}
+          <button type="button" class="cursor-pointer leading-none opacity-70 hover:opacity-100"
+                  title="タグを外す" onclick="detachTag('${t.id}')">×</button>
         </span>`;
       }).join('');
 }
