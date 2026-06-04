@@ -87,6 +87,18 @@ pub struct VersioningEngine {
     pub meta: SharedMetaStore,
 }
 
+/// クライアントへ提示する見かけのサイズ。blob は UTF-8 だが、SMB / HTTP では
+/// 元 charset へ再エンコードして返すため、`FileMeta.size` も提示サイズ（再エンコード
+/// 後の長さ）に揃える。これで「一覧のサイズ」と「open/read のサイズ」が一致し、
+/// macOS 等が folder 上のサイズと実体の食い違いを reconcile できずループするのを防ぐ。
+/// charset が無い（バイナリ）場合は blob 長そのまま。
+fn presented_size(normalized: &[u8], charset: Option<&str>) -> u64 {
+    match charset {
+        Some(cs) => text::encode_text(&String::from_utf8_lossy(normalized), cs).len() as u64,
+        None => normalized.len() as u64,
+    }
+}
+
 impl VersioningEngine {
     pub fn new(
         registry: Arc<CrdtRegistry>,
@@ -142,12 +154,13 @@ impl VersioningEngine {
         } else {
             String::new()
         };
+        let size = presented_size(&normalized, charset.as_deref());
         self.persist_create(
             display_name,
             mime,
             charset,
             blob_id,
-            normalized.len() as u64,
+            size,
             fmt.format_id(),
             actor,
             &content_str,
@@ -219,10 +232,11 @@ impl VersioningEngine {
         } else {
             None
         };
+        let size = presented_size(&serialized, file.charset.as_deref().or(charset.as_deref()));
         self.persist_commit(
             &mut file,
             blob_id,
-            serialized.len() as u64,
+            size,
             fmt.format_id(),
             actor,
             message,

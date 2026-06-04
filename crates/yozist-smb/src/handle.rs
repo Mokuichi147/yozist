@@ -20,6 +20,7 @@ use yozist_core::{ActorId, FileId};
 use yozist_versioning::VersioningEngine;
 
 use crate::ShareDeps;
+use tracing::debug;
 use yozist_auth::{DbAuthorizer, Permission, PermissionMask, Subject, Target};
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
 
@@ -37,6 +38,14 @@ pub struct YozistFileHandle {
     /// 監査ログ書き込み先（close 時に成功・失敗を記録）。
     audit: Option<SharedAuditLog>,
     actor: ActorId,
+    /// SMB へ報告する作成時刻（FILETIME）。既存ファイルは `created_at`。
+    creation_ft: u64,
+    /// SMB へ報告する更新時刻（FILETIME）。既存ファイルは `updated_at`。
+    ///
+    /// stat の度に `now()` を返すと、NSDocument（macOS のプレビュー等）が
+    /// 「ファイルが別アプリに変更された」と誤検知して保存できなくなるため、
+    /// open 時点の値でセッション中は固定する。
+    modified_ft: u64,
 }
 
 struct HandleState {
@@ -69,23 +78,43 @@ impl YozistFileHandle {
         writable: bool,
     ) -> Result<Self, smb_server::SmbError> {
         let _ = deps;
-        let buffer = engine
+        let raw = engine
             .read_current(file_id)
             .await
             .map_err(|_| smb_server::SmbError::NotFound)?;
+        let meta = engine.meta.get_file(&file_id).await.ok().flatten();
         // blob は UTF-8。テキストは元エンコーディング（charset）へ再エンコードして
         // SMB クライアントへ「元の形式」で見せる。サイズ報告(snapshot_info)も
         // この buffer 長を使うため read/サイズとも整合する。
-        let buffer = match engine.meta.get_file(&file_id).await {
-            Ok(Some(meta)) => match meta.charset {
-                Some(cs) => {
-                    let text = String::from_utf8_lossy(&buffer);
-                    yozist_versioning::encode_text(&text, &cs)
-                }
-                None => buffer,
-            },
-            _ => buffer,
+        let buffer = match meta.as_ref().and_then(|m| m.charset.as_deref()) {
+            Some(cs) => {
+                let text = String::from_utf8_lossy(&raw);
+                yozist_versioning::encode_text(&text, cs)
+            }
+            None => raw,
         };
+        // 時刻はストア上の値で固定する。stat の度に now() を返すと NSDocument が
+        // 競合と誤検知し保存できなくなる（[[project_smb_safe_save]] 参照）。
+        let (creation_ft, modified_ft) = match &meta {
+            Some(m) => (
+                offset_dt_to_filetime(m.created_at),
+                offset_dt_to_filetime(m.updated_at),
+            ),
+            None => {
+                let now = system_time_to_filetime(SystemTime::now());
+                (now, now)
+            }
+        };
+        // 既存ファイルの size が提示サイズ（buffer 長）と食い違う場合は自己修復する。
+        // charset 対応前に作られた等で UTF-8 blob 長が記録されていると、一覧
+        // (file_meta_to_info=meta.size) と open(snapshot_info=buffer.len) が食い違い、
+        // macOS が folder 上のサイズと実体を reconcile できずループする。buffer は
+        // 既に読み込み済みなので追加 I/O は無い。updated_at は変えない（mtime 安定）。
+        if let Some(m) = meta.as_ref().filter(|m| m.size != buffer.len() as u64) {
+            let mut fixed = m.clone();
+            fixed.size = buffer.len() as u64;
+            let _ = engine.meta.update_file(&fixed).await;
+        }
         Ok(Self {
             inner: Mutex::new(HandleState {
                 file_id: Some(file_id),
@@ -104,6 +133,8 @@ impl YozistFileHandle {
             smb_actor_label: None,
             audit: None,
             actor: ActorId::new(),
+            creation_ft,
+            modified_ft,
         })
     }
 
@@ -131,6 +162,10 @@ impl YozistFileHandle {
             smb_actor_label: None,
             audit: None,
             actor: ActorId::new(),
+            // 新規ファイルは作成時刻のみ持つ。close 時の create_file までは
+            // ストア上に時刻が無いため open 時の現在時刻で固定する。
+            creation_ft: system_time_to_filetime(SystemTime::now()),
+            modified_ft: system_time_to_filetime(SystemTime::now()),
         }
     }
 
@@ -160,6 +195,10 @@ impl YozistFileHandle {
             smb_actor_label: None,
             audit: None,
             actor: ActorId::new(),
+            // 新規ファイルは作成時刻のみ持つ。close 時の create_file までは
+            // ストア上に時刻が無いため open 時の現在時刻で固定する。
+            creation_ft: system_time_to_filetime(SystemTime::now()),
+            modified_ft: system_time_to_filetime(SystemTime::now()),
         }
     }
 
@@ -190,6 +229,10 @@ impl YozistFileHandle {
             smb_actor_label: None,
             audit: None,
             actor: ActorId::new(),
+            // 新規ファイルは作成時刻のみ持つ。close 時の create_file までは
+            // ストア上に時刻が無いため open 時の現在時刻で固定する。
+            creation_ft: system_time_to_filetime(SystemTime::now()),
+            modified_ft: system_time_to_filetime(SystemTime::now()),
         }
     }
 
@@ -222,6 +265,10 @@ impl YozistFileHandle {
             smb_actor_label: None,
             audit: None,
             actor: ActorId::new(),
+            // 新規ファイルは作成時刻のみ持つ。close 時の create_file までは
+            // ストア上に時刻が無いため open 時の現在時刻で固定する。
+            creation_ft: system_time_to_filetime(SystemTime::now()),
+            modified_ft: system_time_to_filetime(SystemTime::now()),
         }
     }
 
@@ -248,15 +295,15 @@ impl YozistFileHandle {
 
     fn snapshot_info(&self) -> FileInfo {
         let st = self.inner.lock();
-        let now = system_time_to_filetime(SystemTime::now());
         FileInfo {
             name: st.display_name.clone(),
             end_of_file: st.buffer.len() as u64,
             allocation_size: st.buffer.len() as u64,
-            creation_time: now,
-            last_access_time: now,
-            last_write_time: now,
-            change_time: now,
+            // open 時に固定した時刻を返す（stat ごとに変えない）。
+            creation_time: self.creation_ft,
+            last_access_time: self.modified_ft,
+            last_write_time: self.modified_ft,
+            change_time: self.modified_ft,
             is_directory: false,
             file_index: 0,
         }
@@ -278,6 +325,7 @@ impl Handle for YozistFileHandle {
     }
 
     async fn write(&self, offset: u64, data: &[u8]) -> smb_server::SmbResult<u32> {
+        debug!(offset, len = data.len(), "YozistFileHandle::write");
         let mut st = self.inner.lock();
         if !st.writable {
             return Err(smb_server::SmbError::AccessDenied);
@@ -292,7 +340,32 @@ impl Handle for YozistFileHandle {
     }
 
     async fn flush(&self) -> smb_server::SmbResult<()> {
-        // commit はクローズ時に行う（部分書き込み中のコミットを避ける）。
+        // macOS（NSDocument: TextEdit/プレビュー等）は保存時に
+        // 「write → flush → 別ハンドルで再オープンして内容を検証」する。
+        // commit を close 時だけに行うと、その検証 read が `read_current`
+        // （＝コミット済み＝旧内容）を返し、アプリは「保存できていない」と
+        // 判断して延々リトライ（クルクル）する。よって既存ファイルは flush
+        // 時点で永続化し、再オープンで新内容が見えるようにする。
+        // （[[project_smb_safe_save]]）
+        let (file_id, buffer, dirty) = {
+            let st = self.inner.lock();
+            (st.file_id, st.buffer.clone(), st.dirty)
+        };
+        if !dirty {
+            return Ok(());
+        }
+        // 新規ファイル（file_id=None）は close 時の create_file に委ねる。
+        if let Some(id) = file_id {
+            self.engine
+                .commit(id, &buffer, self.actor, Some("smb".into()))
+                .await
+                .map_err(|e| {
+                    smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
+                })?;
+            // 直近 write 分はコミット済み。以降 write が無ければ close で再コミットしない。
+            self.inner.lock().dirty = false;
+            debug!(file_id = %id, bytes = buffer.len(), "YozistFileHandle::flush committed");
+        }
         Ok(())
     }
 
@@ -300,12 +373,19 @@ impl Handle for YozistFileHandle {
         Ok(self.snapshot_info())
     }
 
-    async fn set_times(&self, _times: FileTimes) -> smb_server::SmbResult<()> {
+    async fn set_times(&self, times: FileTimes) -> smb_server::SmbResult<()> {
         // TODO: FileMeta に時刻列を追加するか、commit metadata に保持
+        debug!(
+            creation = times.creation_time.is_some(),
+            last_write = times.last_write_time.is_some(),
+            change = times.change_time.is_some(),
+            "YozistFileHandle::set_times (no-op)"
+        );
         Ok(())
     }
 
     async fn truncate(&self, len: u64) -> smb_server::SmbResult<()> {
+        debug!(len, "YozistFileHandle::truncate");
         let mut st = self.inner.lock();
         if !st.writable {
             return Err(smb_server::SmbError::AccessDenied);
@@ -337,6 +417,13 @@ impl Handle for YozistFileHandle {
         let label = self.smb_actor_label.clone();
         let audit = self.audit.clone();
         let action_label: &str = if file_id.is_some() { "commit" } else { "create_file" };
+        debug!(
+            file_id = ?file_id,
+            dirty,
+            bytes = buffer.len(),
+            action = action_label,
+            "YozistFileHandle::close 開始"
+        );
         if !dirty {
             return Ok(());
         }
@@ -398,6 +485,11 @@ impl Handle for YozistFileHandle {
             }
         }
         .await;
+        debug!(
+            ok = inner_result.is_ok(),
+            action = action_label,
+            "YozistFileHandle::close commit/create 完了"
+        );
 
         // 監査記録（SMB 経由のみ）
         if let (Some(label), Some(audit)) = (label, audit) {
@@ -422,17 +514,51 @@ impl Handle for YozistFileHandle {
     }
 }
 
+/// 仮想ディレクトリの時刻フォールバック（配下が空などで最大値が取れない時）。
+/// 固定値（約 2022-06）。stat の度に変わらなければよく、値自体に意味は無い。
+const STABLE_DIR_FILETIME: u64 = 133_000_000_000_000_000;
+
 /// 仮想ディレクトリ Handle。`list_dir` のみ実装。
 pub struct YozistDirHandle {
     name: String,
     entries: Vec<DirEntry>,
+    creation_ft: u64,
+    modified_ft: u64,
 }
 
 impl YozistDirHandle {
     pub fn new(name: impl Into<String>, entries: Vec<DirEntry>) -> Self {
+        // ディレクトリの時刻は配下エントリの時刻から導く。stat の度に now() を
+        // 返すと、macOS が「ディレクトリが変化し続けている」と誤認して列挙を
+        // 無限ループする（[[project_smb_safe_save]]）。配下が変わらなければ
+        // 安定し、ファイル追加/更新時のみ変化する。
+        let modified_ft = entries
+            .iter()
+            .map(|e| e.info.last_write_time)
+            .filter(|&t| t != 0)
+            .max()
+            .unwrap_or(STABLE_DIR_FILETIME);
+        let creation_ft = entries
+            .iter()
+            .map(|e| e.info.creation_time)
+            .filter(|&t| t != 0)
+            .min()
+            .unwrap_or(STABLE_DIR_FILETIME);
+        let name = name.into();
+        // この値が stat の度（＝ディレクトリ open の度）に変わると macOS が
+        // 再列挙ループする。診断用に出力（安定していれば毎回同じ値のはず）。
+        debug!(
+            dir = %name,
+            entries = entries.len(),
+            modified_ft,
+            creation_ft,
+            "YozistDirHandle::new (dir mtime 安定化済み build)"
+        );
         Self {
-            name: name.into(),
+            name,
             entries,
+            creation_ft,
+            modified_ft,
         }
     }
 }
@@ -449,15 +575,15 @@ impl Handle for YozistDirHandle {
         Ok(())
     }
     async fn stat(&self) -> smb_server::SmbResult<FileInfo> {
-        let now = system_time_to_filetime(SystemTime::now());
         Ok(FileInfo {
             name: self.name.clone(),
             end_of_file: 0,
             allocation_size: 0,
-            creation_time: now,
-            last_access_time: now,
-            last_write_time: now,
-            change_time: now,
+            // 配下から導いた安定時刻を返す（stat ごとに変えない）。
+            creation_time: self.creation_ft,
+            last_access_time: self.modified_ft,
+            last_write_time: self.modified_ft,
+            change_time: self.modified_ft,
             is_directory: true,
             file_index: 0,
         })
@@ -470,11 +596,190 @@ impl Handle for YozistDirHandle {
     }
     async fn list_dir(
         &self,
-        _pattern: Option<&str>,
+        pattern: Option<&str>,
     ) -> smb_server::SmbResult<Vec<DirEntry>> {
-        Ok(self.entries.clone())
+        // SMB の QUERY_DIRECTORY は検索パターンで絞り込んで返す必要がある。
+        // 絞らずに全件返すと、クライアント（macOS）が「特定名の存在確認」を
+        // パターン検索で行ったとき、存在しない一時ファイル名(`*.sb-…`)に対しても
+        // 全件が返って「存在する」と誤認し、保存用 temp 名を連番で無限に探し続け
+        // （save が永久にスピン）てしまう。([[project_smb_safe_save]])
+        match pattern {
+            None => Ok(self.entries.clone()),
+            Some(pat) if pat == "*" || pat == "*.*" => Ok(self.entries.clone()),
+            Some(pat) => Ok(self
+                .entries
+                .iter()
+                .filter(|e| dos_glob_match(pat, &e.info.name))
+                .cloned()
+                .collect()),
+        }
     }
     async fn close(self: Box<Self>) -> smb_server::SmbResult<()> {
+        Ok(())
+    }
+}
+
+/// DOS 風ワイルドカード照合（`*`=任意の並び, `?`=任意の1文字, 大文字小文字無視）。
+/// SMB の QUERY_DIRECTORY のパターン絞り込みに使う。
+fn dos_glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let n: Vec<char> = name.to_lowercase().chars().collect();
+    // 反復的ワイルドカード照合（`*` をバックトラッキング）。
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star_pi, mut star_ni): (Option<usize>, usize) = (None, 0);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+// ---------------------------------------------------------------------------
+// スクラッチ FS（macOS のアトミック保存用・一時サブディレクトリの仮想サポート）
+// ---------------------------------------------------------------------------
+
+/// `/all` はフラットだが、macOS のドキュメント保存（`replaceItemAtURL:`）は
+/// 保存先と同じ場所に一時**サブディレクトリ**（`<本体>.sb-…` 等、任意名）を
+/// 作り、その中に新内容を書いて最後に本体へ差し替える。これを受け止めるための
+/// メモリ上スクラッチ FS。実体はメモリにのみ存在し、rename（スクラッチ内
+/// ファイル → 本体）で本体ファイルへ fold される。`[[project_smb_safe_save]]`
+#[derive(Default)]
+pub struct ScratchFs {
+    /// 仮想ディレクトリ名（パスの第1成分）。
+    pub dirs: std::collections::HashSet<String>,
+    /// `"dir/file"` → 内容。
+    pub files: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl ScratchFs {
+    /// `dir` 配下のファイル名一覧。
+    pub fn entries_in(&self, dir: &str) -> Vec<String> {
+        let prefix = format!("{dir}/");
+        self.files
+            .keys()
+            .filter_map(|k| k.strip_prefix(&prefix).map(|s| s.to_string()))
+            .collect()
+    }
+}
+
+pub type SharedScratch = Arc<Mutex<ScratchFs>>;
+
+/// スクラッチ FS 上のファイルハンドル。read/write/truncate はメモリ上の
+/// バッファを操作し、close してもスクラッチには残る（rename/unlink/rmdir で
+/// 破棄または本体へ fold される）。
+pub struct ScratchFileHandle {
+    scratch: SharedScratch,
+    key: String,
+    name: String,
+    readable: bool,
+    writable: bool,
+    ft: u64,
+}
+
+impl ScratchFileHandle {
+    pub fn new(
+        scratch: SharedScratch,
+        key: String,
+        name: String,
+        readable: bool,
+        writable: bool,
+    ) -> Self {
+        Self {
+            scratch,
+            key,
+            name,
+            readable,
+            writable,
+            ft: system_time_to_filetime(SystemTime::now()),
+        }
+    }
+}
+
+#[async_trait]
+impl Handle for ScratchFileHandle {
+    async fn read(&self, offset: u64, len: u32) -> smb_server::SmbResult<Bytes> {
+        if !self.readable {
+            return Err(smb_server::SmbError::AccessDenied);
+        }
+        let sc = self.scratch.lock();
+        match sc.files.get(&self.key) {
+            Some(b) if (offset as usize) < b.len() => {
+                let end = ((offset as usize) + len as usize).min(b.len());
+                Ok(Bytes::copy_from_slice(&b[offset as usize..end]))
+            }
+            _ => Ok(Bytes::new()),
+        }
+    }
+    async fn write(&self, offset: u64, data: &[u8]) -> smb_server::SmbResult<u32> {
+        if !self.writable {
+            return Err(smb_server::SmbError::AccessDenied);
+        }
+        let mut sc = self.scratch.lock();
+        let buf = sc.files.entry(self.key.clone()).or_default();
+        let end = offset as usize + data.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[offset as usize..end].copy_from_slice(data);
+        Ok(data.len() as u32)
+    }
+    async fn flush(&self) -> smb_server::SmbResult<()> {
+        Ok(())
+    }
+    async fn stat(&self) -> smb_server::SmbResult<FileInfo> {
+        let size = self
+            .scratch
+            .lock()
+            .files
+            .get(&self.key)
+            .map(|b| b.len())
+            .unwrap_or(0) as u64;
+        Ok(FileInfo {
+            name: self.name.clone(),
+            end_of_file: size,
+            allocation_size: size,
+            creation_time: self.ft,
+            last_access_time: self.ft,
+            last_write_time: self.ft,
+            change_time: self.ft,
+            is_directory: false,
+            file_index: 0,
+        })
+    }
+    async fn set_times(&self, _times: FileTimes) -> smb_server::SmbResult<()> {
+        Ok(())
+    }
+    async fn truncate(&self, len: u64) -> smb_server::SmbResult<()> {
+        if !self.writable {
+            return Err(smb_server::SmbError::AccessDenied);
+        }
+        let mut sc = self.scratch.lock();
+        sc.files.entry(self.key.clone()).or_default().resize(len as usize, 0);
+        Ok(())
+    }
+    async fn list_dir(
+        &self,
+        _pattern: Option<&str>,
+    ) -> smb_server::SmbResult<Vec<DirEntry>> {
+        Err(smb_server::SmbError::NotADirectory)
+    }
+    async fn close(self: Box<Self>) -> smb_server::SmbResult<()> {
+        // スクラッチはここでは破棄しない（rename で本体へ fold される）。
         Ok(())
     }
 }
