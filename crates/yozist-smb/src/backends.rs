@@ -118,6 +118,20 @@ impl AllBackend {
             .list_files(ALL_LIST_LIMIT, 0)
             .await
             .map_err(io_err)?;
+        // 旧バージョンで実ファイルとして永続化されてしまった AppleDouble / `.DS_Store`
+        // を後始末する（self-heal）。これらは一覧で非表示のため Finder からは
+        // 消せず、放置すると残り続ける。列挙のたびに見つけ次第 論理削除し、
+        // 一度消えれば次回以降は対象が無くなる。
+        for meta in files.iter().filter(|m| is_apple_metadata(&m.display_name)) {
+            let mut m = meta.clone();
+            m.deleted = true;
+            m.updated_at = time::OffsetDateTime::now_utc();
+            if let Err(e) = self.deps.meta.update_file(&m).await {
+                debug!(share = "all", name = m.display_name.as_str(), error = %e, "legacy AppleDouble cleanup failed");
+            } else {
+                debug!(share = "all", name = m.display_name.as_str(), "legacy AppleDouble cleanup");
+            }
+        }
         let mut entries: Vec<DirEntry> = files
             .into_iter()
             // ドット始まりは隠しファイル扱い。macOS の `._*` AppleDouble や
@@ -665,8 +679,21 @@ impl ShareBackend for AllBackend {
             debug!(share = "all", ?from_comp, ?to_comp, "AllBackend::rename (scratch)");
         }
         if from_scratch && to_comp.len() == 1 {
-            // 新内容（スクラッチ内ファイル）→ 本体: これが「保存の確定」。
             let from_key = format!("{}/{}", from_comp[0], from_comp[1]);
+            // 宛先が AppleDouble / `.DS_Store` の場合は本体へ fold せず ephemeral へ。
+            // macOS のアトミック保存は temp サブディレクトリ内に作った `._<canonical>`
+            // を最後にルートへ rename するため、ここを fold すると `._<uuid>__<filename>`
+            // が実ファイルとして永続化されてしまう（これが残存の主因）。
+            if is_apple_metadata(&to_comp[0]) {
+                let content = self.scratch.lock().files.remove(&from_key);
+                if let Some(c) = content {
+                    let tk = format!("{EPHEMERAL_DIR}/{}", to_comp[0]);
+                    self.scratch.lock().files.insert(tk, c);
+                }
+                debug!(share = "all", ?from_comp, ?to_comp, "AllBackend::rename (scratch→ephemeral)");
+                return Ok(());
+            }
+            // 新内容（スクラッチ内ファイル）→ 本体: これが「保存の確定」。
             return self
                 .fold_scratch_into_file(identity, &from_key, &to_comp[0])
                 .await;
@@ -1959,6 +1986,84 @@ mod all_backend_tests {
         // unlink は冪等成功（macOS の後始末がエラーにならない）。
         be.unlink(&id, &p("._abcd1234__report.txt")).await.unwrap();
         be.unlink(&id, &p(".DS_Store")).await.unwrap();
+    }
+
+    /// macOS のアトミック保存（temp サブディレクトリ → ルートへ rename）で運ばれる
+    /// AppleDouble が、本体へ fold されず実ファイルとして永続化されないこと。
+    /// （これが「修正したのにまだ `._<uuid>__<filename>` が残る」の主因だった）
+    #[tokio::test]
+    async fn apple_double_via_atomic_save_temp_dir_is_not_persisted() {
+        let (deps, _dir) = test_deps().await;
+        let alice = deps
+            .auth_db
+            .users()
+            .create("alice", "pw", "alice", None)
+            .await
+            .unwrap();
+        let id = user_identity("alice");
+
+        // 本体ファイルを用意（オーナー ACL 付き）。
+        let (orig, _) = deps
+            .engine
+            .create_file("report.txt", b"original", ActorId::new(), None)
+            .await
+            .unwrap();
+        deps.acl_admin
+            .add_rule(&Permission {
+                subject: Subject::User(alice.id),
+                target: Target::file(orig.id),
+                mask: PermissionMask::all(),
+                allow: true,
+                priority: i32::MAX,
+            })
+            .await
+            .unwrap();
+        let canonical = format!("{}{}{}", orig.id, ID_SEP, "report.txt");
+        let appledouble = format!("._{canonical}");
+        let tempdir = format!("{canonical}.sb-12345");
+
+        let be = AllBackend::new(deps.clone());
+
+        // 1) temp サブディレクトリを mkdir。
+        let mkdir_opts = OpenOptions {
+            read: true,
+            write: true,
+            intent: OpenIntent::Create,
+            directory: true,
+            non_directory: false,
+            delete_on_close: false,
+        };
+        be.open(&id, &p(&tempdir), mkdir_opts).await.unwrap();
+
+        // 2) temp 内に新内容 + AppleDouble を書き込み。
+        let inner_data = format!("{tempdir}/{canonical}");
+        let h = be
+            .open(&id, &p(&inner_data), write_opts(OpenIntent::OverwriteOrCreate))
+            .await
+            .unwrap();
+        h.write(0, b"edited!!").await.unwrap();
+        h.close().await.unwrap();
+        let inner_ad = format!("{tempdir}/{appledouble}");
+        let h = be
+            .open(&id, &p(&inner_ad), write_opts(OpenIntent::OverwriteOrCreate))
+            .await
+            .unwrap();
+        h.write(0, b"\x00\x05\x16\x07Mac OS X").await.unwrap();
+        h.close().await.unwrap();
+
+        // 3) temp 内 → ルートへ rename（本体 fold ＋ AppleDouble の移動）。
+        be.rename(&id, &p(&inner_data), &p(&canonical)).await.unwrap();
+        be.rename(&id, &p(&inner_ad), &p(&appledouble)).await.unwrap();
+
+        // 本体は編集後の内容で更新されている。
+        let content = deps.engine.read_current(orig.id).await.unwrap();
+        assert_eq!(content, b"edited!!");
+
+        // AppleDouble は実ファイルとして永続化されていない（本体 1 件のみ）。
+        let persisted = deps.meta.list_files(ALL_LIST_LIMIT, 0).await.unwrap();
+        let names: Vec<&String> = persisted.iter().map(|m| &m.display_name).collect();
+        assert_eq!(persisted.len(), 1, "余計なファイルが永続化された: {names:?}");
+        assert_eq!(persisted[0].display_name, "report.txt", "本体名が変わった: {names:?}");
     }
 
     /// インプレース上書き（truncate→write→close）は従来どおりコミットされる。
