@@ -420,18 +420,12 @@ function imgStageStyle(o, n) {
 function renderImgSide(cont, o, n) {
   cont.innerHTML = `
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 p-3">
-      <figure class="space-y-1">
-        <figcaption class="diff-del text-xs font-semibold px-2 py-0.5 rounded inline-block">旧</figcaption>
-        <div class="img-checker rounded p-1">
-          <img src="${o.url}" class="img-side-img" alt="旧">
-        </div>
-      </figure>
-      <figure class="space-y-1">
-        <figcaption class="diff-add text-xs font-semibold px-2 py-0.5 rounded inline-block">新</figcaption>
-        <div class="img-checker rounded p-1">
-          <img src="${n.url}" class="img-side-img" alt="新">
-        </div>
-      </figure>
+      <div class="img-checker rounded p-1">
+        <img src="${o.url}" class="img-side-img" alt="旧">
+      </div>
+      <div class="img-checker rounded p-1">
+        <img src="${n.url}" class="img-side-img" alt="新">
+      </div>
     </div>`;
 }
 
