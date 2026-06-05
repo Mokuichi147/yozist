@@ -442,10 +442,12 @@ function renderImgSwipe(cont, o, n) {
       </div>
       <p class="text-xs opacity-60">境界線をドラッグして旧/新を切り替えます。</p>
     </div>`;
-  const stage = $('img-stage'), newEl = $('img-new'), handle = $('img-handle');
+  const stage = $('img-stage'), oldEl = $('img-old'), newEl = $('img-new'), handle = $('img-handle');
   const apply = v => {
     v = Math.max(0, Math.min(100, v));
-    // ハンドルより右側に新画像を見せ、左側は旧画像を覗かせる
+    // 旧と新を重ねず境界線で左右に切り分ける。重ねると透過画像で下の画像が
+    // 透けてしまうため、それぞれを自分の側だけに描画し透過部分は市松模様を見せる。
+    oldEl.style.clipPath = `inset(0 ${100 - v}% 0 0)`;
     newEl.style.clipPath = `inset(0 0 0 ${v}%)`;
     handle.style.left = v + '%';
   };
@@ -475,7 +477,7 @@ function renderImgOnion(cont, o, n) {
   cont.innerHTML = `
     <div class="p-3 space-y-2">
       <div class="img-stage img-checker rounded" style="${imgStageStyle(o, n)}">
-        <img src="${o.url}" alt="旧">
+        <img id="img-old" src="${o.url}" alt="旧" style="opacity:0.5;">
         <img id="img-new" src="${n.url}" alt="新" style="opacity:0.5;">
       </div>
       <input id="img-range" type="range" min="0" max="100" value="50" class="range range-xs range-primary">
@@ -484,8 +486,14 @@ function renderImgOnion(cont, o, n) {
         <span class="diff-add px-1 rounded">新</span>
       </div>
     </div>`;
-  const range = $('img-range'), newEl = $('img-new');
-  range.oninput = () => { newEl.style.opacity = (+range.value / 100).toFixed(2); };
+  const range = $('img-range'), oldEl = $('img-old'), newEl = $('img-new');
+  // クロスフェード: 新を v、旧を 1-v にする。重ねた不透明度合算ではなく
+  // 一方を振り切れば他方が消えるため、透過画像でも下の画像が残らない。
+  range.oninput = () => {
+    const v = +range.value / 100;
+    newEl.style.opacity = v.toFixed(2);
+    oldEl.style.opacity = (1 - v).toFixed(2);
+  };
 }
 
 function renderImgDiff(cont, o, n) {
