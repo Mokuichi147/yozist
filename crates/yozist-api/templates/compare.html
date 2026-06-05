@@ -51,7 +51,8 @@
   .img-stage { position: relative; margin: 0 auto; max-width: 100%; }
   .img-stage img {
     position: absolute; inset: 0; width: 100%; height: 100%;
-    object-fit: contain; user-select: none; -webkit-user-drag: none;
+    object-fit: contain; object-position: left top;
+    user-select: none; -webkit-user-drag: none;
   }
   .img-handle {
     position: absolute; top: 0; bottom: 0; width: 2px;
@@ -67,6 +68,16 @@
   .img-side-img {
     display: block; max-width: 100%; max-height: 70vh;
     object-fit: contain; margin: 0 auto; border-radius: 0.375rem;
+  }
+  /* スライダー比較: 境界線を直接ドラッグ */
+  .img-swipe { cursor: ew-resize; touch-action: none; }
+  .img-swipe img { pointer-events: none; }
+  /* ステージ内に重ねる旧/新ラベル */
+  .img-tag {
+    position: absolute; top: 0.25rem; z-index: 1;
+    font-size: 0.7rem; font-weight: 600; line-height: 1;
+    padding: 0.125rem 0.375rem; border-radius: 0.25rem;
+    pointer-events: none; user-select: none;
   }
 {% endblock %}
 
@@ -410,42 +421,55 @@ function imgStageStyle(o, n) {
 function renderImgSide(cont, o, n) {
   cont.innerHTML = `
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 p-3">
-      <figure class="space-y-1">
-        <figcaption class="diff-del text-xs font-semibold px-2 py-0.5 rounded inline-block">旧</figcaption>
-        <div class="img-checker rounded p-1">
-          <img src="${o.url}" class="img-side-img" alt="旧">
-        </div>
-      </figure>
-      <figure class="space-y-1">
-        <figcaption class="diff-add text-xs font-semibold px-2 py-0.5 rounded inline-block">新</figcaption>
-        <div class="img-checker rounded p-1">
-          <img src="${n.url}" class="img-side-img" alt="新">
-        </div>
-      </figure>
+      <div class="img-checker rounded p-1">
+        <img src="${o.url}" class="img-side-img" alt="旧">
+      </div>
+      <div class="img-checker rounded p-1">
+        <img src="${n.url}" class="img-side-img" alt="新">
+      </div>
     </div>`;
 }
 
 function renderImgSwipe(cont, o, n) {
   cont.innerHTML = `
     <div class="p-3 space-y-2">
-      <div id="img-stage" class="img-stage img-checker rounded" style="${imgStageStyle(o, n)}">
+      <div id="img-stage" class="img-stage img-swipe img-checker rounded" style="${imgStageStyle(o, n)}">
         <img id="img-old" src="${o.url}" alt="旧">
         <img id="img-new" src="${n.url}" alt="新">
         <div id="img-handle" class="img-handle" style="left:50%;"></div>
+        <span class="img-tag diff-del" style="left:0.25rem;">旧</span>
+        <span class="img-tag diff-add" style="right:0.25rem;">新</span>
       </div>
-      <input id="img-range" type="range" min="0" max="100" value="50" class="range range-xs range-primary">
-      <div class="flex justify-between text-xs">
-        <span class="diff-del px-1 rounded">旧</span>
-        <span class="diff-add px-1 rounded">新</span>
-      </div>
+      <p class="text-xs opacity-60">境界線をドラッグして旧/新を切り替えます。</p>
     </div>`;
-  const range = $('img-range'), newEl = $('img-new'), handle = $('img-handle');
+  const stage = $('img-stage'), oldEl = $('img-old'), newEl = $('img-new'), handle = $('img-handle');
   const apply = v => {
-    // ハンドルより右側に新画像を見せ、左側は旧画像を覗かせる
+    v = Math.max(0, Math.min(100, v));
+    // 旧と新を重ねず境界線で左右に切り分ける。重ねると透過画像で下の画像が
+    // 透けてしまうため、それぞれを自分の側だけに描画し透過部分は市松模様を見せる。
+    oldEl.style.clipPath = `inset(0 ${100 - v}% 0 0)`;
     newEl.style.clipPath = `inset(0 0 0 ${v}%)`;
     handle.style.left = v + '%';
   };
-  range.oninput = () => apply(+range.value);
+  const posFromEvent = e => {
+    const rect = stage.getBoundingClientRect();
+    return ((e.clientX - rect.left) / rect.width) * 100;
+  };
+  let dragging = false;
+  stage.addEventListener('pointerdown', e => {
+    dragging = true;
+    stage.setPointerCapture(e.pointerId);
+    apply(posFromEvent(e));
+    e.preventDefault();
+  });
+  stage.addEventListener('pointermove', e => { if (dragging) apply(posFromEvent(e)); });
+  const stop = e => {
+    if (!dragging) return;
+    dragging = false;
+    try { stage.releasePointerCapture(e.pointerId); } catch (_) {}
+  };
+  stage.addEventListener('pointerup', stop);
+  stage.addEventListener('pointercancel', stop);
   apply(50);
 }
 
@@ -453,7 +477,7 @@ function renderImgOnion(cont, o, n) {
   cont.innerHTML = `
     <div class="p-3 space-y-2">
       <div class="img-stage img-checker rounded" style="${imgStageStyle(o, n)}">
-        <img src="${o.url}" alt="旧">
+        <img id="img-old" src="${o.url}" alt="旧" style="opacity:0.5;">
         <img id="img-new" src="${n.url}" alt="新" style="opacity:0.5;">
       </div>
       <input id="img-range" type="range" min="0" max="100" value="50" class="range range-xs range-primary">
@@ -462,8 +486,14 @@ function renderImgOnion(cont, o, n) {
         <span class="diff-add px-1 rounded">新</span>
       </div>
     </div>`;
-  const range = $('img-range'), newEl = $('img-new');
-  range.oninput = () => { newEl.style.opacity = (+range.value / 100).toFixed(2); };
+  const range = $('img-range'), oldEl = $('img-old'), newEl = $('img-new');
+  // クロスフェード: 新を v、旧を 1-v にする。重ねた不透明度合算ではなく
+  // 一方を振り切れば他方が消えるため、透過画像でも下の画像が残らない。
+  range.oninput = () => {
+    const v = +range.value / 100;
+    newEl.style.opacity = v.toFixed(2);
+    oldEl.style.opacity = (1 - v).toFixed(2);
+  };
 }
 
 function renderImgDiff(cont, o, n) {
