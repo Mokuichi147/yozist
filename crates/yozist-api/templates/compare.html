@@ -68,6 +68,16 @@
     display: block; max-width: 100%; max-height: 70vh;
     object-fit: contain; margin: 0 auto; border-radius: 0.375rem;
   }
+  /* スライダー比較: 境界線を直接ドラッグ */
+  .img-swipe { cursor: ew-resize; touch-action: none; }
+  .img-swipe img { pointer-events: none; }
+  /* ステージ内に重ねる旧/新ラベル */
+  .img-tag {
+    position: absolute; top: 0.25rem; z-index: 1;
+    font-size: 0.7rem; font-weight: 600; line-height: 1;
+    padding: 0.125rem 0.375rem; border-radius: 0.25rem;
+    pointer-events: none; user-select: none;
+  }
 {% endblock %}
 
 {% block content %}
@@ -428,24 +438,41 @@ function renderImgSide(cont, o, n) {
 function renderImgSwipe(cont, o, n) {
   cont.innerHTML = `
     <div class="p-3 space-y-2">
-      <div id="img-stage" class="img-stage img-checker rounded" style="${imgStageStyle(o, n)}">
+      <div id="img-stage" class="img-stage img-swipe img-checker rounded" style="${imgStageStyle(o, n)}">
         <img id="img-old" src="${o.url}" alt="旧">
         <img id="img-new" src="${n.url}" alt="新">
         <div id="img-handle" class="img-handle" style="left:50%;"></div>
+        <span class="img-tag diff-del" style="left:0.25rem;">旧</span>
+        <span class="img-tag diff-add" style="right:0.25rem;">新</span>
       </div>
-      <input id="img-range" type="range" min="0" max="100" value="50" class="range range-xs range-primary">
-      <div class="flex justify-between text-xs">
-        <span class="diff-del px-1 rounded">旧</span>
-        <span class="diff-add px-1 rounded">新</span>
-      </div>
+      <p class="text-xs opacity-60">境界線をドラッグして旧/新を切り替えます。</p>
     </div>`;
-  const range = $('img-range'), newEl = $('img-new'), handle = $('img-handle');
+  const stage = $('img-stage'), newEl = $('img-new'), handle = $('img-handle');
   const apply = v => {
+    v = Math.max(0, Math.min(100, v));
     // ハンドルより右側に新画像を見せ、左側は旧画像を覗かせる
     newEl.style.clipPath = `inset(0 0 0 ${v}%)`;
     handle.style.left = v + '%';
   };
-  range.oninput = () => apply(+range.value);
+  const posFromEvent = e => {
+    const rect = stage.getBoundingClientRect();
+    return ((e.clientX - rect.left) / rect.width) * 100;
+  };
+  let dragging = false;
+  stage.addEventListener('pointerdown', e => {
+    dragging = true;
+    stage.setPointerCapture(e.pointerId);
+    apply(posFromEvent(e));
+    e.preventDefault();
+  });
+  stage.addEventListener('pointermove', e => { if (dragging) apply(posFromEvent(e)); });
+  const stop = e => {
+    if (!dragging) return;
+    dragging = false;
+    try { stage.releasePointerCapture(e.pointerId); } catch (_) {}
+  };
+  stage.addEventListener('pointerup', stop);
+  stage.addEventListener('pointercancel', stop);
   apply(50);
 }
 
