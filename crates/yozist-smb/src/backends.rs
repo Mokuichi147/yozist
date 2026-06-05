@@ -27,6 +27,20 @@ const ALL_LIST_LIMIT: u32 = 1000;
 /// スクラッチ（一時保存）エントリの固定 FILETIME。listing 毎に揺らさない。
 const SCRATCH_FILETIME: u64 = 133_000_000_000_000_000;
 
+/// macOS が同階層に撒く付随メタデータ（AppleDouble `._*` と `.DS_Store`）を
+/// ルート直下で受けるための予約スクラッチ・ディレクトリ。SMB 名に現れ得ない
+/// NUL を含めることで実ディレクトリ名と衝突せず、`list_root` にも出さない
+/// （`dirs` には登録しない）。`[[project_smb_safe_save]]`
+const EPHEMERAL_DIR: &str = "\u{0}meta";
+
+/// macOS が本体ファイルに付随して撒くメタデータ名か。AppleDouble（`._*`、
+/// 拡張属性/リソースフォーク）と `.DS_Store`（フォルダ表示状態）が該当する。
+/// これらは yozist の実ファイルとして永続化する価値がないため、メモリ上の
+/// ephemeral スクラッチに閉じ込め、接続が切れれば消えるようにする。
+fn is_apple_metadata(name: &str) -> bool {
+    name.starts_with("._") || name == ".DS_Store"
+}
+
 /// `DbError` 等の文字列化可能なエラーを SMB の IO エラーへ畳み込む共通ヘルパ。
 fn io_err<E: std::fmt::Display>(e: E) -> SmbError {
     SmbError::Io(std::io::Error::other(e.to_string()))
@@ -244,6 +258,47 @@ impl AllBackend {
         }
     }
 
+    /// ルート直下の AppleDouble / `.DS_Store` をメモリ上 ephemeral として開く。
+    /// `open_scratch_file` と違い `dirs` には登録しないので `list_root` には
+    /// 現れず、DB/ストレージにも一切永続化されない。接続が切れれば消える。
+    async fn open_ephemeral_file(
+        &self,
+        name: &str,
+        opts: OpenOptions,
+    ) -> SmbResult<Box<dyn Handle>> {
+        if opts.directory {
+            return Err(SmbError::NotSupported);
+        }
+        let key = format!("{EPHEMERAL_DIR}/{name}");
+        debug!(
+            share = "all",
+            name,
+            intent = ?opts.intent,
+            write = opts.write,
+            "ephemeral (AppleDouble/.DS_Store) open"
+        );
+        let mut sc = self.scratch.lock();
+        let exists = sc.files.contains_key(&key);
+        match (opts.intent, exists) {
+            (OpenIntent::Open, false) | (OpenIntent::Truncate, false) => Err(SmbError::NotFound),
+            (OpenIntent::Create, true) => Err(SmbError::Exists),
+            _ => {
+                let buf = sc.files.entry(key.clone()).or_default();
+                if matches!(opts.intent, OpenIntent::Truncate | OpenIntent::OverwriteOrCreate) {
+                    buf.clear();
+                }
+                drop(sc);
+                Ok(Box::new(ScratchFileHandle::new(
+                    self.scratch.clone(),
+                    key,
+                    name.to_string(),
+                    opts.read,
+                    opts.write,
+                )))
+            }
+        }
+    }
+
     /// スクラッチ内ファイルの内容を本体ファイル `to_name` へ反映する（保存の確定）。
     /// 既存ファイルなら commit、無ければ新規 create_file。
     async fn fold_scratch_into_file(
@@ -365,6 +420,13 @@ impl ShareBackend for AllBackend {
             return Err(SmbError::PathNotFound);
         }
         let name = &components[0];
+
+        // macOS の付随メタデータ（AppleDouble `._*` / `.DS_Store`）はメモリ上の
+        // ephemeral に閉じ込め、DB/ストレージへ永続化しない。これが無いと
+        // 保存のたびに `._<uuid>__<filename>` が実ファイルとして残り続ける。
+        if is_apple_metadata(name) {
+            return self.open_ephemeral_file(name, opts).await;
+        }
 
         // 既存のスクラッチ・ディレクトリを開く。
         if self.scratch.lock().dirs.contains(name) {
@@ -530,6 +592,13 @@ impl ShareBackend for AllBackend {
             debug!(share = "all", dir = dir.as_str(), "scratch rmdir");
             return Ok(());
         }
+        // AppleDouble / `.DS_Store` はメモリ上 ephemeral から除去する。旧版で
+        // 永続化されてしまった legacy 実体は、続く通常削除（冪等）で後始末する。
+        if is_apple_metadata(&components[0]) {
+            let key = format!("{EPHEMERAL_DIR}/{}", components[0]);
+            self.scratch.lock().files.remove(&key);
+        }
+
         // 既に存在しない名前の削除は冪等に成功扱い（`rm -f` 相当）。macOS の
         // 安全保存スワップ後始末（identity 回復後に残骸 `.smbdelete…` を削除しに
         // 来る）が NotFound エラーにならないようにする。
@@ -571,6 +640,23 @@ impl ShareBackend for AllBackend {
     ) -> SmbResult<()> {
         let from_comp = from.components();
         let to_comp = to.components();
+
+        // --- ルート直下の AppleDouble / `.DS_Store`（メモリ上 ephemeral）---
+        // これらは永続化しないので、from が ephemeral の rename はバッファ移動で
+        // 完結させる（DB を経由させない）。移動先も付随メタデータなら内容を運び、
+        // そうでなければ内容を捨てて冪等成功にする（実ファイルへ化けさせない）。
+        if from_comp.len() == 1 && is_apple_metadata(&from_comp[0]) {
+            let fk = format!("{EPHEMERAL_DIR}/{}", from_comp[0]);
+            let content = self.scratch.lock().files.remove(&fk);
+            if to_comp.len() == 1 && is_apple_metadata(&to_comp[0]) {
+                if let Some(c) = content {
+                    let tk = format!("{EPHEMERAL_DIR}/{}", to_comp[0]);
+                    self.scratch.lock().files.insert(tk, c);
+                }
+            }
+            debug!(share = "all", ?from_comp, ?to_comp, "AllBackend::rename (ephemeral)");
+            return Ok(());
+        }
 
         // --- スクラッチ FS（一時サブディレクトリ）が絡む rename ---
         let from_scratch = from_comp.len() == 2;
@@ -1827,6 +1913,52 @@ mod all_backend_tests {
             "一時ファイルが残存: {names:?}"
         );
         assert!(names.iter().any(|n| n == &orig_name), "元ファイルが消えた: {names:?}");
+    }
+
+    /// macOS が本体に付随して撒く AppleDouble（`._*`）/ `.DS_Store` が、
+    /// 書き込めて読み戻せる一方で、DB/ストレージへは一切永続化されず接続に
+    /// 閉じた ephemeral として扱われること（修正前は実ファイルとして残った）。
+    #[tokio::test]
+    async fn apple_double_files_are_ephemeral_not_persisted() {
+        let (deps, _dir) = test_deps().await;
+        deps.auth_db
+            .users()
+            .create("alice", "pw", "alice", None)
+            .await
+            .unwrap();
+        let id = user_identity("alice");
+        let be = AllBackend::new(deps.clone());
+
+        for meta_name in ["._abcd1234__report.txt", ".DS_Store"] {
+            // 作成 → 書き込み → close。
+            let h = be
+                .open(&id, &p(meta_name), write_opts(OpenIntent::OverwriteOrCreate))
+                .await
+                .unwrap_or_else(|e| panic!("{meta_name} の作成に失敗: {e:?}"));
+            h.write(0, b"\x00\x05\x16\x07Mac OS X").await.unwrap();
+            h.close().await.unwrap();
+
+            // 同一接続中は開き直して読み戻せる（ephemeral に保持されている）。
+            let h2 = be
+                .open(&id, &p(meta_name), write_opts(OpenIntent::Open))
+                .await
+                .unwrap_or_else(|e| panic!("{meta_name} を開き直せない: {e:?}"));
+            let read = h2.read(0, 64).await.unwrap();
+            assert_eq!(&read[..], b"\x00\x05\x16\x07Mac OS X");
+            h2.close().await.unwrap();
+        }
+
+        // DB には実ファイルが 1 件も作られていない。
+        let persisted = deps.meta.list_files(ALL_LIST_LIMIT, 0).await.unwrap();
+        assert!(
+            persisted.is_empty(),
+            "AppleDouble/.DS_Store が永続化された: {:?}",
+            persisted.iter().map(|m| &m.display_name).collect::<Vec<_>>()
+        );
+
+        // unlink は冪等成功（macOS の後始末がエラーにならない）。
+        be.unlink(&id, &p("._abcd1234__report.txt")).await.unwrap();
+        be.unlink(&id, &p(".DS_Store")).await.unwrap();
     }
 
     /// インプレース上書き（truncate→write→close）は従来どおりコミットされる。
