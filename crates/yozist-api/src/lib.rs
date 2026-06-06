@@ -439,33 +439,26 @@ async fn commit_file(
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
-    // name 指定時はファイル名を更新し、mime/charset を None にリセットしておく。
-    // 後続の commit_streaming が DB からファイルを読み直し、新しい名前＋内容から
-    // mime/charset を再判定するため（アップロードによる「内容を更新」用）。
-    // rename と commit は別書き込みで非アトミックだが、commit 失敗時も mime は
-    // 次回読込/コミットで再補完されるため許容する。
-    if let Some(name) = q.name.as_deref() {
-        let mut file = s
-            .meta
-            .get_file(&id)
-            .await
-            .map_err(ApiError::from_db)?
-            .ok_or(ApiError::NotFound)?;
-        file.display_name = name.to_string();
-        file.mime = None;
-        file.charset = None;
-        s.meta.update_file(&file).await.map_err(ApiError::from_db)?;
-    }
     // ボディをメモリに載せず 1 チャンクずつ blob ストアへ流す。
     let stream = body
         .into_data_stream()
         .map_err(|e| StorageError::Other(e.to_string()))
         .boxed();
-    let result = s
-        .engine
-        .commit_streaming(id, stream, actor, q.message)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()));
+    // name 指定時（アップロードによる「内容を更新」）は前バージョンとマージせず
+    // 全置換する。形式・mime・charset・表示名を新しい名前＋内容から判定し直すため、
+    // 別形式へ差し替えても旧バージョンの解釈に引きずられず破損しない。
+    // name 無し（テキスト編集など）は従来どおり CRDT マージ経路。
+    let result = if let Some(name) = q.name {
+        s.engine
+            .replace_streaming(id, name, stream, actor, q.message)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    } else {
+        s.engine
+            .commit_streaming(id, stream, actor, q.message)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    };
 
     let id_str = id.to_string();
     let (actor_id, actor_label) = actor_info(&ctx);
