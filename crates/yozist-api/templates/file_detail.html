@@ -422,7 +422,8 @@ async function saveEdit() {
 }
 
 // アップロードしたファイルで content を置き換える（新しいコミットとして記録）。
-// display_name / mime は既存メタを維持し、内容のみ更新する。
+// name を渡すことで display_name を更新し、mime/charset はサーバが新しい名前＋
+// 内容から再判定する。
 async function uploadContent(file) {
   const input = $('fd-upload-input');
   if (!file) return;
@@ -431,8 +432,9 @@ async function uploadContent(file) {
       `"${currentFile.display_name}" の内容を "${file.name}" (${fmtSize(file.size)}) で更新しますか？\n(新しいコミットとして記録されます)`,
       { okText: '更新' }
     )) return;
-    const url = `/api/files/${fileId}/content?message=` +
-      encodeURIComponent(`upload ${file.name}`);
+    const url = `/api/files/${fileId}/content?name=` +
+      encodeURIComponent(file.name) +
+      `&message=` + encodeURIComponent(`upload ${file.name}`);
     const r = await api(url, {
       method: 'POST',
       body: await file.arrayBuffer(),

@@ -424,6 +424,9 @@ async fn get_content(
 struct CommitQuery {
     actor: Option<String>,
     message: Option<String>,
+    /// 指定時はファイル名を更新し、mime/charset を新しい名前＋内容から再判定する
+    /// （アップロードによる「内容を更新」用）。テキスト編集等では送らない。
+    name: Option<String>,
 }
 
 async fn commit_file(
@@ -436,6 +439,23 @@ async fn commit_file(
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
+    // name 指定時はファイル名を更新し、mime/charset を None にリセットしておく。
+    // 後続の commit_streaming が DB からファイルを読み直し、新しい名前＋内容から
+    // mime/charset を再判定するため（アップロードによる「内容を更新」用）。
+    // rename と commit は別書き込みで非アトミックだが、commit 失敗時も mime は
+    // 次回読込/コミットで再補完されるため許容する。
+    if let Some(name) = q.name.as_deref() {
+        let mut file = s
+            .meta
+            .get_file(&id)
+            .await
+            .map_err(ApiError::from_db)?
+            .ok_or(ApiError::NotFound)?;
+        file.display_name = name.to_string();
+        file.mime = None;
+        file.charset = None;
+        s.meta.update_file(&file).await.map_err(ApiError::from_db)?;
+    }
     // ボディをメモリに載せず 1 チャンクずつ blob ストアへ流す。
     let stream = body
         .into_data_stream()

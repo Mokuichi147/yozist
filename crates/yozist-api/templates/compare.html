@@ -147,25 +147,39 @@ let history = [];
 let currentCommitId = null;
 let fileCharset = null; // 元エンコーディング。/commits 本文のデコードに使う。
 let viewMode = 'unified';
-const contentCache = new Map();
+const bytesCache = new Map(); // commitId → Uint8Array（生バイト。デコード/種別判定の共通源）
 const expanded = new Set(); // 展開済みの equal セグメント index
 
 // --- 画像差分 ---
-let isImage = false;        // 対象ファイルが画像か（mime / 拡張子で判定）
-let fileMime = null;        // Blob/object URL 生成に使う MIME
 let imgMode = 'side';       // side | swipe | onion | diff
 let imgState = null;        // 直近に取得した {old, new} 画像情報（モード切替時の再描画用）
 const imgCache = new Map(); // commitId → { url, bytes, size, width, height }
 
-const EXT_MIME = {
-  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
-  webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp',
-  ico: 'image/x-icon', avif: 'image/avif',
-};
-function extOf(name) { return (String(name).split('.').pop() || '').toLowerCase(); }
-function isImageFile(mime, name) {
-  const m = (mime || '').toLowerCase();
-  return m.startsWith('image/') || /^(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/.test(extOf(name));
+// コミット単位の mime はメタに保持していない（content の Content-Type も常に
+// 最新ファイルの mime になる）ため、各コミットの実バイトから種別を判定する。
+// これにより「内容を更新」で形式が変わっても旧/新を正しく扱える。
+function sniffImageMime(b) {
+  if (b.length >= 4 && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47) return 'image/png';
+  if (b.length >= 3 && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF) return 'image/jpeg';
+  if (b.length >= 4 && b[0]===0x47 && b[1]===0x49 && b[2]===0x46 && b[3]===0x38) return 'image/gif';
+  if (b.length >= 12 && b[0]===0x52 && b[1]===0x49 && b[2]===0x46 && b[3]===0x46 &&
+      b[8]===0x57 && b[9]===0x45 && b[10]===0x42 && b[11]===0x50) return 'image/webp';
+  if (b.length >= 2 && b[0]===0x42 && b[1]===0x4D) return 'image/bmp';
+  if (b.length >= 4 && b[0]===0x00 && b[1]===0x00 && b[2]===0x01 && b[3]===0x00) return 'image/x-icon';
+  // SVG はテキストなのでマジックナンバーが無い。先頭付近に <svg があれば画像扱い。
+  const head = new TextDecoder('utf-8', { fatal: false }).decode(b.subarray(0, 512)).toLowerCase();
+  if (head.includes('<svg')) return 'image/svg+xml';
+  return null;
+}
+// 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）。
+function bytesLookBinary(b) {
+  const lim = Math.min(b.length, 8192);
+  for (let i = 0; i < lim; i++) if (b[i] === 0) return true;
+  return false;
+}
+function commitKind(bytes, imgMime) {
+  if (imgMime) return 'image';
+  return bytesLookBinary(bytes) ? 'binary' : 'text';
 }
 function fmtSize(n) {
   n = Number(n) || 0;
@@ -184,15 +198,13 @@ const detailUrl = '/ui/files/' + fileId;
 $('back-detail').href = detailUrl;
 $('back-link').href = detailUrl;
 
-async function fetchContent(commitId) {
-  if (contentCache.has(commitId)) return contentCache.get(commitId);
+async function fetchBytes(commitId) {
+  if (bytesCache.has(commitId)) return bytesCache.get(commitId);
   const r = await api(`/api/files/${fileId}/commits/${commitId}`);
   if (!r.ok) throw r;
-  // 元エンコーディング（fileCharset）でデコードする。r.text() は UTF-8 固定で
-  // charset を無視するため Shift-JIS 等が文字化けする。
-  const text = decodeBytes(await r.arrayBuffer(), fileCharset);
-  contentCache.set(commitId, text);
-  return text;
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  bytesCache.set(commitId, bytes);
+  return bytes;
 }
 
 function looksBinary(s) {
@@ -398,14 +410,11 @@ function loadImageMeta(url) {
   });
 }
 
-async function fetchImage(commitId) {
+// 取得済みバイトと sniff した mime から画像情報（object URL・寸法）を組み立てる。
+// Bearer 認証のため <img src> で直接参照できず、Blob + object URL を使う。
+async function imageInfo(commitId, bytes, mime) {
   if (imgCache.has(commitId)) return imgCache.get(commitId);
-  const r = await api(`/api/files/${fileId}/commits/${commitId}`);
-  if (!r.ok) throw r;
-  const buf = await r.arrayBuffer();
-  const bytes = new Uint8Array(buf);
-  // Bearer 認証のため <img src> で直接参照できず、Blob + object URL を使う。
-  const url = URL.createObjectURL(new Blob([buf], { type: fileMime }));
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
   const meta = await loadImageMeta(url);
   const info = { url, bytes, size: bytes.length, width: meta.width, height: meta.height };
   imgCache.set(commitId, info);
@@ -537,71 +546,111 @@ function renderImageDiff(o, n) {
   else renderImgDiff(cont, o, n);
 }
 
-function updateImage() {
-  const baseId = $('sel-base').value;
-  const compareId = $('sel-compare').value;
-  const newUrl = `${location.pathname}?base=${baseId}&compare=${compareId}`;
-  window.history.replaceState(null, '', newUrl);
-  $('cmp-message').classList.add('hidden');
-  $('cmp-diff').innerHTML = '<span class="opacity-50 text-xs p-3 block">画像を読み込み中…</span>';
-  Promise.all([fetchImage(baseId), fetchImage(compareId)]).then(([o, n]) => {
-    renderImageDiff(o, n);
-  }).catch(() => {
-    $('cmp-stats').textContent = '';
-    $('cmp-diff').innerHTML = '';
-    $('cmp-message').textContent = '画像の取得に失敗しました。';
-    $('cmp-message').classList.remove('hidden');
-  });
-}
-
 let lastSegs = null;
 
+// 表示モード切替ツールバーをコミット種別に応じて出し分ける。
+function showViews(kind) {
+  $('text-views').classList.toggle('hidden', kind !== 'text');
+  $('image-views').classList.toggle('hidden', kind !== 'image');
+}
+
 function update() {
-  if (isImage) return updateImage();
   const baseId = $('sel-base').value;
   const compareId = $('sel-compare').value;
   const newUrl = `${location.pathname}?base=${baseId}&compare=${compareId}`;
   window.history.replaceState(null, '', newUrl);
   expanded.clear();
   $('cmp-message').classList.add('hidden');
+  $('cmp-stats').textContent = '';
+  $('cmp-diff').innerHTML = '<span class="opacity-50 text-xs p-3 block">読み込み中…</span>';
 
-  Promise.all([fetchContent(baseId), fetchContent(compareId)]).then(([oldText, newText]) => {
-    if (looksBinary(oldText) || looksBinary(newText)) {
-      $('cmp-stats').textContent = '';
-      $('cmp-diff').innerHTML = '';
-      $('cmp-message').textContent = 'バイナリデータのため差分表示できません。';
-      $('cmp-message').classList.remove('hidden');
-      return;
+  Promise.all([fetchBytes(baseId), fetchBytes(compareId)]).then(([ob, nb]) => {
+    const oMime = sniffImageMime(ob), nMime = sniffImageMime(nb);
+    const oKind = commitKind(ob, oMime), nKind = commitKind(nb, nMime);
+
+    // 両方画像 / 両方テキストは専用の差分表示。形式（カテゴリ）をまたぐ場合や
+    // バイナリは行/画像差分が成立しないため、比較可能なメタ項目のみを表示する。
+    if (oKind === 'image' && nKind === 'image') {
+      showViews('image');
+      return Promise.all([imageInfo(baseId, ob, oMime), imageInfo(compareId, nb, nMime)])
+        .then(([o, n]) => renderImageDiff(o, n));
     }
-    if (oldText === newText) {
-      $('cmp-stats').innerHTML = '<span class="opacity-60">差分はありません</span>';
-      $('cmp-diff').innerHTML = '';
-      return;
+    if (oKind === 'text' && nKind === 'text') {
+      showViews('text');
+      return renderTextDiff(ob, nb);
     }
-    const oldLines = oldText.split('\n');
-    const newLines = newText.split('\n');
-    if (oldLines.length * newLines.length > 4_000_000) {
-      $('cmp-stats').textContent = '';
-      $('cmp-diff').innerHTML = '';
-      $('cmp-message').textContent =
-        'ファイルが大きすぎるため差分表示できません（行数が多すぎます）。';
-      $('cmp-message').classList.remove('hidden');
-      return;
-    }
-    const ops = lcsDiff(oldLines, newLines);
-    let added = 0, removed = 0;
-    for (const o of ops) { if (o.t === '+') added++; else if (o.t === '-') removed++; }
-    $('cmp-stats').innerHTML =
-      `<span class="text-success font-semibold">+${added}</span> ` +
-      `<span class="text-error font-semibold">-${removed}</span> ` +
-      `<span class="opacity-60">行</span>`;
-    lastSegs = buildSegments(ops, oldLines, newLines);
-    renderDiff(lastSegs);
+    showViews('none');
+    return renderMetaOnly(baseId, ob, oKind, oMime, compareId, nb, nKind, nMime);
   }).catch(() => {
+    $('cmp-stats').textContent = '';
     $('cmp-diff').innerHTML = '';
     $('cmp-message').textContent = 'コミット内容の取得に失敗しました。';
     $('cmp-message').classList.remove('hidden');
   });
+}
+
+function renderTextDiff(ob, nb) {
+  // 元エンコーディング（fileCharset）でデコードする。
+  const oldText = decodeBytes(ob.buffer, fileCharset);
+  const newText = decodeBytes(nb.buffer, fileCharset);
+  if (looksBinary(oldText) || looksBinary(newText)) {
+    $('cmp-stats').textContent = '';
+    $('cmp-diff').innerHTML = '';
+    $('cmp-message').textContent = 'バイナリデータのため差分表示できません。';
+    $('cmp-message').classList.remove('hidden');
+    return;
+  }
+  if (oldText === newText) {
+    $('cmp-stats').innerHTML = '<span class="opacity-60">差分はありません</span>';
+    $('cmp-diff').innerHTML = '';
+    return;
+  }
+  const oldLines = oldText.split('\n');
+  const newLines = newText.split('\n');
+  if (oldLines.length * newLines.length > 4_000_000) {
+    $('cmp-stats').textContent = '';
+    $('cmp-diff').innerHTML = '';
+    $('cmp-message').textContent =
+      'ファイルが大きすぎるため差分表示できません（行数が多すぎます）。';
+    $('cmp-message').classList.remove('hidden');
+    return;
+  }
+  const ops = lcsDiff(oldLines, newLines);
+  let added = 0, removed = 0;
+  for (const o of ops) { if (o.t === '+') added++; else if (o.t === '-') removed++; }
+  $('cmp-stats').innerHTML =
+    `<span class="text-success font-semibold">+${added}</span> ` +
+    `<span class="text-error font-semibold">-${removed}</span> ` +
+    `<span class="opacity-60">行</span>`;
+  lastSegs = buildSegments(ops, oldLines, newLines);
+  renderDiff(lastSegs);
+}
+
+// カテゴリをまたぐ更新・バイナリ: 比較可能なメタ項目のみを新旧で並べる。
+async function renderMetaOnly(baseId, ob, ok, om, compareId, nb, nk, nm) {
+  $('cmp-stats').textContent = '';
+  const kindLabel = k => k === 'image' ? '画像' : k === 'text' ? 'テキスト' : 'バイナリ';
+  const cell = async (commitId, b, k, mime) => {
+    let dim = '';
+    if (k === 'image') {
+      const info = await imageInfo(commitId, b, mime);
+      if (info.width) dim =
+        `<div><dt class="opacity-50">寸法</dt><dd class="font-mono">${info.width}×${info.height}</dd></div>`;
+    }
+    return `<dl class="space-y-2">
+      <div><dt class="opacity-50">種別</dt><dd>${kindLabel(k)}</dd></div>
+      <div><dt class="opacity-50">サイズ</dt><dd class="font-mono">${fmtSize(b.length)}</dd></div>
+      ${dim}
+    </dl>`;
+  };
+  const [oCell, nCell] = await Promise.all([
+    cell(baseId, ob, ok, om), cell(compareId, nb, nk, nm),
+  ]);
+  $('cmp-diff').innerHTML = `
+    <div class="grid grid-cols-2 gap-4 p-4 text-xs">
+      <div><span class="diff-del px-1 rounded inline-block mb-2 font-semibold">旧</span>${oCell}</div>
+      <div><span class="diff-add px-1 rounded inline-block mb-2 font-semibold">新</span>${nCell}</div>
+    </div>`;
 }
 
 function optionLabel(c) {
@@ -686,18 +735,11 @@ async function init() {
   }
   currentCommitId = file.current_commit;
   fileCharset = file.charset;
-  isImage = isImageFile(file.mime, file.display_name);
-  fileMime = file.mime || EXT_MIME[extOf(file.display_name)] || 'application/octet-stream';
   document.title = `yozist - ${file.display_name} の比較`;
   $('main').classList.remove('hidden');
   $('cmp-name').textContent = file.display_name;
 
-  // 画像は専用の比較モード（並べて / スライダー / 重ね合わせ / 差分）を提供する。
-  if (isImage) {
-    $('text-views').classList.add('hidden');
-    $('image-views').classList.remove('hidden');
-  }
-
+  // 表示モードのツールバーは比較ごとにコミット種別から決める（update 内 showViews）。
   buildSelectors();
   update();
 }
