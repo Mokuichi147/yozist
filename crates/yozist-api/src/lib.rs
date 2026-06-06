@@ -424,6 +424,9 @@ async fn get_content(
 struct CommitQuery {
     actor: Option<String>,
     message: Option<String>,
+    /// 指定時はファイル名を更新し、mime/charset を新しい名前＋内容から再判定する
+    /// （アップロードによる「内容を更新」用）。テキスト編集等では送らない。
+    name: Option<String>,
 }
 
 async fn commit_file(
@@ -441,11 +444,21 @@ async fn commit_file(
         .into_data_stream()
         .map_err(|e| StorageError::Other(e.to_string()))
         .boxed();
-    let result = s
-        .engine
-        .commit_streaming(id, stream, actor, q.message)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()));
+    // name 指定時（アップロードによる「内容を更新」）は前バージョンとマージせず
+    // 全置換する。形式・mime・charset・表示名を新しい名前＋内容から判定し直すため、
+    // 別形式へ差し替えても旧バージョンの解釈に引きずられず破損しない。
+    // name 無し（テキスト編集など）は従来どおり CRDT マージ経路。
+    let result = if let Some(name) = q.name {
+        s.engine
+            .replace_streaming(id, name, stream, actor, q.message)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    } else {
+        s.engine
+            .commit_streaming(id, stream, actor, q.message)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    };
 
     let id_str = id.to_string();
     let (actor_id, actor_label) = actor_info(&ctx);

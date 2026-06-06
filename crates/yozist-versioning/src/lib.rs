@@ -357,6 +357,86 @@ impl VersioningEngine {
         }
     }
 
+    /// アップロードによる内容の全置換。既存バージョンとはマージせず、新しい内容を
+    /// そのまま新コミットとして記録する。形式・mime・charset・表示名は新しい名前
+    /// ＋内容から判定し直すため、別形式へ差し替えても前バージョンの解釈
+    /// （例: PNG をテキストとして load）に引きずられず破損しない。
+    ///
+    /// `commit()`（CRDT マージ）と異なり前コミットの内容を読まないので、テキスト
+    /// 形式でも空状態から正規化する（= 新内容そのもの）。メタ更新は `persist_commit`
+    /// 内の単一書き込みに集約し、blob 保存に成功した場合のみ反映する。
+    pub async fn replace_streaming(
+        &self,
+        file_id: FileId,
+        new_name: String,
+        stream: ByteStream,
+        actor: ActorId,
+        message: Option<String>,
+    ) -> Result<Commit, VersioningError> {
+        let mut file = self
+            .meta
+            .get_file(&file_id)
+            .await?
+            .ok_or(VersioningError::NotFound(file_id))?;
+
+        // 表示名を更新し、mime/charset は確定済みでも破棄して再判定させる
+        // （persist_commit は None のときだけ hint/charset で補完する）。
+        file.display_name = new_name;
+        file.mime = None;
+        file.charset = None;
+
+        let mut hint = FormatHint {
+            extension: ext_of(&file.display_name),
+            mime: None,
+            first_bytes: None,
+            display_name: Some(file.display_name.clone()),
+        };
+        // mime を確定（PlainTextCrdt::detect 等の保存形式選択に効かせる）。
+        // 本文をバッファせず先頭バイトを覗き、ストリームは巻き戻す。
+        let (mime, stream) = resolve_stream_mime(&file.display_name, None, stream).await?;
+        hint.mime = mime;
+        let fmt = self.registry.resolve(&hint);
+        let now = time::OffsetDateTime::now_utc();
+
+        if fmt.supports_streaming() {
+            // バイナリ(LWW): 本文をメモリに載せず blob へ直接流す。
+            let (blob_id, size) = self.blob.put_stream(stream).await?;
+            self.persist_commit(
+                &mut file, blob_id, size, fmt.format_id(), actor, message, None, "", now, &hint,
+            )
+            .await
+        } else {
+            // テキスト等: バッファし、空状態から正規化（前バージョンとマージしない）。
+            let buf = collect_stream(stream).await?;
+            let normalized = self.normalize(&fmt, &buf, actor).await?;
+            let blob_id = self.blob.put(&normalized).await?;
+            let content_str = if fmt.format_id() == "text/plain" {
+                std::str::from_utf8(&normalized).unwrap_or("").to_string()
+            } else {
+                String::new()
+            };
+            let charset = if fmt.format_id() == "text/plain" {
+                Some(text::detect_charset(&buf))
+            } else {
+                None
+            };
+            let size = presented_size(&normalized, charset.as_deref());
+            self.persist_commit(
+                &mut file,
+                blob_id,
+                size,
+                fmt.format_id(),
+                actor,
+                message,
+                charset,
+                &content_str,
+                now,
+                &hint,
+            )
+            .await
+        }
+    }
+
     /// 新規ファイルの DB 反映（file + commit + current_commit 更新 + FTS）。
     /// buffered/streaming 両経路の共通部。
     #[allow(clippy::too_many_arguments)]
@@ -786,6 +866,48 @@ mod engine_tests {
             .unwrap();
         assert_eq!(c2.parent, Some(commit.id));
         assert_eq!(eng.read_current(file.id).await.unwrap(), vec![0xAA, 0xBB]);
+    }
+
+    #[tokio::test]
+    async fn replace_streaming_switches_format_without_corrupting() {
+        // 回帰: 画像(LWW)にテキストをアップロードして全置換しても、前バージョンの
+        // バイナリをテキスト形式で load してマージする破損が起きないこと。
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // 画像(LWW)として作成。
+        let (file, c1) = eng
+            .create_file_streaming(
+                "picture.png",
+                byte_stream(vec![b"\x89PNG\r\n\x1a\n\x00\x00data"]),
+                actor,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(c1.format_id, "_/lww");
+        assert_eq!(file.mime.as_deref(), Some("image/png"));
+
+        // テキストファイルで全置換。
+        let text = b"hello\nworld";
+        let c2 = eng
+            .replace_streaming(
+                file.id,
+                "notes.txt".into(),
+                byte_stream(vec![text]),
+                actor,
+                Some("upload notes.txt".into()),
+            )
+            .await
+            .unwrap();
+        // 履歴は連結され、形式・mime・charset・表示名が新内容から再判定される。
+        assert_eq!(c2.parent, Some(c1.id));
+        assert_eq!(c2.format_id, "text/plain");
+        // 破損していない: 取り出した内容が渡したテキストと完全一致。
+        assert_eq!(eng.read_current(file.id).await.unwrap(), text.to_vec());
+        let got = eng.meta.get_file(&file.id).await.unwrap().unwrap();
+        assert_eq!(got.display_name, "notes.txt");
+        assert_eq!(got.mime.as_deref(), Some("text/plain"));
+        assert_eq!(got.charset.as_deref(), Some("UTF-8"));
     }
 
     #[tokio::test]
