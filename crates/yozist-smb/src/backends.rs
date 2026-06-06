@@ -118,11 +118,12 @@ impl AllBackend {
             .list_files(ALL_LIST_LIMIT, 0)
             .await
             .map_err(io_err)?;
+        // ドット始まり（旧版で永続化されてしまった `._*`/`.DS_Store` 等）も隠さず
+        // そのまま一覧へ出す。隠すと Finder から手動で消せず残骸を管理できないため。
+        // 新規の `._*`/`.DS_Store` は永続化せず ephemeral に閉じ込めるので、ここに
+        // 現れるのは過去の残骸のみ（ユーザーが見て削除できる）。
         let mut entries: Vec<DirEntry> = files
             .into_iter()
-            // ドット始まりは隠しファイル扱い。macOS の `._*` AppleDouble や
-            // `.DS_Store` 等で一覧が汚れるのを防ぐ（実体は残るが表示しない）。
-            .filter(|meta| !meta.display_name.starts_with('.'))
             .map(|meta| {
                 let name = Self::display_filename(&meta);
                 DirEntry {
