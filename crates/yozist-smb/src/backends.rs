@@ -118,20 +118,6 @@ impl AllBackend {
             .list_files(ALL_LIST_LIMIT, 0)
             .await
             .map_err(io_err)?;
-        // 旧バージョンで実ファイルとして永続化されてしまった AppleDouble / `.DS_Store`
-        // を後始末する（self-heal）。これらは一覧で非表示のため Finder からは
-        // 消せず、放置すると残り続ける。列挙のたびに見つけ次第 論理削除し、
-        // 一度消えれば次回以降は対象が無くなる。
-        for meta in files.iter().filter(|m| is_apple_metadata(&m.display_name)) {
-            let mut m = meta.clone();
-            m.deleted = true;
-            m.updated_at = time::OffsetDateTime::now_utc();
-            if let Err(e) = self.deps.meta.update_file(&m).await {
-                debug!(share = "all", name = m.display_name.as_str(), error = %e, "legacy AppleDouble cleanup failed");
-            } else {
-                debug!(share = "all", name = m.display_name.as_str(), "legacy AppleDouble cleanup");
-            }
-        }
         let mut entries: Vec<DirEntry> = files
             .into_iter()
             // ドット始まりは隠しファイル扱い。macOS の `._*` AppleDouble や
