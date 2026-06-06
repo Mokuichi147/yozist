@@ -58,6 +58,8 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4 gap-2">
           <button class="btn btn-sm btn-block" onclick="downloadContent()">ダウンロード</button>
+          <button class="btn btn-sm btn-block" onclick="$('fd-upload-input').click()">内容を更新</button>
+          <input id="fd-upload-input" type="file" class="hidden" onchange="uploadContent(this.files[0])">
           <button class="btn btn-sm btn-block" onclick="issueShare()">共有URL</button>
           <button class="btn btn-sm btn-block" onclick="grantPermission()">権限付与</button>
           <button class="btn btn-sm btn-block btn-error btn-outline" onclick="deleteFile()">削除</button>
@@ -417,6 +419,34 @@ async function saveEdit() {
   currentFile = await json('/api/files/' + fileId);
   $('fd-editor').classList.add('hidden');
   await loadDetail();
+}
+
+// アップロードしたファイルで content を置き換える（新しいコミットとして記録）。
+// display_name / mime は既存メタを維持し、内容のみ更新する。
+async function uploadContent(file) {
+  const input = $('fd-upload-input');
+  if (!file) return;
+  try {
+    if (!await uiConfirm(
+      `"${currentFile.display_name}" の内容を "${file.name}" (${fmtSize(file.size)}) で更新しますか？\n(新しいコミットとして記録されます)`,
+      { okText: '更新' }
+    )) return;
+    const url = `/api/files/${fileId}/content?message=` +
+      encodeURIComponent(`upload ${file.name}`);
+    const r = await api(url, {
+      method: 'POST',
+      body: await file.arrayBuffer(),
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+    if (!r.ok) { uiToast('更新に失敗しました: ' + await r.text(), 'error'); return; }
+    uiToast('更新しました', 'success');
+    currentFile = await json('/api/files/' + fileId);
+    $('fd-editor').classList.add('hidden');
+    await loadDetail();
+  } finally {
+    // 同じファイルを連続で選んでも change が発火するようリセット
+    input.value = '';
+  }
 }
 
 async function addTag() {
