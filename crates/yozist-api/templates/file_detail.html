@@ -248,13 +248,18 @@ async function loadTags() {
   $('fd-tags').innerHTML = tags.length === 0
     ? '<span class="opacity-50 text-xs">タグなし</span>'
     : tags.map(t => {
-        // システムタグ（ext:/type: 等）は自動付与なので手動で外せないよう × を出さない
-        const removeBtn = t.kind === 'system' ? '' :
-          `<button type="button" class="cursor-pointer leading-none opacity-70 hover:opacity-100"
-                  title="タグを外す" onclick="detachTag('${t.id}')">×</button>`;
-        return `<span class="badge badge-sm ${tagVariant(t.kind)} gap-1">
-          ${escapeHtml(t.name)}${tagIcon(t.kind)}${removeBtn}
-        </span>`;
+        // システムタグ（ext:/type: 等）は自動付与なので手動で外せない（クリック不可・× なし）
+        if (t.kind === 'system') {
+          return `<span class="badge ${tagVariant(t.kind)} gap-1">
+            ${escapeHtml(t.name)}${tagIcon(t.kind)}
+          </span>`;
+        }
+        // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
+        return `<button type="button" class="badge ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
+                title="クリックでタグを外す" onclick="detachTag('${t.id}')">
+          ${escapeHtml(t.name)}${tagIcon(t.kind)}
+          <span class="leading-none opacity-70">×</span>
+        </button>`;
       }).join('');
   await loadTagCandidates();
 }
