@@ -26,20 +26,20 @@
 <body class="min-h-screen bg-base-200 text-base-content">
 
 <div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2 flex items-center gap-3">
+  <div class="flex-1 px-2 flex items-center gap-4">
     <a href="/ui" class="text-xl font-bold">yozist</a>
     {% if active != "login" %}
-    <div class="tabs tabs-boxed tabs-sm">
-      <a href="/ui/files" class="tab {% if active == "files" %}tab-active{% endif %}">ファイル</a>
+    <nav class="flex items-center gap-3 text-sm">
+      <a href="/ui/files" class="link link-hover {% if active == "files" %}font-semibold{% endif %}">ファイル</a>
       {% block subtabs %}{% endblock %}
-    </div>
+    </nav>
     {% endif %}
   </div>
   {% if active != "login" %}
-  <div class="flex-none flex items-center gap-3 px-2">
-    <a href="/ui/manage" class="btn btn-sm btn-ghost {% if active == "manage" %}btn-active{% endif %}">管理</a>
-    <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
-    <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
+  <div class="flex-none flex items-center gap-4 px-2 text-sm">
+    <a href="/ui/manage" class="link link-hover {% if active == "manage" %}font-semibold{% endif %}">管理</a>
+    <a id="me" href="/ui/settings" class="link link-hover" title="ユーザー設定">…</a>
+    <button id="logout" class="btn btn-sm btn-outline">ログアウト</button>
   </div>
   {% endif %}
 </div>
