@@ -31,13 +31,13 @@
     {% if active != "login" %}
     <div class="tabs tabs-boxed tabs-sm">
       <a href="/ui/files" class="tab {% if active == "files" %}tab-active{% endif %}">ファイル</a>
-      <a href="/ui/manage" class="tab {% if active == "manage" %}tab-active{% endif %}">管理</a>
       {% block subtabs %}{% endblock %}
     </div>
     {% endif %}
   </div>
   {% if active != "login" %}
   <div class="flex-none flex items-center gap-3 px-2">
+    <a href="/ui/manage" class="btn btn-sm btn-ghost {% if active == "manage" %}btn-active{% endif %}">管理</a>
     <a id="me" href="/ui/settings" class="btn btn-sm btn-ghost normal-case" title="ユーザー設定">…</a>
     <button id="logout" class="btn btn-sm btn-ghost">ログアウト</button>
   </div>
