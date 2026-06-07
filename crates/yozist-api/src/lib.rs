@@ -577,8 +577,22 @@ struct TagCreated {
     id: TagId,
 }
 
-async fn list_tags(State(s): State<ApiState>) -> Result<Json<Vec<Tag>>, ApiError> {
-    let tags = s.meta.list_tags().await.map_err(ApiError::from_db)?;
+#[derive(Deserialize)]
+struct ListTagsQuery {
+    /// "usage" を指定すると割り当て数の多い順で返す。未指定は名前昇順。
+    sort: Option<String>,
+}
+
+async fn list_tags(
+    State(s): State<ApiState>,
+    Query(q): Query<ListTagsQuery>,
+) -> Result<Json<Vec<Tag>>, ApiError> {
+    let tags = if q.sort.as_deref() == Some("usage") {
+        s.meta.list_tags_by_usage().await
+    } else {
+        s.meta.list_tags().await
+    }
+    .map_err(ApiError::from_db)?;
     Ok(Json(tags))
 }
 
