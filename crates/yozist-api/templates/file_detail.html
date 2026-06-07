@@ -273,6 +273,7 @@ function renderTagCandidates() {
   if (!box) return;
   const q = $('fd-add-tag').value.trim().toLowerCase();
   const cands = allTags.filter(t =>
+    t.kind !== 'system' &&        // システムタグ（ext:/type: 等）は自動付与なので候補に出さない
     !assignedTagIds.has(t.id) &&
     (q === '' || t.name.toLowerCase().includes(q))
   );
