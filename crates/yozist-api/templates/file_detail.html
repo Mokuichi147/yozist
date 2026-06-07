@@ -265,21 +265,18 @@ function renderTags() {
   if (!box) return;
   const q = $('fd-add-tag').value.trim().toLowerCase();
 
-  // 割り当て済み（選択済み）
-  const assignedHtml = assignedTags.map(t => {
-    // システムタグ（ext:/type: 等）は自動付与なので手動で外せない（クリック不可・× なし）
-    if (t.kind === 'system') {
-      return `<span class="badge badge-sm ${tagVariant(t.kind)} gap-1">
+  // 割り当て済み（選択済み）。システムタグ（ext:/type: 等）は自動付与で詳細情報に
+  // MIME 等として表示されるため、タグカードには出さない。
+  const assignedHtml = assignedTags
+    .filter(t => t.kind !== 'system')
+    .map(t =>
+      // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
+      `<button type="button" class="badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
+              title="クリックでタグを外す" onclick="detachTag('${t.id}')">
         ${escapeHtml(t.name)}${tagIcon(t.kind)}
-      </span>`;
-    }
-    // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
-    return `<button type="button" class="badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
-            title="クリックでタグを外す" onclick="detachTag('${t.id}')">
-      ${escapeHtml(t.name)}${tagIcon(t.kind)}
-      <span class="leading-none opacity-70">×</span>
-    </button>`;
-  }).join('');
+        <span class="leading-none opacity-70">×</span>
+      </button>`
+    ).join('');
 
   // 候補（未選択）。システムタグ・割り当て済みは除外し、入力でフィルター。
   const cands = allTags.filter(t =>
