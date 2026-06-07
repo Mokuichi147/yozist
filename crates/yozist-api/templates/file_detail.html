@@ -77,14 +77,13 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
           <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">タグ</h3>
-          <div id="fd-tags" class="flex flex-wrap gap-2"></div>
-          <div class="join w-full mt-1">
+          <div class="join w-full">
             <input id="fd-add-tag" class="input input-bordered input-sm join-item w-full"
                    placeholder="タグ名を入力して追加"
-                   oninput="renderTagCandidates()" onfocus="renderTagCandidates()">
+                   oninput="renderTags()" onfocus="renderTags()">
             <button class="btn btn-sm join-item" onclick="addTag()">+</button>
           </div>
-          <div id="fd-tag-candidates" class="flex flex-wrap gap-1 mt-1"></div>
+          <div id="fd-tags" class="flex flex-wrap gap-2 mt-1"></div>
         </div>
       </div>
 
@@ -150,6 +149,7 @@ let currentContent = '';
 let canEdit = false;          // 現在の content がテキスト編集可能か
 let contentObjectUrl = null;  // メディアプレビュー用の object URL
 let allTags = [];             // 全タグ（割り当て数の多い順）
+let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
 
 // 拡張子 → MIME（mime 未設定ファイルのフォールバック）
@@ -243,53 +243,61 @@ function tagIcon(kind) {
 }
 
 async function loadTags() {
-  const tags = await json(`/api/files/${fileId}/tags`);
-  assignedTagIds = new Set(tags.map(t => t.id));
-  $('fd-tags').innerHTML = tags.length === 0
-    ? '<span class="opacity-50 text-xs">タグなし</span>'
-    : tags.map(t => {
-        // システムタグ（ext:/type: 等）は自動付与なので手動で外せない（クリック不可・× なし）
-        if (t.kind === 'system') {
-          return `<span class="badge badge-sm ${tagVariant(t.kind)} gap-1">
-            ${escapeHtml(t.name)}${tagIcon(t.kind)}
-          </span>`;
-        }
-        // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
-        return `<button type="button" class="badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
-                title="クリックでタグを外す" onclick="detachTag('${t.id}')">
-          ${escapeHtml(t.name)}${tagIcon(t.kind)}
-          <span class="leading-none opacity-70">×</span>
-        </button>`;
-      }).join('');
+  assignedTags = await json(`/api/files/${fileId}/tags`);
+  assignedTagIds = new Set(assignedTags.map(t => t.id));
   await loadTagCandidates();
 }
 
-// 全タグを割り当て数の多い順で取得し、候補を再描画する。
+// 全タグを割り当て数の多い順で取得し、タグ表示を再描画する。
 async function loadTagCandidates() {
   try {
     allTags = await json('/api/tags?sort=usage');
   } catch (e) {
     allTags = [];
   }
-  renderTagCandidates();
+  renderTags();
 }
 
-// 入力中の文字列でフィルターし、割り当て済みを除いた候補を多い順で表示する。
-function renderTagCandidates() {
-  const box = $('fd-tag-candidates');
+// 割り当て済みタグ + 候補（未選択）を同じコンテナにまとめて描画する。
+// 候補は入力中の文字列でフィルターし、割り当て済みを除いて多い順で並べる。
+function renderTags() {
+  const box = $('fd-tags');
   if (!box) return;
   const q = $('fd-add-tag').value.trim().toLowerCase();
+
+  // 割り当て済み（選択済み）
+  const assignedHtml = assignedTags.map(t => {
+    // システムタグ（ext:/type: 等）は自動付与なので手動で外せない（クリック不可・× なし）
+    if (t.kind === 'system') {
+      return `<span class="badge badge-sm ${tagVariant(t.kind)} gap-1">
+        ${escapeHtml(t.name)}${tagIcon(t.kind)}
+      </span>`;
+    }
+    // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
+    return `<button type="button" class="badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
+            title="クリックでタグを外す" onclick="detachTag('${t.id}')">
+      ${escapeHtml(t.name)}${tagIcon(t.kind)}
+      <span class="leading-none opacity-70">×</span>
+    </button>`;
+  }).join('');
+
+  // 候補（未選択）。システムタグ・割り当て済みは除外し、入力でフィルター。
   const cands = allTags.filter(t =>
-    t.kind !== 'system' &&        // システムタグ（ext:/type: 等）は自動付与なので候補に出さない
+    t.kind !== 'system' &&
     !assignedTagIds.has(t.id) &&
     (q === '' || t.name.toLowerCase().includes(q))
   );
-  if (cands.length === 0) { box.innerHTML = ''; return; }
-  box.innerHTML = cands.slice(0, 30).map(t =>
+  const candHtml = cands.slice(0, 30).map(t =>
     `<button type="button"
              class="badge badge-sm badge-outline ${tagVariant(t.kind)} cursor-pointer hover:badge-soft"
              title="このタグを割り当てる" onclick="assignExistingTag('${t.id}')">+ ${escapeHtml(t.name)}${tagIcon(t.kind)}</button>`
   ).join('');
+
+  if (!assignedHtml && !candHtml) {
+    box.innerHTML = '<span class="opacity-50 text-xs">タグなし</span>';
+    return;
+  }
+  box.innerHTML = assignedHtml + candHtml;
 }
 
 // 既存タグを割り当てる（候補クリック時）。
