@@ -38,6 +38,8 @@ pub trait MetaStore: Send + Sync {
     async fn get_tag(&self, id: &TagId) -> Result<Option<Tag>, DbError>;
     async fn get_tag_by_name(&self, name: &str) -> Result<Option<Tag>, DbError>;
     async fn list_tags(&self) -> Result<Vec<Tag>, DbError>;
+    /// 割り当て数の多い順（同数は名前昇順）にタグを返す。タグ候補の提示に使う。
+    async fn list_tags_by_usage(&self) -> Result<Vec<Tag>, DbError>;
     async fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<(), DbError>;
     async fn delete_tag(&self, id: &TagId) -> Result<(), DbError>;
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;

@@ -80,9 +80,11 @@
           <div id="fd-tags" class="flex flex-wrap gap-1"></div>
           <div class="join w-full mt-1">
             <input id="fd-add-tag" class="input input-bordered input-sm join-item w-full"
-                   placeholder="タグ名を入力して追加">
+                   placeholder="タグ名を入力して追加"
+                   oninput="renderTagCandidates()" onfocus="renderTagCandidates()">
             <button class="btn btn-sm join-item" onclick="addTag()">+</button>
           </div>
+          <div id="fd-tag-candidates" class="flex flex-wrap gap-1 mt-1"></div>
         </div>
       </div>
 
@@ -147,6 +149,8 @@ let currentFile = null;
 let currentContent = '';
 let canEdit = false;          // 現在の content がテキスト編集可能か
 let contentObjectUrl = null;  // メディアプレビュー用の object URL
+let allTags = [];             // 全タグ（割り当て数の多い順）
+let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
 
 // 拡張子 → MIME（mime 未設定ファイルのフォールバック）
 const EXT_MIME = {
@@ -228,22 +232,67 @@ async function loadDetail() {
   await Promise.all([loadTags(), loadHistory(), renderContent()]);
 }
 
+// 種別ごとのバッジ配色（files 一覧と統一。ダークでも視認できるよう塗りつぶし）
+function tagVariant(kind) {
+  return kind === 'system' ? 'badge-neutral'
+       : kind === 'ai' ? 'badge-warning'
+       : 'badge-primary';
+}
+function tagIcon(kind) {
+  return kind === 'system' ? ' ⚙' : kind === 'ai' ? ' 🤖' : '';
+}
+
 async function loadTags() {
   const tags = await json(`/api/files/${fileId}/tags`);
+  assignedTagIds = new Set(tags.map(t => t.id));
   $('fd-tags').innerHTML = tags.length === 0
     ? '<span class="opacity-50 text-xs">タグなし</span>'
     : tags.map(t => {
-        // files 一覧と同じく種別は塗りつぶしバッジ + 絵文字で表現（ダークでも視認できるよう outline を使わない）
-        const variant = t.kind === 'system' ? 'badge-neutral'
-                      : t.kind === 'ai' ? 'badge-warning'
-                      : 'badge-primary';
-        const icon = t.kind === 'system' ? ' ⚙' : t.kind === 'ai' ? ' 🤖' : '';
-        return `<span class="badge badge-sm ${variant} gap-1">
-          ${escapeHtml(t.name)}${icon}
+        return `<span class="badge badge-sm ${tagVariant(t.kind)} gap-1">
+          ${escapeHtml(t.name)}${tagIcon(t.kind)}
           <button type="button" class="cursor-pointer leading-none opacity-70 hover:opacity-100"
                   title="タグを外す" onclick="detachTag('${t.id}')">×</button>
         </span>`;
       }).join('');
+  await loadTagCandidates();
+}
+
+// 全タグを割り当て数の多い順で取得し、候補を再描画する。
+async function loadTagCandidates() {
+  try {
+    allTags = await json('/api/tags?sort=usage');
+  } catch (e) {
+    allTags = [];
+  }
+  renderTagCandidates();
+}
+
+// 入力中の文字列でフィルターし、割り当て済みを除いた候補を多い順で表示する。
+function renderTagCandidates() {
+  const box = $('fd-tag-candidates');
+  if (!box) return;
+  const q = $('fd-add-tag').value.trim().toLowerCase();
+  const cands = allTags.filter(t =>
+    !assignedTagIds.has(t.id) &&
+    (q === '' || t.name.toLowerCase().includes(q))
+  );
+  if (cands.length === 0) { box.innerHTML = ''; return; }
+  box.innerHTML = cands.slice(0, 30).map(t =>
+    `<button type="button"
+             class="badge badge-sm badge-outline ${tagVariant(t.kind)} cursor-pointer hover:badge-soft"
+             title="このタグを割り当てる" onclick="assignExistingTag('${t.id}')">+ ${escapeHtml(t.name)}${tagIcon(t.kind)}</button>`
+  ).join('');
+}
+
+// 既存タグを割り当てる（候補クリック時）。
+async function assignExistingTag(tagId) {
+  const r = await api(`/api/files/${fileId}/tags`, {
+    method: 'POST', body: JSON.stringify({ tag_id: tagId }),
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
+  $('fd-add-tag').value = '';
+  await loadTags();
 }
 
 async function loadHistory() {

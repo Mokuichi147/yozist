@@ -322,6 +322,19 @@ impl MetaStore for SqliteMetaStore {
         rows.into_iter().map(row_to_tag).collect()
     }
 
+    async fn list_tags_by_usage(&self) -> Result<Vec<Tag>, DbError> {
+        let rows = sqlx::query(
+            r#"SELECT t.id, t.name, t.kind, t.confidence
+               FROM tags t
+               LEFT JOIN file_tags ft ON ft.tag_id = t.id
+               GROUP BY t.id, t.name, t.kind, t.confidence
+               ORDER BY COUNT(ft.file_id) DESC, t.name ASC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_tag).collect()
+    }
+
     async fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<(), DbError> {
         let res = sqlx::query("UPDATE tags SET name = ? WHERE id = ?")
             .bind(new_name)
