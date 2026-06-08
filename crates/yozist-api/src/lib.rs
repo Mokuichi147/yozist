@@ -372,17 +372,17 @@ async fn delete_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 保存済み MIME を Content-Type に設定して本文を返す。未設定なら octet-stream。
+/// 保存済み MIME と本文を、配信用の `(Content-Type, body)` に整える。
 ///
 /// テキストファイル（`charset` あり）は blob に UTF-8 で保存されているため、
 /// 取り込み時に判定した元エンコーディングへ再エンコードして「元の形式」で返す。
 /// 併せて `Content-Type` に `charset=` を付与し、ブラウザが正しくデコードできる
 /// ようにする。`charset` が `None`（バイナリ）はそのまま返す。
-fn content_response(
+fn encode_content(
     mime: Option<String>,
     charset: Option<String>,
     bytes: Vec<u8>,
-) -> impl IntoResponse {
+) -> (String, Vec<u8>) {
     let mut ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
     let body = match &charset {
         Some(cs) => {
@@ -396,14 +396,115 @@ fn content_response(
         }
         None => bytes,
     };
+    (ct, body)
+}
+
+/// 保存済み MIME を Content-Type に設定して本文を返す。未設定なら octet-stream。
+fn content_response(
+    mime: Option<String>,
+    charset: Option<String>,
+    bytes: Vec<u8>,
+) -> impl IntoResponse {
+    let (ct, body) = encode_content(mime, charset, bytes);
     ([(axum::http::header::CONTENT_TYPE, ct)], body)
+}
+
+/// `Range: bytes=START-END` を解釈して単一レンジ `(start, end)`（両端含む）を返す。
+/// 巨大ファイルをフロントが分割取得するための最小実装。複数レンジ・範囲外・
+/// 空ファイルは `None`（呼び出し側で 416 か全体返却に振り分ける）。
+///
+/// - `bytes=0-1023` → `(0, 1023)`
+/// - `bytes=1024-`  → `(1024, total-1)`
+/// - `bytes=-512`   → 末尾 512 バイト
+fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.trim().strip_prefix("bytes=")?;
+    // 複数レンジ（カンマ区切り）は非対応。
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let (start, end) = if start_s.is_empty() {
+        // suffix レンジ: 末尾 N バイト。
+        let n: u64 = end_s.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(total);
+        (total - n, total - 1)
+    } else {
+        let start: u64 = start_s.trim().parse().ok()?;
+        let end: u64 = if end_s.trim().is_empty() {
+            total - 1
+        } else {
+            end_s.trim().parse().ok()?
+        };
+        (start, end.min(total - 1))
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// `Range` ヘッダがあれば 206 Partial Content で該当範囲のみ、無ければ 200 で全体を返す。
+/// テキスト/メディアともにフロントが必要な分だけ取得できるよう、常に
+/// `Accept-Ranges: bytes` を付与する。解釈できるが範囲外の Range は 416 を返す。
+fn range_response(
+    content_type: String,
+    body: Vec<u8>,
+    range: Option<&axum::http::HeaderValue>,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let total = body.len() as u64;
+    let ct = HeaderValue::from_str(&content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let accept = HeaderValue::from_static("bytes");
+
+    let parsed = range
+        .and_then(|h| h.to_str().ok())
+        .map(|s| (s, parse_byte_range(s, total)));
+
+    match parsed {
+        Some((_, Some((start, end)))) => {
+            let slice = body[start as usize..=end as usize].to_vec();
+            let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
+            let h = resp.headers_mut();
+            h.insert(header::CONTENT_TYPE, ct);
+            h.insert(header::ACCEPT_RANGES, accept);
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                h.insert(header::CONTENT_RANGE, v);
+            }
+            resp
+        }
+        Some((_, None)) => {
+            // Range ヘッダはあるが解釈不能/範囲外 → 416。
+            let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            let h = resp.headers_mut();
+            h.insert(header::ACCEPT_RANGES, accept);
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                h.insert(header::CONTENT_RANGE, v);
+            }
+            resp
+        }
+        None => {
+            let mut resp = body.into_response();
+            let h = resp.headers_mut();
+            h.insert(header::CONTENT_TYPE, ct);
+            h.insert(header::ACCEPT_RANGES, accept);
+            resp
+        }
+    }
 }
 
 async fn get_content(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
     let file = s
@@ -417,7 +518,8 @@ async fn get_content(
         .read_current(id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(content_response(file.mime, file.charset, bytes))
+    let (ct, body) = encode_content(file.mime, file.charset, bytes);
+    Ok(range_response(ct, body, headers.get(axum::http::header::RANGE)))
 }
 
 #[derive(Deserialize)]
@@ -2142,6 +2244,49 @@ mod tests {
             bom.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
             "text/markdown; charset=UTF-8"
         );
+    }
+
+    #[test]
+    fn parse_byte_range_handles_common_forms() {
+        // 通常レンジ・両端含む。
+        assert_eq!(parse_byte_range("bytes=0-1023", 4096), Some((0, 1023)));
+        // 開始のみ → 末尾まで。
+        assert_eq!(parse_byte_range("bytes=1024-", 4096), Some((1024, 4095)));
+        // 末尾 N バイト。
+        assert_eq!(parse_byte_range("bytes=-512", 4096), Some((3584, 4095)));
+        // end が total を超える場合は total-1 にクランプ。
+        assert_eq!(parse_byte_range("bytes=0-99999", 4096), Some((0, 4095)));
+        // suffix が total を超える場合は全体。
+        assert_eq!(parse_byte_range("bytes=-99999", 4096), Some((0, 4095)));
+        // 範囲外・複数レンジ・空ファイル・不正は None。
+        assert_eq!(parse_byte_range("bytes=5000-6000", 4096), None);
+        assert_eq!(parse_byte_range("bytes=0-100,200-300", 4096), None);
+        assert_eq!(parse_byte_range("bytes=0-100", 0), None);
+        assert_eq!(parse_byte_range("items=0-100", 4096), None);
+    }
+
+    #[test]
+    fn range_response_returns_partial_content() {
+        use axum::http::{header, HeaderValue};
+        let body = (0u8..=9).collect::<Vec<u8>>();
+        let range = HeaderValue::from_static("bytes=2-5");
+        let resp = range_response("text/plain".into(), body.clone(), Some(&range));
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+
+        // Range 無しは 200 で Accept-Ranges のみ付与。
+        let full = range_response("text/plain".into(), body.clone(), None);
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+
+        // 範囲外は 416。
+        let bad = HeaderValue::from_static("bytes=100-200");
+        let oob = range_response("text/plain".into(), body, Some(&bad));
+        assert_eq!(oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
     async fn make_state() -> (ApiState, tempfile::TempDir) {

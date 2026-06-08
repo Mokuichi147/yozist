@@ -152,6 +152,15 @@ let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
 
+// --- テキストの分割読み込み状態 ---
+// 巨大ファイルでも一度に全体を読まず、先頭チャンクのみ取得して表示し、
+// 必要に応じて続きを追記する。currentContent には読み込み済みの全文を保持する。
+const TEXT_CHUNK_BYTES = 256 * 1024; // 1 回の追加読み込みで取得するバイト数
+let textTotalBytes = 0;       // content 全体のバイト数（charset 再エンコード後）
+let textLoadedBytes = 0;      // これまでに取得したバイト数
+let textDecoder = null;       // チャンク境界をまたぐためのストリーミングデコーダ
+let textFullyLoaded = true;   // 全文を取得済みか
+
 // 拡張子 → MIME（mime 未設定ファイルのフォールバック）
 const EXT_MIME = {
   png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif',
@@ -359,6 +368,34 @@ function looksBinary(buf) {
   return false;
 }
 
+// content の charset に対応する TextDecoder を作る（decodeBytes と同じ規則）。
+// stream:true で順次デコードするため、チャンク境界でマルチバイト文字が割れない。
+function makeDecoder(charset) {
+  let label = 'utf-8';
+  if (charset) label = (charset.toLowerCase() === 'utf-8-bom') ? 'utf-8' : charset;
+  try { return new TextDecoder(label, { fatal: false }); }
+  catch (_) { return new TextDecoder('utf-8', { fatal: false }); }
+}
+
+// content の [start, start+len) を Range リクエストで取得する。
+// 返り値 { buf, total }。total はサーバの Content-Range から得た全体バイト数
+// （Range 非対応サーバが 200 で全体を返した場合は本文長）。
+async function fetchContentRange(start, len) {
+  const end = start + len - 1; // inclusive
+  const r = await api(`/api/files/${fileId}/content`, {
+    headers: { Range: `bytes=${start}-${end}` },
+  });
+  if (!r.ok && r.status !== 206) {
+    throw new Error((await r.text().catch(() => '')) || r.statusText);
+  }
+  const buf = await r.arrayBuffer();
+  let total = buf.byteLength;
+  const cr = r.headers.get('Content-Range'); // "bytes start-end/total"
+  const m = cr && /\/(\d+)\s*$/.exec(cr);
+  if (m) total = parseInt(m[1], 10);
+  return { buf, total };
+}
+
 // content をデータ種別に応じた要素で描画する
 async function renderContent() {
   revokeContentUrl();
@@ -385,26 +422,80 @@ async function renderContent() {
       cont.innerHTML = `<iframe src="${url}" title="${escapeHtml(currentFile.display_name)}"
         class="w-full h-[70vh] rounded border border-base-300"></iframe>`;
     } else {
-      // text / unknown: バイト列を取得し、バイナリらしければプレビュー不可表示。
-      // charset があるものはサーバがテキストとして保持しているため常にテキスト扱い
-      // （UTF-16 はヌルバイトを含み looksBinary に誤検知されるのを避ける）。
-      const buf = await fetchContentBytes();
-      if (kind === 'unknown' && !currentFile.charset && looksBinary(buf)) {
-        renderBinary(cont);
-      } else {
-        const text = decodeBytes(buf, currentFile.charset);
-        currentContent = text;
-        canEdit = true;
-        const pre = document.createElement('pre');
-        pre.className = 'bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[75vh] whitespace-pre-wrap break-words';
-        pre.textContent = text.length > 20000 ? text.slice(0, 20000) + '\n…' : text;
-        cont.replaceChildren(pre);
-      }
+      // text / unknown: 分割取得で表示（巨大ファイル対策）。
+      await renderTextContent(cont, kind);
     }
   } catch (e) {
     cont.innerHTML = `<span class="text-error text-xs">content の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
   }
   $('fd-edit-btn').classList.toggle('hidden', !canEdit);
+}
+
+// テキスト/不明データを分割取得して表示する。先頭チャンクで判定・表示し、
+// 続きがあれば「さらに読み込む / 全て表示」で追記する。
+async function renderTextContent(cont, kind) {
+  const first = await fetchContentRange(0, TEXT_CHUNK_BYTES);
+  // charset があるものはサーバがテキストとして保持しているため常にテキスト扱い
+  // （UTF-16 はヌルバイトを含み looksBinary に誤検知されるのを避ける）。
+  if (kind === 'unknown' && !currentFile.charset && looksBinary(first.buf)) {
+    renderBinary(cont);
+    return;
+  }
+  canEdit = true;
+  textTotalBytes = first.total;
+  textLoadedBytes = first.buf.byteLength;
+  textDecoder = makeDecoder(currentFile.charset);
+  textFullyLoaded = textLoadedBytes >= textTotalBytes;
+
+  const pre = document.createElement('pre');
+  pre.id = 'fd-text-pre';
+  pre.className = 'bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[75vh] whitespace-pre-wrap break-words';
+  const chunkText = textDecoder.decode(first.buf, { stream: !textFullyLoaded });
+  currentContent = chunkText;
+  pre.appendChild(document.createTextNode(chunkText));
+  cont.replaceChildren(pre);
+  renderLoadMore(cont);
+}
+
+// 続きの有無に応じて「さらに読み込む / 全て表示」バーを描画/撤去する。
+function renderLoadMore(cont) {
+  const old = $('fd-text-more');
+  if (old) old.remove();
+  if (textFullyLoaded) return;
+  const bar = document.createElement('div');
+  bar.id = 'fd-text-more';
+  bar.className = 'mt-2 flex items-center gap-2 text-xs flex-wrap';
+  bar.innerHTML =
+    `<span class="opacity-60">${fmtSize(textLoadedBytes)} / ${fmtSize(textTotalBytes)} 表示中</span>` +
+    `<button class="btn btn-xs" onclick="loadMoreText()">さらに読み込む</button>` +
+    `<button class="btn btn-xs btn-outline" onclick="loadAllText()">全て表示</button>`;
+  cont.appendChild(bar);
+}
+
+// 次のチャンクを取得して表示と currentContent に追記する。
+async function appendNextChunk() {
+  if (textFullyLoaded) return;
+  const { buf, total } = await fetchContentRange(textLoadedBytes, TEXT_CHUNK_BYTES);
+  textTotalBytes = total;
+  textLoadedBytes += buf.byteLength;
+  // 取得バイトが 0 なら（想定外でも）ループを止める。
+  textFullyLoaded = textLoadedBytes >= textTotalBytes || buf.byteLength === 0;
+  const chunkText = textDecoder.decode(buf, { stream: !textFullyLoaded });
+  currentContent += chunkText;
+  const pre = $('fd-text-pre');
+  if (pre) pre.appendChild(document.createTextNode(chunkText));
+}
+
+async function loadMoreText() {
+  await appendNextChunk();
+  renderLoadMore($('fd-content'));
+}
+
+// 残り全チャンクを順次読み込む。編集前の全文取得にも使う。
+async function loadAllText() {
+  let guard = 0;
+  while (!textFullyLoaded && guard++ < 100000) await appendNextChunk();
+  renderLoadMore($('fd-content'));
 }
 
 function renderBinary(cont) {
@@ -446,11 +537,21 @@ async function rollback(commitId, time) {
   await loadDetail();
 }
 
-function toggleEdit() {
+async function toggleEdit() {
   if (!canEdit) { uiToast('このファイルはテキスト編集に対応していません', 'warning'); return; }
   const ed = $('fd-editor');
   const cont = $('fd-content');
   if (ed.classList.contains('hidden')) {
+    // 編集には全文が必要。未読込分があればここで残りを取得する。
+    if (!textFullyLoaded) {
+      const btn = $('fd-edit-btn');
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '読み込み中…';
+      try { await loadAllText(); }
+      catch (e) { uiToast('全文の読み込みに失敗しました: ' + e.message, 'error'); return; }
+      finally { btn.disabled = false; btn.textContent = label; }
+    }
     const ta = $('fd-edit-textarea');
     ta.value = currentContent;
     $('fd-edit-message').value = '';
