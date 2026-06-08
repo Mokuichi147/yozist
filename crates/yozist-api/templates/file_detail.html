@@ -146,24 +146,28 @@
 <script>
 const fileId = location.pathname.split('/').pop();
 let currentFile = null;
-let currentContent = '';
 let canEdit = false;          // 現在の content がテキスト編集可能か
 let contentObjectUrl = null;  // メディアプレビュー用の object URL
 let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
 
-// --- テキストの分割読み込み状態 ---
-// 巨大ファイルでも一度に全体を読まず、先頭チャンクのみ取得して表示し、
-// 必要に応じて続きを追記する。currentContent には読み込み済みの全文を保持する。
-const TEXT_CHUNK_BYTES = 256 * 1024; // 1 回の追加読み込みで取得するバイト数
-let textTotalBytes = 0;       // content 全体のバイト数（charset 再エンコード後）
-let textLoadedBytes = 0;      // これまでに取得したバイト数
-let textDecoder = null;       // チャンク境界をまたぐためのストリーミングデコーダ
-let textFullyLoaded = true;   // 全文を取得済みか
-let editKeepFrom = null;      // 部分編集時、保持する末尾の開始位置（ストレージ UTF-8 バイト）
-
-function utf8Len(str) { return new TextEncoder().encode(str).length; }
+// --- テキストの仮想スクロール状態 ---
+// 巨大ファイルでも全体を読まず、スクロール位置に応じてチャンクを動的にロードし、
+// 画面から離れたチャンクは解放（リリース）してメモリを一定に保つ。
+// ビューアはストレージの生 UTF-8 を読む（?utf8=1）。UTF-8 は継続バイトで文字
+// 境界を判定でき、チャンクを独立にデコード／解放／再ロードできるため。
+const TEXT_CHUNK_BYTES = 256 * 1024;   // 1 チャンクのバイト数
+const TEXT_WINDOW_CHUNKS = 8;          // 同時にロードしておく最大チャンク数（≒2MB）
+let textTotalBytes = 0;                // content 全体のバイト数（UTF-8）
+let textNumChunks = 0;                 // 総チャンク数
+let textWinStart = 0;                  // ロード中ウィンドウの先頭チャンク index
+let textWinEnd = 0;                    // ロード中ウィンドウの末尾 +1（[start, end)）
+let textEstChunkH = 0;                 // 1 チャンクの推定ピクセル高（下スペーサー用）
+let textTopH = 0;                      // 上スペーサー高（解放済み先頭チャンクの実高合計）
+let textMaxLoadedChunk = 0;            // これまでにロードした最大チャンク index（編集範囲用）
+let textBusy = false;                  // ロード処理の多重実行防止
+let editKeepFrom = null;               // 部分編集時、保持する末尾の開始位置（UTF-8 バイト）
 
 // 拡張子 → MIME（mime 未設定ファイルのフォールバック）
 const EXT_MIME = {
@@ -372,23 +376,14 @@ function looksBinary(buf) {
   return false;
 }
 
-// content の charset に対応する TextDecoder を作る（decodeBytes と同じ規則）。
-// stream:true で順次デコードするため、チャンク境界でマルチバイト文字が割れない。
-function makeDecoder(charset) {
-  let label = 'utf-8';
-  if (charset) label = (charset.toLowerCase() === 'utf-8-bom') ? 'utf-8' : charset;
-  try { return new TextDecoder(label, { fatal: false }); }
-  catch (_) { return new TextDecoder('utf-8', { fatal: false }); }
-}
-
 // content の [start, start+len) を Range リクエストで取得する。
+// utf8=true でストレージの生 UTF-8 を取得（仮想スクロール／編集用）。
 // 返り値 { buf, total }。total はサーバの Content-Range から得た全体バイト数
 // （Range 非対応サーバが 200 で全体を返した場合は本文長）。
-async function fetchContentRange(start, len) {
+async function fetchContentRange(start, len, utf8) {
   const end = start + len - 1; // inclusive
-  const r = await api(`/api/files/${fileId}/content`, {
-    headers: { Range: `bytes=${start}-${end}` },
-  });
+  const path = `/api/files/${fileId}/content` + (utf8 ? '?utf8=1' : '');
+  const r = await api(path, { headers: { Range: `bytes=${start}-${end}` } });
   if (!r.ok && r.status !== 206) {
     throw new Error((await r.text().catch(() => '')) || r.statusText);
   }
@@ -398,6 +393,25 @@ async function fetchContentRange(start, len) {
   const m = cr && /\/(\d+)\s*$/.exec(cr);
   if (m) total = parseInt(m[1], 10);
   return { buf, total };
+}
+
+// チャンク i（UTF-8 ストレージ空間）のテキストを取得する。
+// 文字は「先頭バイトが属するチャンク」が所有する規約で分割し、境界の
+// マルチバイト文字を欠落・重複なく復元する（末尾を最大 3 バイト多めに読む）。
+async function fetchUtf8ChunkText(i) {
+  const start = i * TEXT_CHUNK_BYTES;
+  const chunkEnd = Math.min(start + TEXT_CHUNK_BYTES, textTotalBytes); // exclusive
+  const reqEnd = Math.min(chunkEnd + 3, textTotalBytes);              // 末尾文字の補完分
+  const { buf } = await fetchContentRange(start, reqEnd - start, true);
+  const bytes = new Uint8Array(buf);
+  // 先頭: 継続バイト(0b10xxxxxx)は前チャンク所有の文字 → 読み飛ばす。
+  let s = 0;
+  while (s < bytes.length && (bytes[s] & 0xC0) === 0x80) s++;
+  // 末尾: chunkEnd 位置が継続バイトなら、その文字は本チャンク所有 → 完了まで含める。
+  let e = Math.min(chunkEnd - start, bytes.length);
+  while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  if (e < s) e = s;
+  return new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(s, e));
 }
 
 // content をデータ種別に応じた要素で描画する
@@ -435,71 +449,186 @@ async function renderContent() {
   $('fd-edit-btn').classList.toggle('hidden', !canEdit);
 }
 
-// テキスト/不明データを分割取得して表示する。先頭チャンクで判定・表示し、
-// 続きがあれば「さらに読み込む / 全て表示」で追記する。
+// テキスト/不明データを仮想スクロールで表示する。
+// 1 つの <pre>（fd-text-body）にチャンク単位の textNode を並べ、上下のスペーサーで
+// 未ロード領域の高さを確保する。スクロールに応じてチャンクをロード／解放する。
 async function renderTextContent(cont, kind) {
-  const first = await fetchContentRange(0, TEXT_CHUNK_BYTES);
-  // charset があるものはサーバがテキストとして保持しているため常にテキスト扱い
-  // （UTF-16 はヌルバイトを含み looksBinary に誤検知されるのを避ける）。
+  // 先頭チャンクを取得（バイナリ判定にも使う）。
+  const first = await fetchUtf8ChunkProbe();
   if (kind === 'unknown' && !currentFile.charset && looksBinary(first.buf)) {
     renderBinary(cont);
     return;
   }
   canEdit = true;
   textTotalBytes = first.total;
-  textLoadedBytes = first.buf.byteLength;
-  textDecoder = makeDecoder(currentFile.charset);
-  textFullyLoaded = textLoadedBytes >= textTotalBytes;
+  textNumChunks = Math.max(1, Math.ceil(textTotalBytes / TEXT_CHUNK_BYTES));
 
-  const pre = document.createElement('pre');
-  pre.id = 'fd-text-pre';
-  pre.className = 'bg-base-300/50 p-3 rounded text-xs overflow-x-auto max-h-[75vh] whitespace-pre-wrap break-words';
-  const chunkText = textDecoder.decode(first.buf, { stream: !textFullyLoaded });
-  currentContent = chunkText;
-  pre.appendChild(document.createTextNode(chunkText));
-  cont.replaceChildren(pre);
-  renderLoadMore(cont);
+  cont.innerHTML =
+    `<div id="fd-text-scroll" class="relative bg-base-300/50 rounded text-xs overflow-auto max-h-[75vh] [overflow-anchor:none]">` +
+    `<div id="fd-text-top"></div>` +
+    `<pre id="fd-text-body" class="m-0 px-3 py-2 whitespace-pre-wrap break-words"></pre>` +
+    `<div id="fd-text-bottom"></div>` +
+    `</div>`;
+
+  // 先頭チャンクを表示し、推定高を確定。
+  const body = $('fd-text-body');
+  body.appendChild(makeChunkNode(0, first.text));
+  textWinStart = 0;
+  textWinEnd = 1;
+  textMaxLoadedChunk = 0;
+  textTopH = 0;
+  textEstChunkH = Math.max(40, body.offsetHeight);
+  setSpacer('fd-text-top', 0);
+  setSpacer('fd-text-bottom', textEstChunkH * (textNumChunks - 1));
+
+  const scroll = $('fd-text-scroll');
+  let scheduled = false;
+  scroll.addEventListener('scroll', () => {
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => { scheduled = false; onTextScroll(scroll); });
+  });
 }
 
-// 続きの有無に応じて「さらに読み込む / 全て表示」バーを描画/撤去する。
-function renderLoadMore(cont) {
-  const old = $('fd-text-more');
-  if (old) old.remove();
-  if (textFullyLoaded) return;
-  const bar = document.createElement('div');
-  bar.id = 'fd-text-more';
-  bar.className = 'mt-2 flex items-center gap-2 text-xs flex-wrap';
-  bar.innerHTML =
-    `<span class="opacity-60">${fmtSize(textLoadedBytes)} / ${fmtSize(textTotalBytes)} 表示中</span>` +
-    `<button class="btn btn-xs" onclick="loadMoreText()">さらに読み込む</button>` +
-    `<button class="btn btn-xs btn-outline" onclick="loadAllText()">全て表示</button>`;
-  cont.appendChild(bar);
+// 先頭チャンクの生バイト（バイナリ判定用）・total・トリム済みテキストを取得する。
+// チャンク 0 は先頭の読み飛ばしが不要で、末尾だけ次文字の途中で切らないよう詰める。
+async function fetchUtf8ChunkProbe() {
+  const { buf, total } = await fetchContentRange(0, TEXT_CHUNK_BYTES, true);
+  const bytes = new Uint8Array(buf);
+  let e = bytes.length;
+  // total が 1 チャンクより大きいときのみ末尾が途中の可能性がある。
+  if (total > TEXT_CHUNK_BYTES) {
+    e = Math.min(TEXT_CHUNK_BYTES, bytes.length);
+    while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  }
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, e));
+  return { buf, total, text };
 }
 
-// 次のチャンクを取得して表示と currentContent に追記する。
-async function appendNextChunk() {
-  if (textFullyLoaded) return;
-  const { buf, total } = await fetchContentRange(textLoadedBytes, TEXT_CHUNK_BYTES);
-  textTotalBytes = total;
-  textLoadedBytes += buf.byteLength;
-  // 取得バイトが 0 なら（想定外でも）ループを止める。
-  textFullyLoaded = textLoadedBytes >= textTotalBytes || buf.byteLength === 0;
-  const chunkText = textDecoder.decode(buf, { stream: !textFullyLoaded });
-  currentContent += chunkText;
-  const pre = $('fd-text-pre');
-  if (pre) pre.appendChild(document.createTextNode(chunkText));
+// チャンク textNode を <span data-i> で包む（解放・計測のため identity を持たせる）。
+function makeChunkNode(i, text) {
+  const span = document.createElement('span');
+  span.dataset.i = String(i);
+  span.appendChild(document.createTextNode(text));
+  return span;
 }
 
-async function loadMoreText() {
-  await appendNextChunk();
-  renderLoadMore($('fd-content'));
+function setSpacer(id, h) {
+  const el = $(id);
+  if (el) el.style.height = Math.max(0, Math.round(h)) + 'px';
 }
 
-// 残り全チャンクを順次読み込む。編集前の全文取得にも使う。
-async function loadAllText() {
-  let guard = 0;
-  while (!textFullyLoaded && guard++ < 100000) await appendNextChunk();
-  renderLoadMore($('fd-content'));
+// スクロール位置に応じてウィンドウを前後へ伸縮させる。
+// 幾何モデル: 上スペーサー(textTopH=解放済み先頭チャンクの実高合計) + 本文(pre) +
+// 下スペーサー(未ロード末尾チャンクの推定高)。読込済み本文の上下端に viewport が
+// 近づいたら、その方向へチャンクをロードし、ウィンドウ超過分を反対側で解放する。
+async function onTextScroll(scroll) {
+  if (textBusy) return;
+  textBusy = true;
+  try {
+    const NEAR = 800;      // 端からこの px 以内に来たらロード
+    const body = $('fd-text-body');
+    if (!body) return;
+
+    // スクロールバーを大きくドラッグして本文から大きく外れた場合は、推定位置へ
+    // ウィンドウごと飛ばす（順次ロードでの長い空白を避ける）。
+    const contentTop = body.offsetTop;
+    const contentBottom = body.offsetTop + body.offsetHeight;
+    if (scroll.scrollTop > contentBottom + textEstChunkH ||
+        scroll.scrollTop + scroll.clientHeight < contentTop - textEstChunkH) {
+      await relocateWindow(Math.round(scroll.scrollTop / Math.max(1, textEstChunkH)));
+    }
+
+    // 下方向: viewport 下端が本文末尾に近づく間、次チャンクを足す。
+    let guard = 0;
+    while (textWinEnd < textNumChunks && guard++ < 64) {
+      const bottom = body.offsetTop + body.offsetHeight;
+      if (scroll.scrollTop + scroll.clientHeight < bottom - NEAR) break;
+      await appendChunk();
+      trimTop();
+    }
+    // 上方向: viewport 上端が本文先頭に近づく間、前チャンクを足す。
+    guard = 0;
+    while (textWinStart > 0 && guard++ < 64) {
+      if (scroll.scrollTop > body.offsetTop + NEAR) break;
+      await prependChunk();
+      trimBottom();
+    }
+  } catch (e) {
+    // 取得失敗時は次のスクロールで再試行する（ループを止めるだけ）。
+    console.error('text chunk load failed:', e);
+  } finally {
+    textBusy = false;
+  }
+}
+
+// 末尾に次チャンクを追加（本文下端に実コンテンツが伸び、下スペーサーは推定で縮む）。
+async function appendChunk() {
+  const i = textWinEnd;
+  const text = await fetchUtf8ChunkText(i);
+  const body = $('fd-text-body');
+  if (!body) return;
+  body.appendChild(makeChunkNode(i, text));
+  textWinEnd = i + 1;
+  textMaxLoadedChunk = Math.max(textMaxLoadedChunk, i);
+  setSpacer('fd-text-bottom', textEstChunkH * (textNumChunks - textWinEnd));
+}
+
+// 先頭に前チャンクを追加。挿入で本文が下がるぶん、上スペーサーを同量縮めて相殺
+// するため（実高どうしで一致）、scrollTop 補正なしで viewport が安定する。
+async function prependChunk() {
+  const i = textWinStart - 1;
+  const text = await fetchUtf8ChunkText(i);
+  const body = $('fd-text-body');
+  if (!body) return;
+  const before = body.offsetHeight;
+  body.insertBefore(makeChunkNode(i, text), body.firstChild);
+  const added = body.offsetHeight - before;
+  textWinStart = i;
+  textTopH = Math.max(0, textTopH - added);
+  setSpacer('fd-text-top', textTopH);
+}
+
+// 大きなジャンプ時、ウィンドウを推定位置 target チャンクへ移す。
+async function relocateWindow(target) {
+  target = Math.max(0, Math.min(textNumChunks - 1, target));
+  const body = $('fd-text-body');
+  if (!body) return;
+  body.replaceChildren();              // 既存ウィンドウは破棄（メモリ解放）
+  textWinStart = target;
+  textWinEnd = target;
+  textTopH = textEstChunkH * target;   // ジャンプ先の上側は推定
+  setSpacer('fd-text-top', textTopH);
+  setSpacer('fd-text-bottom', textEstChunkH * (textNumChunks - target));
+  await appendChunk();                 // target チャンクを描画（winEnd=target+1）
+}
+
+// 先頭チャンクを解放（下スクロール中）。除去で本文上端が縮むぶん上スペーサーを
+// 同量伸ばすので、解放済みより下のコンテンツ位置は不変（viewport 安定）。
+function trimTop() {
+  const body = $('fd-text-body');
+  while (textWinEnd - textWinStart > TEXT_WINDOW_CHUNKS) {
+    const node = body.firstElementChild;
+    if (!node) break;
+    const before = body.offsetHeight;
+    body.removeChild(node);
+    textTopH += before - body.offsetHeight;
+    textWinStart++;
+    setSpacer('fd-text-top', textTopH);
+  }
+}
+
+// 末尾チャンクを解放（上スクロール中）。下スペーサーを推定で戻す（viewport 上側に
+// 影響しない）。
+function trimBottom() {
+  const body = $('fd-text-body');
+  while (textWinEnd - textWinStart > TEXT_WINDOW_CHUNKS) {
+    const node = body.lastElementChild;
+    if (!node) break;
+    body.removeChild(node);
+    textWinEnd--;
+    setSpacer('fd-text-bottom', textEstChunkH * (textNumChunks - textWinEnd));
+  }
 }
 
 function renderBinary(cont) {
@@ -546,18 +675,31 @@ async function toggleEdit() {
   const ed = $('fd-editor');
   const cont = $('fd-content');
   if (ed.classList.contains('hidden')) {
-    // 部分読み込み中でも全文を取得せずに編集できる。読み込み済みの先頭部分のみを
-    // 編集対象とし、未読込の末尾はサーバ側で保持して結合する（keep_from）。
-    // editKeepFrom = 読み込み済みプレフィックスの UTF-8 バイト長（= ストレージ上の
-    // 保持開始オフセット。文字境界に一致する）。全文読込済みなら通常の全置換。
-    editKeepFrom = textFullyLoaded ? null : utf8Len(currentContent);
+    // 部分読み込み中でも全文を取得せずに編集できる。スクロールで見た範囲
+    // （先頭〜最大ロード位置）のみを編集対象とし、未読込の末尾はサーバ側で
+    // 保持して結合する（keep_from）。
+    const btn = $('fd-edit-btn');
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '読み込み中…';
+    let prefix;
+    try {
+      prefix = await loadEditPrefix();
+    } catch (e) {
+      uiToast('編集データの読み込みに失敗しました: ' + e.message, 'error');
+      return;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+    // 全文を読み込んでいれば通常の全置換、そうでなければ keep_from で末尾保持。
+    editKeepFrom = prefix.full ? null : prefix.keepFrom;
     const ta = $('fd-edit-textarea');
-    ta.value = currentContent;
+    ta.value = prefix.text;
     $('fd-edit-message').value = '';
-    // 末尾が未読込のときは、保持される旨を編集欄に明示する。
     const note = $('fd-edit-note');
     if (editKeepFrom != null) {
-      note.textContent = `※ 表示中の先頭部分のみ編集できます。未読込の末尾（${fmtSize(textTotalBytes - textLoadedBytes)}）はそのまま保持されます。`;
+      note.textContent = `※ 表示中の先頭部分（${fmtSize(prefix.keepFrom)}）のみ編集できます。未読込の末尾（${fmtSize(textTotalBytes - prefix.keepFrom)}）はそのまま保持されます。`;
       note.classList.remove('hidden');
     } else {
       note.classList.add('hidden');
@@ -573,6 +715,20 @@ async function toggleEdit() {
     ed.classList.add('hidden');
     cont.classList.remove('hidden');
   }
+}
+
+// 編集対象の先頭プレフィックスを取得する。
+// 先頭〜「これまでにロードした最大チャンクの末尾」までを連続取得し、UTF-8 文字
+// 境界に丸める。keepFrom はその正確なバイト長（= ストレージ上の保持開始位置）。
+async function loadEditPrefix() {
+  const wantEnd = Math.min((textMaxLoadedChunk + 1) * TEXT_CHUNK_BYTES, textTotalBytes);
+  const reqEnd = Math.min(wantEnd + 3, textTotalBytes); // 末尾文字の補完分
+  const { buf } = await fetchContentRange(0, reqEnd, true);
+  const bytes = new Uint8Array(buf);
+  let e = Math.min(wantEnd, bytes.length);
+  while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, e));
+  return { text, keepFrom: e, full: e >= textTotalBytes };
 }
 
 async function saveEdit() {

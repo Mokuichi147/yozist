@@ -499,10 +499,19 @@ fn range_response(
     }
 }
 
+#[derive(Deserialize)]
+struct ContentQuery {
+    /// 真値のときは charset 再エンコードせず、ストレージの生 UTF-8 を返す
+    /// （`Content-Type` は `charset=utf-8`）。仮想スクロールビューアが
+    /// チャンク境界の文字割れを安定処理するために使う。
+    utf8: Option<String>,
+}
+
 async fn get_content(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
+    Query(q): Query<ContentQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
     let id = parse_file_id(&id)?;
@@ -518,7 +527,17 @@ async fn get_content(
         .read_current(id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let (ct, body) = encode_content(file.mime, file.charset, bytes);
+    let want_utf8 = q.utf8.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
+    let (ct, body) = if want_utf8 {
+        // blob は常に UTF-8。charset 再エンコードせず生のまま返す。
+        let mut ct = file.mime.unwrap_or_else(|| "text/plain".to_string());
+        if !ct.to_ascii_lowercase().contains("charset=") {
+            ct = format!("{ct}; charset=utf-8");
+        }
+        (ct, bytes)
+    } else {
+        encode_content(file.mime, file.charset, bytes)
+    };
     Ok(range_response(ct, body, headers.get(axum::http::header::RANGE)))
 }
 
