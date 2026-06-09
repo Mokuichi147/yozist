@@ -152,14 +152,17 @@ let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
 
-// --- テキストの仮想スクロール状態 ---
-// 巨大ファイルでも全体を読まず、ビューポート近傍のチャンクだけを動的にロードし、
-// 離れたチャンクは解放（リリース）してメモリを一定に保つ。各チャンクは推定高の
-// スロットとして先に並べ、IntersectionObserver で可視判定する。スクロール速度に
-// 依らず「今ビューポート近傍にあるスロット」を検出できるため高速スクロールに追従する。
+// --- テキスト表示の状態 ---
+// 通常サイズ（TEXT_FULL_LOAD_MAX 以下）は全文を 1 回で取得し <pre> 1 つで描画する
+// （ページのネイティブスクロール。スクロールバーが内容と完全一致しずれない）。
+// 巨大ファイルのみ仮想スクロール（IntersectionObserver, root=ビューポート）に切替え、
+// ビューポート近傍のチャンクだけを動的ロード／解放してメモリを一定に保つ。
 // ビューアはストレージの生 UTF-8 を読む（?utf8=1）。UTF-8 は継続バイトで文字
 // 境界を判定でき、チャンクを独立にデコード／解放／再ロードできるため。
-const TEXT_CHUNK_BYTES = 256 * 1024;   // 1 チャンクのバイト数
+const TEXT_CHUNK_BYTES = 256 * 1024;        // 1 チャンクのバイト数
+const TEXT_FULL_LOAD_MAX = 4 * 1024 * 1024; // これ以下は全文ロード
+let textVirtual = false;               // 仮想スクロール中か（巨大ファイル）
+let textFullContent = '';              // 全文ロード時の本文（編集用）
 let textTotalBytes = 0;                // content 全体のバイト数（UTF-8）
 let textNumChunks = 0;                 // 総チャンク数
 let textEstChunkH = 0;                 // 1 チャンクの推定ピクセル高（未ロード slot の予約高）
@@ -452,10 +455,7 @@ async function renderContent() {
   $('fd-edit-btn').classList.toggle('hidden', !canEdit);
 }
 
-// テキスト/不明データを仮想スクロールで表示する。
-// 各チャンクを推定高の slot として先に並べ、IntersectionObserver でビューポート
-// 近傍の slot だけを実ロード、離れたら解放する。高速スクロールやスクロールバーの
-// 大ジャンプでも、IO が「今近傍にある slot」を検出するため正しく追従する。
+// テキスト/不明データを表示する。通常サイズは全文、巨大ファイルは仮想スクロール。
 async function renderTextContent(cont, kind) {
   // 先頭チャンクを取得（バイナリ判定にも使う）。
   const first = await fetchUtf8ChunkProbe();
@@ -465,6 +465,47 @@ async function renderTextContent(cont, kind) {
   }
   canEdit = true;
   textTotalBytes = first.total;
+  textFullContent = '';
+  if (textObserver) { textObserver.disconnect(); textObserver = null; }
+
+  if (textTotalBytes <= TEXT_FULL_LOAD_MAX) {
+    await renderTextFull(cont, first);
+  } else {
+    renderTextVirtual(cont, first);
+  }
+}
+
+// 共通: テキスト表示用 <pre> を作る（折り返し等は Tailwind 非依存のインライン）。
+function makeTextPre() {
+  const pre = document.createElement('pre');
+  pre.style.cssText =
+    'margin:0;padding:0.5rem 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;' +
+    'font-size:0.75rem;line-height:1.2rem;background:rgba(127,127,127,0.06);border-radius:0.375rem';
+  return pre;
+}
+
+// 全文ロード: 1 リクエストで全体を取得し <pre> 1 つで描画。ページがそのまま
+// スクロールするため、スクロールバーと内容が完全に一致しずれない。
+async function renderTextFull(cont, first) {
+  textVirtual = false;
+  let text;
+  if (textTotalBytes <= TEXT_CHUNK_BYTES) {
+    text = first.text;               // probe が全体を取得済み
+  } else {
+    // サーバは展開済みキャッシュを即返すので 1 リクエストで全文取得して問題ない。
+    const { buf } = await fetchContentRange(0, textTotalBytes, true);
+    text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+  }
+  textFullContent = text;            // 編集用
+  const pre = makeTextPre();
+  pre.textContent = text;
+  cont.replaceChildren(pre);
+}
+
+// 仮想スクロール（巨大ファイル）: 推定高の slot を並べ、IntersectionObserver
+// （root=ビューポート）でページスクロールに連動してロード／解放する。
+function renderTextVirtual(cont, first) {
+  textVirtual = true;
   textNumChunks = Math.max(1, Math.ceil(textTotalBytes / TEXT_CHUNK_BYTES));
   textSlots = new Array(textNumChunks);
   textLoaded = new Array(textNumChunks).fill(false);
@@ -472,19 +513,10 @@ async function renderTextContent(cont, kind) {
   textLoading = new Array(textNumChunks).fill(false);
   textAbort = new Array(textNumChunks).fill(null);
   textMaxLoadedChunk = 0;
-  if (textObserver) { textObserver.disconnect(); textObserver = null; }
 
-  // スクロールに関わる重要スタイルはインラインで確実に当てる
-  // （Tailwind v4 ブラウザ CDN は JS で動的注入した任意値クラスを生成しないことが
-  //   あり、max-height/overflow が当たらないとページ全体がスクロールしてしまう）。
-  cont.innerHTML =
-    `<div id="fd-text-scroll" class="bg-base-300/50 rounded"` +
-    ` style="max-height:75vh;overflow:auto;font-size:0.75rem;line-height:1.15rem"></div>`;
-  const scroll = $('fd-text-scroll');
-
-  // 先頭 slot を描画して推定高を確定 → 残り slot を推定高で予約。
+  cont.replaceChildren();
   const s0 = makeSlot(0);
-  scroll.appendChild(s0);
+  cont.appendChild(s0);
   renderSlot(0, first.text);
   textEstChunkH = Math.max(40, s0.offsetHeight);
   const frag = document.createDocumentFragment();
@@ -493,10 +525,10 @@ async function renderTextContent(cont, kind) {
     s.style.minHeight = textEstChunkH + 'px';
     frag.appendChild(s);
   }
-  scroll.appendChild(frag);
+  cont.appendChild(frag);
 
-  // 近傍（上下 1200px）の slot をロード、離れたら解放する。
-  textObserver = new IntersectionObserver(onChunkIntersect, { root: scroll, rootMargin: '1200px 0px' });
+  // root=null（ビューポート）でページスクロールに連動。近傍を先読みする。
+  textObserver = new IntersectionObserver(onChunkIntersect, { root: null, rootMargin: '1500px 0px' });
   for (let i = 0; i < textNumChunks; i++) textObserver.observe(textSlots[i]);
 }
 
@@ -515,8 +547,10 @@ function renderSlot(i, text) {
   const el = textSlots[i];
   if (!el) return;
   const pre = document.createElement('pre');
+  // 背景は付けない（隣接チャンク間に継ぎ目/隙間を作らないため）。
   pre.style.cssText =
-    'margin:0;padding:0.4rem 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit';
+    'margin:0;padding:0 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;' +
+    'font-size:0.75rem;line-height:1.2rem';
   pre.appendChild(document.createTextNode(text));
   el.replaceChildren(pre);
   el.style.minHeight = '';
@@ -645,35 +679,40 @@ async function toggleEdit() {
   const ed = $('fd-editor');
   const cont = $('fd-content');
   if (ed.classList.contains('hidden')) {
-    // 部分読み込み中でも全文を取得せずに編集できる。スクロールで見た範囲
-    // （先頭〜最大ロード位置）のみを編集対象とし、未読込の末尾はサーバ側で
-    // 保持して結合する（keep_from）。
-    const btn = $('fd-edit-btn');
-    const label = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = '読み込み中…';
-    let prefix;
-    try {
-      prefix = await loadEditPrefix();
-    } catch (e) {
-      uiToast('編集データの読み込みに失敗しました: ' + e.message, 'error');
-      return;
-    } finally {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-    // 全文を読み込んでいれば通常の全置換、そうでなければ keep_from で末尾保持。
-    editKeepFrom = prefix.full ? null : prefix.keepFrom;
     const ta = $('fd-edit-textarea');
-    ta.value = prefix.text;
-    $('fd-edit-message').value = '';
     const note = $('fd-edit-note');
-    if (editKeepFrom != null) {
-      note.textContent = `※ 表示中の先頭部分（${fmtSize(prefix.keepFrom)}）のみ編集できます。未読込の末尾（${fmtSize(textTotalBytes - prefix.keepFrom)}）はそのまま保持されます。`;
-      note.classList.remove('hidden');
-    } else {
+    if (!textVirtual) {
+      // 全文ロード済み → そのまま全置換編集。
+      editKeepFrom = null;
+      ta.value = textFullContent;
       note.classList.add('hidden');
+    } else {
+      // 巨大ファイル: スクロールで見た範囲（先頭〜最大ロード位置）のみ編集対象とし、
+      // 未読込の末尾はサーバ側で保持して結合する（keep_from）。
+      const btn = $('fd-edit-btn');
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '読み込み中…';
+      let prefix;
+      try {
+        prefix = await loadEditPrefix();
+      } catch (e) {
+        uiToast('編集データの読み込みに失敗しました: ' + e.message, 'error');
+        return;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+      editKeepFrom = prefix.full ? null : prefix.keepFrom;
+      ta.value = prefix.text;
+      if (editKeepFrom != null) {
+        note.textContent = `※ 表示中の先頭部分（${fmtSize(prefix.keepFrom)}）のみ編集できます。未読込の末尾（${fmtSize(textTotalBytes - prefix.keepFrom)}）はそのまま保持されます。`;
+        note.classList.remove('hidden');
+      } else {
+        note.classList.add('hidden');
+      }
     }
+    $('fd-edit-message').value = '';
     // 表示専用欄と同じ高さで編集できるよう、隠す前に現在の表示高さを引き継ぐ
     // （rows 固定だと内容に対して欄サイズが飛んでしまうのを防ぐ）
     const h = cont.offsetHeight;
