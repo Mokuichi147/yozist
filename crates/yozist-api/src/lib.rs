@@ -593,14 +593,17 @@ struct CommitQuery {
     /// 指定時はファイル名を更新し、mime/charset を新しい名前＋内容から再判定する
     /// （アップロードによる「内容を更新」用）。テキスト編集等では送らない。
     name: Option<String>,
-    /// 部分編集用。指定時はボディを「先頭プレフィックスの新しい内容」とみなし、
-    /// 現行内容の `keep_from`（ストレージ UTF-8 バイト空間でのオフセット）以降を
-    /// そのまま残して結合した全文をコミットする。これにより巨大ファイルでも
-    /// クライアントは読み込んだ先頭部分だけで編集できる（末尾は読み込み不要）。
+    /// 部分編集用（範囲置換）。指定時はボディで現行内容の
+    /// `[repl_start, repl_end)`（ストレージ UTF-8 バイト空間）を置換し、その前後は
+    /// そのまま残して全文をコミットする。巨大ファイルでも表示中の範囲だけ編集できる。
+    /// 省略時の既定: repl_start=0, repl_end=現行長（= 全置換 / 末尾保持）。
+    repl_start: Option<u64>,
+    repl_end: Option<u64>,
+    /// 後方互換: repl_start=0, repl_end=keep_from と同義（先頭プレフィックス置換）。
     keep_from: Option<u64>,
 }
 
-/// 部分編集（`keep_from`）で受け取る新プレフィックスの最大バイト数。
+/// 部分編集で受け取る本文の最大バイト数。
 const MAX_EDIT_PREFIX_BYTES: usize = 512 * 1024 * 1024;
 
 async fn commit_file(
@@ -616,8 +619,9 @@ async fn commit_file(
     // name 指定時（アップロードによる「内容を更新」）は前バージョンとマージせず
     // 全置換する。形式・mime・charset・表示名を新しい名前＋内容から判定し直すため、
     // 別形式へ差し替えても旧バージョンの解釈に引きずられず破損しない。
-    // keep_from 指定時（部分編集）は現行内容の末尾を保持して結合し全文コミットする。
-    // どちらも無い（テキスト全文編集など）は従来どおりストリーミング CRDT マージ経路。
+    // repl_start/repl_end/keep_from 指定時（部分編集）は現行内容の該当範囲のみ置換する。
+    // どれも無い（テキスト全文編集など）は従来どおりストリーミング CRDT マージ経路。
+    let is_partial = q.repl_start.is_some() || q.repl_end.is_some() || q.keep_from.is_some();
     let result = if let Some(name) = q.name {
         let stream = body
             .into_data_stream()
@@ -627,8 +631,10 @@ async fn commit_file(
             .replace_streaming(id, name, stream, actor, q.message)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
-    } else if let Some(keep_from) = q.keep_from {
-        commit_partial(&s, id, keep_from, body, actor, q.message).await
+    } else if is_partial {
+        let repl_start = q.repl_start.unwrap_or(0);
+        let repl_end = q.repl_end.or(q.keep_from); // keep_from は repl_end の別名
+        commit_partial(&s, id, repl_start, repl_end, body, actor, q.message).await
     } else {
         let stream = body
             .into_data_stream()
@@ -663,21 +669,22 @@ async fn commit_file(
     Ok(Json(result?))
 }
 
-/// 部分編集コミット。受信した新プレフィックス（UTF-8）に現行内容の
-/// `keep_from` 以降を結合して全文を作り、通常の CRDT コミットへ渡す。
+/// 部分編集コミット。受信した本文（UTF-8）で現行内容の `[repl_start, repl_end)` を
+/// 置換し、その前後を残して全文を作り、通常の CRDT コミットへ渡す。
 ///
-/// 結合は **ストレージの UTF-8 バイト空間** で行う（blob は常に UTF-8）。
-/// `keep_from` はクライアントが読み込んだ先頭テキストの UTF-8 バイト長であり、
-/// 文字境界に一致する。安全のためサーバ側でも長さクランプと境界補正を行う。
+/// 置換は **ストレージの UTF-8 バイト空間** で行う（blob は常に UTF-8）。オフセットは
+/// クライアントが読み込んだテキストの UTF-8 バイト位置で文字境界に一致する。安全のため
+/// サーバ側でも長さクランプと境界補正を行う。`repl_end=None` は現行長（末尾まで置換）。
 async fn commit_partial(
     s: &ApiState,
     id: FileId,
-    keep_from: u64,
+    repl_start: u64,
+    repl_end: Option<u64>,
     body: Body,
     actor: ActorId,
     message: Option<String>,
 ) -> Result<yozist_core::Commit, ApiError> {
-    let prefix = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
+    let body = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
         .await
         .map_err(|e| ApiError::BadRequest(format!("body: {e}")))?;
     let current = s
@@ -685,31 +692,35 @@ async fn commit_partial(
         .read_current(id)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let new_full = splice_prefix(&prefix, &current, keep_from);
+    let end = repl_end.unwrap_or(current.len() as u64);
+    let new_full = splice_range(&body, &current, repl_start, end);
     s.engine
         .commit(id, &new_full, actor, message)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-/// 新プレフィックス + 現行内容の `keep_from` 以降を結合する。
+/// `current[0..repl_start)` + `body` + `current[repl_end..]` を結合する。
 ///
-/// blob は文字コードに関わらず常に UTF-8 で保存され、クライアントが送る新
-/// プレフィックスも UTF-8。`keep_from` はクライアントが読み込んだ先頭テキストの
-/// UTF-8 バイト長で、ストレージ UTF-8 上の文字境界に一致する。よってこの結合は
-/// 元の文字コード（Shift_JIS / EUC-JP / UTF-16 など）に依存せず正しく機能する。
-/// 念のためサーバ側でも長さクランプと UTF-8 境界補正を行い、不正なオフセットでも
-/// 文字の途中で切れないようにする。
-fn splice_prefix(prefix: &[u8], current: &[u8], keep_from: u64) -> Vec<u8> {
-    let mut keep = (keep_from as usize).min(current.len());
-    // UTF-8 継続バイト (0b10xxxxxx) の途中なら直前の境界まで戻す。
-    while keep > 0 && keep < current.len() && (current[keep] & 0xC0) == 0x80 {
-        keep -= 1;
-    }
-    let mut new_full = Vec::with_capacity(prefix.len() + (current.len() - keep));
-    new_full.extend_from_slice(prefix);
-    new_full.extend_from_slice(&current[keep..]);
-    new_full
+/// blob は文字コードに依らず常に UTF-8 保存で、`body` も UTF-8。オフセットは
+/// クライアントが読み込んだテキストの UTF-8 バイト位置（文字境界）。元の文字コード
+/// （Shift_JIS / EUC-JP / UTF-16 など）に依存せず正しく機能する。念のため
+/// サーバ側でも長さクランプと UTF-8 境界補正（継続バイトの途中で切らない）を行う。
+fn splice_range(body: &[u8], current: &[u8], repl_start: u64, repl_end: u64) -> Vec<u8> {
+    let to_boundary = |mut p: usize| {
+        p = p.min(current.len());
+        while p > 0 && p < current.len() && (current[p] & 0xC0) == 0x80 {
+            p -= 1;
+        }
+        p
+    };
+    let start = to_boundary(repl_start as usize);
+    let end = to_boundary((repl_end as usize).max(repl_start as usize));
+    let mut out = Vec::with_capacity(start + body.len() + (current.len() - end));
+    out.extend_from_slice(&current[..start]);
+    out.extend_from_slice(body);
+    out.extend_from_slice(&current[end..]);
+    out
 }
 
 async fn history(
@@ -2417,26 +2428,29 @@ mod tests {
     }
 
     #[test]
-    fn splice_prefix_preserves_tail() {
-        // 先頭 4 バイトぶんの読み込み済みプレフィックスを "XY" に編集し、
-        // 残り（current[4..]="EFGH"）はサーバ側で保持して結合する。
-        assert_eq!(splice_prefix(b"XY", b"ABCDEFGH", 4), b"XYEFGH".to_vec());
-        // keep_from=len は末尾が空 → 全置換（全文読込済みでの保存に相当）。
-        assert_eq!(splice_prefix(b"NEW", b"OLD", 3), b"NEW".to_vec());
-        // 範囲外は len へクランプ → 全置換。
-        assert_eq!(splice_prefix(b"NEW", b"OLD", 999), b"NEW".to_vec());
+    fn splice_range_replaces_region() {
+        // 先頭プレフィックス置換（repl_start=0）: [0,4) を "XY" に → "XY"+"EFGH"。
+        assert_eq!(splice_range(b"XY", b"ABCDEFGH", 0, 4), b"XYEFGH".to_vec());
+        // 中間範囲置換: [2,6) を "xy" に → "AB"+"xy"+"GH"。
+        assert_eq!(splice_range(b"xy", b"ABCDEFGH", 2, 6), b"ABxyGH".to_vec());
+        // 末尾範囲置換: [6,8) を "Z" に → "ABCDEF"+"Z"。
+        assert_eq!(splice_range(b"Z", b"ABCDEFGH", 6, 8), b"ABCDEFZ".to_vec());
+        // end=len は末尾保持なし（全置換相当）。
+        assert_eq!(splice_range(b"NEW", b"OLD", 0, 3), b"NEW".to_vec());
+        // 範囲外はクランプ。
+        assert_eq!(splice_range(b"NEW", b"OLD", 0, 999), b"NEW".to_vec());
     }
 
     #[test]
-    fn splice_prefix_respects_utf8_boundaries() {
+    fn splice_range_respects_utf8_boundaries() {
         // 「あいうえお」= 各 3 バイトの UTF-8。blob は文字コードに依らず UTF-8 保存。
         let current = "あいうえお".as_bytes(); // 15 bytes
-        // keep_from=6 は「う」の先頭境界。先頭 2 文字を新プレフィックスへ。
-        let spliced = splice_prefix("X".as_bytes(), current, 6);
-        assert_eq!(String::from_utf8(spliced).unwrap(), "Xうえお");
-        // keep_from が継続バイトの途中(7)でも境界(6)へ補正され破損しない。
-        let spliced = splice_prefix("X".as_bytes(), current, 7);
-        assert_eq!(String::from_utf8(spliced).unwrap(), "Xうえお");
+        // [6,9)（「う」）を "X" に置換 → "あいXえお"。
+        let spliced = splice_range("X".as_bytes(), current, 6, 9);
+        assert_eq!(String::from_utf8(spliced).unwrap(), "あいXえお");
+        // 継続バイトの途中(7,10)でも境界(6,9)へ補正され破損しない。
+        let spliced = splice_range("X".as_bytes(), current, 7, 10);
+        assert_eq!(String::from_utf8(spliced).unwrap(), "あいXえお");
     }
 
     async fn make_state() -> (ApiState, tempfile::TempDir) {
