@@ -151,6 +151,8 @@ let contentObjectUrl = null;  // メディアプレビュー用の object URL
 let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
+let zipEntries = [];          // zip の全エントリ（フラット）
+let zipCwd = '';              // 現在の zip 内ディレクトリ（'' = ルート、末尾スラッシュなし）
 
 // 拡張子 → MIME（mime 未設定ファイルのフォールバック）
 const EXT_MIME = {
@@ -168,6 +170,18 @@ const TEXT_EXT = new Set([
 ]);
 
 function extOf(name) { return (name.split('.').pop() || '').toLowerCase(); }
+
+// zip ファイルかどうか（mime 優先、なければ拡張子）
+function isZip() {
+  const m = (currentFile.mime || '').toLowerCase();
+  return m === 'application/zip' || m === 'application/x-zip-compressed'
+    || extOf(currentFile.display_name) === 'zip';
+}
+
+// 任意文字列を単一引用符の JS 文字列リテラルへ安全に埋め込む（onclick 用）。
+function jsStr(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/</g, '\\x3c');
+}
 
 function fmtSize(n) {
   n = Number(n) || 0;
@@ -365,6 +379,12 @@ async function renderContent() {
   canEdit = false;
   const cont = $('fd-content');
   cont.classList.remove('hidden');  // 編集後の再描画時に表示専用欄を確実に復帰
+  // zip はテキスト編集ではなく、中身をフォルダのように閲覧・操作する。
+  if (isZip()) {
+    $('fd-edit-btn').classList.add('hidden');
+    await loadZip();
+    return;
+  }
   cont.innerHTML = '<span class="opacity-50 text-xs">読み込み中…</span>';
   const kind = mediaKind(currentFile.mime, currentFile.display_name);
   const mime = effectiveMime();
@@ -415,6 +435,226 @@ function renderBinary(cont) {
       <div class="text-xs opacity-50 break-all">${escapeHtml(currentFile.mime || '不明な形式')} · ${fmtSize(currentFile.size)}</div>
       <button class="btn btn-sm btn-primary" onclick="downloadContent()">ダウンロード</button>
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// zip ブラウザ: 中身をフォルダのように閲覧・移動・削除・追加・取り出し
+// ---------------------------------------------------------------------------
+
+// zip エントリ一覧を取得して描画する。
+async function loadZip() {
+  const cont = $('fd-content');
+  cont.classList.remove('hidden');
+  cont.innerHTML = '<span class="opacity-50 text-xs">zip を読み込み中…</span>';
+  try {
+    zipEntries = await json(`/api/files/${fileId}/zip`);
+    renderZip();
+  } catch (e) {
+    cont.innerHTML = `<span class="text-error text-xs">zip の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+// 現在ディレクトリ直下の子要素（ディレクトリ名一覧 + ファイルエントリ一覧）を
+// フラットなエントリ列から計算する。明示的なディレクトリエントリと、ファイルパスの
+// 接頭辞から導かれる暗黙のディレクトリの両方を拾う。
+function zipChildren(cwd) {
+  const prefix = cwd ? cwd + '/' : '';
+  const dirs = new Set();
+  const files = [];
+  for (const e of zipEntries) {
+    if (!e.path.startsWith(prefix)) continue;
+    const rest = e.path.slice(prefix.length);
+    if (rest === '') continue;
+    const slash = rest.indexOf('/');
+    if (slash >= 0) {
+      dirs.add(rest.slice(0, slash));
+    } else if (e.is_dir) {
+      dirs.add(rest);
+    } else {
+      files.push(e);
+    }
+  }
+  return {
+    dirs: [...dirs].sort((a, b) => a.localeCompare(b)),
+    files: files.sort((a, b) => a.path.localeCompare(b.path)),
+  };
+}
+
+function zipNavigate(dir) { zipCwd = dir; renderZip(); }
+
+function zipBreadcrumb() {
+  const parts = zipCwd ? zipCwd.split('/') : [];
+  const crumbs = [`<button class="link link-hover" onclick="zipNavigate('')">📦 ルート</button>`];
+  let acc = '';
+  for (const p of parts) {
+    acc = acc ? acc + '/' + p : p;
+    crumbs.push(`<span class="opacity-40">/</span>` +
+      `<button class="link link-hover" onclick="zipNavigate('${jsStr(acc)}')">${escapeHtml(p)}</button>`);
+  }
+  return crumbs.join(' ');
+}
+
+function renderZip() {
+  const cont = $('fd-content');
+  const { dirs, files } = zipChildren(zipCwd);
+  // 現在のディレクトリが（削除等で）存在しなくなったらルートへ戻す。
+  if (zipCwd !== '' && dirs.length === 0 && files.length === 0) {
+    zipCwd = '';
+    return renderZip();
+  }
+  const prefix = zipCwd ? zipCwd + '/' : '';
+
+  const dirRows = dirs.map(name => {
+    const path = prefix + name;
+    return `<div class="flex items-center justify-between gap-2 px-2 py-1.5 hover:bg-base-200">
+      <button class="flex items-center gap-2 min-w-0 flex-1 text-left" onclick="zipNavigate('${jsStr(path)}')">
+        <span class="shrink-0">📁</span><span class="truncate font-medium">${escapeHtml(name)}/</span>
+      </button>
+      <div class="flex gap-1 shrink-0">
+        <button class="btn btn-xs" onclick="zipMove('${jsStr(path)}')">移動</button>
+        <button class="btn btn-xs btn-error btn-outline" onclick="zipDelete('${jsStr(path)}', true)">削除</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  const fileRows = files.map(e => {
+    const name = e.path.slice(prefix.length);
+    return `<div class="flex items-center justify-between gap-2 px-2 py-1.5 hover:bg-base-200">
+      <button class="flex items-center gap-2 min-w-0 flex-1 text-left" onclick="zipPreview('${jsStr(e.path)}')" title="プレビュー">
+        <span class="shrink-0">🗎</span><span class="truncate">${escapeHtml(name)}</span>
+        <span class="text-xs opacity-50 shrink-0">${fmtSize(e.size)}</span>
+      </button>
+      <div class="flex gap-1 shrink-0">
+        <button class="btn btn-xs" onclick="zipExtract('${jsStr(e.path)}')" title="独立ファイルとして取り出す">取り出す</button>
+        <button class="btn btn-xs" onclick="zipMove('${jsStr(e.path)}')">移動</button>
+        <button class="btn btn-xs btn-error btn-outline" onclick="zipDelete('${jsStr(e.path)}', false)">削除</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  const empty = (!dirRows && !fileRows)
+    ? '<div class="opacity-50 text-xs px-2 py-3">（空のフォルダ）</div>' : '';
+
+  cont.innerHTML = `
+    <div class="space-y-2">
+      <div class="flex items-center justify-between gap-2 flex-wrap">
+        <div class="text-sm flex items-center gap-1 flex-wrap">${zipBreadcrumb()}</div>
+        <div class="flex gap-1">
+          <button class="btn btn-xs" onclick="zipMkdir()">＋フォルダ</button>
+          <button class="btn btn-xs btn-primary" onclick="$('zip-add-input').click()">＋ファイル追加</button>
+          <input id="zip-add-input" type="file" multiple class="hidden" onchange="zipAddFiles(this.files); this.value='';">
+        </div>
+      </div>
+      <div class="border border-base-300 rounded divide-y divide-base-200">
+        ${dirRows}${fileRows}${empty}
+      </div>
+      <div class="text-xs opacity-50">zip の中身。変更は新しいコミットとして保存されます。</div>
+    </div>`;
+}
+
+// 変更後にファイルメタ（サイズ・履歴）と zip 一覧を再取得する。zipCwd は保持。
+async function afterZipChange() {
+  currentFile = await json('/api/files/' + fileId);
+  await loadDetail();
+}
+
+// エントリを推定 Content-Type 付きで取得し、新しいタブで開く（プレビュー）。
+async function zipPreview(path) {
+  try {
+    const r = await api(`/api/files/${fileId}/zip/entry?path=` + encodeURIComponent(path));
+    if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+    const ct = r.headers.get('content-type') || 'application/octet-stream';
+    const u = URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: ct }));
+    window.open(u, '_blank');
+    setTimeout(() => URL.revokeObjectURL(u), 60000);
+  } catch (e) {
+    uiToast('プレビューに失敗しました: ' + e.message, 'error');
+  }
+}
+
+// エントリを yozist の独立ファイルとして取り出す（元 zip は変更しない）。
+async function zipExtract(path) {
+  if (!await uiConfirm(`"${path}" を独立したファイルとして取り出しますか？`, { okText: '取り出す' })) return;
+  try {
+    const f = await json(`/api/files/${fileId}/zip/extract`, { method: 'POST', body: { path } });
+    uiToast('取り出しました（一覧に追加されました）', 'success');
+    return f;
+  } catch (e) {
+    uiToast('取り出しに失敗しました: ' + e.message, 'error');
+  }
+}
+
+// エントリ（ファイル/ディレクトリ）を削除する。
+async function zipDelete(path, isDir) {
+  if (!await uiConfirm(`"${path}"${isDir ? ' 配下すべて' : ''} を削除しますか？\n(新しいコミットとして記録されます)`,
+    { danger: true, okText: '削除' })) return;
+  try {
+    await json(`/api/files/${fileId}/zip/delete`, { method: 'POST', body: { path } });
+    uiToast('削除しました', 'success');
+    await afterZipChange();
+  } catch (e) {
+    uiToast('削除に失敗しました: ' + e.message, 'error');
+  }
+}
+
+// エントリを移動 / リネームする。
+async function zipMove(path) {
+  const r = await uiPrompt({
+    title: '移動 / リネーム', okText: '移動',
+    fields: [{ name: 'to', label: '新しいパス (zip 内)', value: path }],
+  });
+  if (!r) return;
+  const to = (r.to || '').trim();
+  if (!to || to === path) return;
+  try {
+    await json(`/api/files/${fileId}/zip/move`, { method: 'POST', body: { from: path, to } });
+    uiToast('移動しました', 'success');
+    await afterZipChange();
+  } catch (e) {
+    uiToast('移動に失敗しました: ' + e.message, 'error');
+  }
+}
+
+// 現在ディレクトリにファイルを追加（同名は置換）する。
+async function zipAddFiles(files) {
+  if (!files || !files.length) return;
+  try {
+    for (const file of files) {
+      const path = (zipCwd ? zipCwd + '/' : '') + file.name;
+      const r = await api(`/api/files/${fileId}/zip/add?path=` + encodeURIComponent(path), {
+        method: 'POST',
+        body: await file.arrayBuffer(),
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+      if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+    }
+    uiToast('追加しました', 'success');
+    await afterZipChange();
+  } catch (e) {
+    uiToast('追加に失敗しました: ' + e.message, 'error');
+  }
+}
+
+// 現在ディレクトリにフォルダを作成する。
+async function zipMkdir() {
+  const r = await uiPrompt({
+    title: 'フォルダ作成', okText: '作成',
+    fields: [{ name: 'name', label: 'フォルダ名' }],
+  });
+  if (!r || !r.name) return;
+  const path = (zipCwd ? zipCwd + '/' : '') + r.name.trim().replace(/\/+$/, '') + '/';
+  try {
+    const res = await api(`/api/files/${fileId}/zip/add?path=` + encodeURIComponent(path), {
+      method: 'POST',
+      body: new Uint8Array().buffer,
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+    if (!res.ok) throw new Error((await res.text().catch(() => '')) || res.statusText);
+    uiToast('フォルダを作成しました', 'success');
+    await afterZipChange();
+  } catch (e) {
+    uiToast('作成に失敗しました: ' + e.message, 'error');
+  }
 }
 
 async function downloadContent() {

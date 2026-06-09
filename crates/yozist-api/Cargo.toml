@@ -27,6 +27,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 askama.workspace = true
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+mime_guess = "2.0.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -35,6 +35,7 @@ use yozist_auth::{
 };
 
 pub mod ui;
+pub mod zip;
 use yozist_core::{
     ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
@@ -68,6 +69,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files", get(list_files).post(create_file))
         .route("/api/files/:id", get(get_file).delete(delete_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
+        .route("/api/files/:id/zip", get(list_zip))
+        .route("/api/files/:id/zip/entry", get(read_zip_entry))
+        .route("/api/files/:id/zip/move", post(move_zip_entry))
+        .route("/api/files/:id/zip/delete", post(delete_zip_entry))
+        .route("/api/files/:id/zip/add", post(add_zip_entry))
+        .route("/api/files/:id/zip/extract", post(extract_zip_entry))
         .route("/api/files/:id/history", get(history))
         .route("/api/files/:id/commits/:cid", get(read_commit))
         .route("/api/files/:id/rollback/:cid", post(rollback))
@@ -481,6 +488,230 @@ async fn commit_file(
     .await;
 
     Ok(Json(result?))
+}
+
+// ---------------------------------------------------------------------------
+// zip アーカイブの中身を「フォルダのように」閲覧・操作する
+// ---------------------------------------------------------------------------
+
+/// `ZipOpError` を HTTP エラーへ変換する。
+fn zip_err(e: crate::zip::ZipOpError) -> ApiError {
+    use crate::zip::ZipOpError::*;
+    match e {
+        NotFound(_) => ApiError::NotFound,
+        BadPath(m) | Invalid(m) => ApiError::BadRequest(m),
+        Exists(_) => ApiError::Conflict,
+        Io(m) => ApiError::Internal(m),
+    }
+}
+
+/// 対象ファイルの現在の内容を取得し、zip であることを検証して返す。
+async fn load_zip_bytes(s: &ApiState, id: FileId) -> Result<Vec<u8>, ApiError> {
+    let bytes = s.engine.read_current(id).await.map_err(|e| match e {
+        yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
+        other => ApiError::Internal(other.to_string()),
+    })?;
+    if !crate::zip::looks_like_zip(&bytes) {
+        return Err(ApiError::BadRequest("zip ファイルではありません".into()));
+    }
+    Ok(bytes)
+}
+
+/// zip 編集の共通処理: 新バイト列を新コミットとして記録し、監査ログを書く。
+async fn commit_zip(
+    s: &ApiState,
+    ctx: &AuthContext,
+    id: FileId,
+    new_bytes: Vec<u8>,
+    action: &str,
+    metadata_json: &str,
+) -> Result<yozist_core::Commit, ApiError> {
+    let actor = ActorId::new();
+    let result = s
+        .engine
+        .commit(id, &new_bytes, actor, Some(action.to_string()))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let id_str = id.to_string();
+    audit_event(
+        s,
+        ctx,
+        action,
+        Some("file"),
+        Some(&id_str),
+        Some(metadata_json),
+        &result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    result
+}
+
+/// zip エントリ一覧を返す。
+async fn list_zip(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<crate::zip::ZipEntry>>, ApiError> {
+    let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
+    let bytes = load_zip_bytes(&s, id).await?;
+    let entries = crate::zip::list_entries(&bytes).map_err(zip_err)?;
+    Ok(Json(entries))
+}
+
+#[derive(Deserialize)]
+struct ZipPathQuery {
+    path: String,
+}
+
+/// zip 内の単一エントリ本文を、拡張子から推定した Content-Type で返す。
+async fn read_zip_entry(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Query(q): Query<ZipPathQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
+    let bytes = load_zip_bytes(&s, id).await?;
+    let data = crate::zip::read_entry(&bytes, &q.path).map_err(zip_err)?;
+    let ct = mime_guess::from_path(&q.path)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    Ok(([(axum::http::header::CONTENT_TYPE, ct)], data))
+}
+
+#[derive(Deserialize)]
+struct ZipMoveInput {
+    from: String,
+    to: String,
+}
+
+/// zip 内エントリ（ファイル/ディレクトリ）を移動・リネームする。
+async fn move_zip_entry(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<ZipMoveInput>,
+) -> Result<Json<yozist_core::Commit>, ApiError> {
+    let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
+    let bytes = load_zip_bytes(&s, id).await?;
+    let new_bytes = crate::zip::move_path(&bytes, &input.from, &input.to).map_err(zip_err)?;
+    let meta = format!(
+        "{{\"op\":\"move\",\"from\":{:?},\"to\":{:?}}}",
+        input.from, input.to
+    );
+    let commit = commit_zip(&s, &ctx, id, new_bytes, "zip_move", &meta).await?;
+    Ok(Json(commit))
+}
+
+/// zip 内エントリ（ファイル/ディレクトリ）を削除する。
+async fn delete_zip_entry(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<ZipPathQuery>,
+) -> Result<Json<yozist_core::Commit>, ApiError> {
+    let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
+    let bytes = load_zip_bytes(&s, id).await?;
+    let new_bytes = crate::zip::delete_path(&bytes, &input.path).map_err(zip_err)?;
+    let meta = format!("{{\"op\":\"delete\",\"path\":{:?}}}", input.path);
+    let commit = commit_zip(&s, &ctx, id, new_bytes, "zip_delete", &meta).await?;
+    Ok(Json(commit))
+}
+
+/// zip 内にエントリを追加（同名は置換）する。本文はリクエストボディ。
+/// `path` が末尾 `/` ならディレクトリを作成する。
+async fn add_zip_entry(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Query(q): Query<ZipPathQuery>,
+    body: Body,
+) -> Result<Json<yozist_core::Commit>, ApiError> {
+    let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
+    let bytes = load_zip_bytes(&s, id).await?;
+    let data = collect_body(body).await?;
+    let new_bytes = crate::zip::add_entry(&bytes, &q.path, &data).map_err(zip_err)?;
+    let meta = format!("{{\"op\":\"add\",\"path\":{:?}}}", q.path);
+    let commit = commit_zip(&s, &ctx, id, new_bytes, "zip_add", &meta).await?;
+    Ok(Json(commit))
+}
+
+/// zip 内エントリを yozist の独立ファイルとして取り出す（展開）。
+/// 元の zip は変更しない。作成者にオーナー権限を自動付与する。
+async fn extract_zip_entry(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<ZipPathQuery>,
+) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
+    let id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
+    require_authenticated(&ctx).await?;
+    let bytes = load_zip_bytes(&s, id).await?;
+    let data = crate::zip::read_entry(&bytes, &input.path).map_err(zip_err)?;
+    // エントリ名の最終要素をファイル名にする。
+    let name = input
+        .path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("extracted")
+        .to_string();
+    let actor = ActorId::new();
+    let result = s
+        .engine
+        .create_file(name.clone(), &data, actor, None)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    let meta_json = format!(
+        "{{\"op\":\"extract\",\"from\":{:?},\"name\":{:?}}}",
+        input.path, name
+    );
+    audit_event(
+        &s,
+        &ctx,
+        "zip_extract",
+        Some("file"),
+        result.as_ref().ok().map(|(f, _)| f.id.to_string()).as_deref(),
+        Some(&meta_json),
+        &result.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let (file, _commit) = result?;
+
+    // 作成者にオーナー（フル）権限を自動付与（create_file と同じ）。
+    if let AuthContext::User { user, .. } = &ctx {
+        let owner_rule = Permission {
+            subject: Subject::User(user.id),
+            target: Target::file(file.id),
+            mask: PermissionMask::all(),
+            allow: true,
+            priority: i32::MAX,
+        };
+        s.acl_admin
+            .add_rule(&owner_rule)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    Ok((StatusCode::CREATED, Json(file)))
+}
+
+/// リクエストボディをメモリへ集約する（zip 編集はバイト列全体が必要）。
+async fn collect_body(body: Body) -> Result<Vec<u8>, ApiError> {
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 async fn history(
@@ -2191,6 +2422,51 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// zip を作成 → 中身を編集 → commit → 読み戻すまでが versioning エンジン経由で
+    /// 成立すること（保存形式は LWW のまま、内容は妥当な zip であり続ける）。
+    #[tokio::test]
+    async fn zip_edit_roundtrips_through_engine() {
+        use std::io::Write as _;
+        // テスト用の zip を組み立てる（extern crate `zip` を `::zip` で参照）。
+        let zip_bytes = {
+            let opts = ::zip::write::SimpleFileOptions::default()
+                .compression_method(::zip::CompressionMethod::Deflated);
+            let mut w = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            w.start_file("a.txt", opts).unwrap();
+            w.write_all(b"hello").unwrap();
+            w.start_file("dir/b.txt", opts).unwrap();
+            w.write_all(b"world").unwrap();
+            w.finish().unwrap().into_inner()
+        };
+
+        let (state, _td) = make_state().await;
+        let actor = ActorId::new();
+        let (file, _c) = state
+            .engine
+            .create_file("archive.zip", &zip_bytes, actor, None)
+            .await
+            .unwrap();
+        assert_eq!(file.mime.as_deref(), Some("application/zip"));
+
+        // 現在の内容は妥当な zip で 2 エントリ。
+        let cur = state.engine.read_current(file.id).await.unwrap();
+        assert!(crate::zip::looks_like_zip(&cur));
+        assert_eq!(crate::zip::list_entries(&cur).unwrap().len(), 2);
+
+        // a.txt を削除して新コミットとして保存。
+        let edited = crate::zip::delete_path(&cur, "a.txt").unwrap();
+        state
+            .engine
+            .commit(file.id, &edited, actor, Some("zip_delete".into()))
+            .await
+            .unwrap();
+
+        // 読み戻すと a.txt は消え、dir/b.txt は残っている。
+        let cur2 = state.engine.read_current(file.id).await.unwrap();
+        assert!(crate::zip::read_entry(&cur2, "a.txt").is_err());
+        assert_eq!(crate::zip::read_entry(&cur2, "dir/b.txt").unwrap(), b"world");
     }
 
     #[tokio::test]
