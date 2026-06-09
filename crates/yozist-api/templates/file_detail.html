@@ -475,17 +475,36 @@ async function renderTextContent(cont, kind) {
   }
 }
 
-// 共通: テキスト表示用 <pre> を作る（折り返し等は Tailwind 非依存のインライン）。
+// 共通: 内容を内部スクロールさせる枠を作る（重要スタイルはインライン＝Tailwind 非依存）。
+// 高さは呼び出し側でピクセル明示する（max-height ではなく明示高にして、どの環境でも
+// 確実に枠内スクロールにする。ページ全体はスクロールしない）。
+function makeTextScrollBox() {
+  const box = document.createElement('div');
+  box.id = 'fd-text-scroll';
+  box.style.cssText =
+    'overflow:auto;border:1px solid rgba(127,127,127,0.25);' +
+    'border-radius:0.375rem;background:rgba(127,127,127,0.06)';
+  return box;
+}
+
+// 枠の高さを「内容高と 70vh の小さい方」にピクセルで明示する。
+// 短い内容はぴったり（余白なし・スクロールなし）、長い内容は 70vh で枠内スクロール。
+function fitScrollBox(box) {
+  const cap = Math.round(window.innerHeight * 0.7);
+  box.style.height = Math.min(box.scrollHeight, cap) + 'px';
+}
+
+// 共通: テキスト表示用 <pre>（折り返し等は Tailwind 非依存のインライン）。
 function makeTextPre() {
   const pre = document.createElement('pre');
   pre.style.cssText =
     'margin:0;padding:0.5rem 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;' +
-    'font-size:0.75rem;line-height:1.2rem;background:rgba(127,127,127,0.06);border-radius:0.375rem';
+    'font-size:0.75rem;line-height:1.2rem';
   return pre;
 }
 
-// 全文ロード: 1 リクエストで全体を取得し <pre> 1 つで描画。ページがそのまま
-// スクロールするため、スクロールバーと内容が完全に一致しずれない。
+// 全文ロード: 1 リクエストで全体を取得し、スクロール枠内の <pre> 1 つで描画する。
+// 枠の中に全文があるので、枠のスクロールバーが内容と完全に一致してずれない。
 async function renderTextFull(cont, first) {
   textVirtual = false;
   let text;
@@ -497,13 +516,16 @@ async function renderTextFull(cont, first) {
     text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
   }
   textFullContent = text;            // 編集用
+  const box = makeTextScrollBox();
   const pre = makeTextPre();
   pre.textContent = text;
-  cont.replaceChildren(pre);
+  box.appendChild(pre);
+  cont.replaceChildren(box);
+  fitScrollBox(box);                 // 内容高 or 70vh の小さい方に固定
 }
 
-// 仮想スクロール（巨大ファイル）: 推定高の slot を並べ、IntersectionObserver
-// （root=ビューポート）でページスクロールに連動してロード／解放する。
+// 仮想スクロール（巨大ファイル）: 推定高の slot を枠内に並べ、IntersectionObserver
+// （root=枠）で枠内スクロールに連動してロード／解放する。
 function renderTextVirtual(cont, first) {
   textVirtual = true;
   textNumChunks = Math.max(1, Math.ceil(textTotalBytes / TEXT_CHUNK_BYTES));
@@ -514,9 +536,11 @@ function renderTextVirtual(cont, first) {
   textAbort = new Array(textNumChunks).fill(null);
   textMaxLoadedChunk = 0;
 
-  cont.replaceChildren();
+  const box = makeTextScrollBox();
+  box.style.height = Math.round(window.innerHeight * 0.7) + 'px'; // 巨大ファイルは常に超過
+  cont.replaceChildren(box);
   const s0 = makeSlot(0);
-  cont.appendChild(s0);
+  box.appendChild(s0);
   renderSlot(0, first.text);
   textEstChunkH = Math.max(40, s0.offsetHeight);
   const frag = document.createDocumentFragment();
@@ -525,10 +549,10 @@ function renderTextVirtual(cont, first) {
     s.style.minHeight = textEstChunkH + 'px';
     frag.appendChild(s);
   }
-  cont.appendChild(frag);
+  box.appendChild(frag);
 
-  // root=null（ビューポート）でページスクロールに連動。近傍を先読みする。
-  textObserver = new IntersectionObserver(onChunkIntersect, { root: null, rootMargin: '1500px 0px' });
+  // root=枠 で枠内スクロールに連動。近傍を先読みする。
+  textObserver = new IntersectionObserver(onChunkIntersect, { root: box, rootMargin: '1500px 0px' });
   for (let i = 0; i < textNumChunks; i++) textObserver.observe(textSlots[i]);
 }
 
