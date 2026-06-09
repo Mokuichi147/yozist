@@ -160,7 +160,7 @@ let assignedTagIds = new Set(); // このファイルに割り当て済みのタ
 // ビューアはストレージの生 UTF-8 を読む（?utf8=1）。UTF-8 は継続バイトで文字
 // 境界を判定でき、チャンクを独立にデコード／解放／再ロードできるため。
 const TEXT_CHUNK_BYTES = 256 * 1024;        // 1 チャンクのバイト数
-const TEXT_FULL_LOAD_MAX = 4 * 1024 * 1024; // これ以下は全文ロード
+const TEXT_FULL_LOAD_MAX = 16 * 1024 * 1024; // これ以下は全文ロード（textarea で確実にスクロール）
 let textVirtual = false;               // 仮想スクロール中か（巨大ファイル）
 let textFullContent = '';              // 全文ロード時の本文（編集用）
 let textTotalBytes = 0;                // content 全体のバイト数（UTF-8）
@@ -476,8 +476,6 @@ async function renderTextContent(cont, kind) {
 }
 
 // 共通: 内容を内部スクロールさせる枠を作る（重要スタイルはインライン＝Tailwind 非依存）。
-// 高さは呼び出し側でピクセル明示する（max-height ではなく明示高にして、どの環境でも
-// 確実に枠内スクロールにする。ページ全体はスクロールしない）。
 function makeTextScrollBox() {
   const box = document.createElement('div');
   box.id = 'fd-text-scroll';
@@ -487,24 +485,9 @@ function makeTextScrollBox() {
   return box;
 }
 
-// 枠の高さを「内容高と 70vh の小さい方」にピクセルで明示する。
-// 短い内容はぴったり（余白なし・スクロールなし）、長い内容は 70vh で枠内スクロール。
-function fitScrollBox(box) {
-  const cap = Math.round(window.innerHeight * 0.7);
-  box.style.height = Math.min(box.scrollHeight, cap) + 'px';
-}
-
-// 共通: テキスト表示用 <pre>（折り返し等は Tailwind 非依存のインライン）。
-function makeTextPre() {
-  const pre = document.createElement('pre');
-  pre.style.cssText =
-    'margin:0;padding:0.5rem 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;' +
-    'font-size:0.75rem;line-height:1.2rem';
-  return pre;
-}
-
-// 全文ロード: 1 リクエストで全体を取得し、スクロール枠内の <pre> 1 つで描画する。
-// 枠の中に全文があるので、枠のスクロールバーが内容と完全に一致してずれない。
+// 全文ロード: 全体を取得し、読み取り専用 <textarea> で表示する。
+// textarea はフォーム要素としてネイティブの内部スクロールを持つため、CSS の
+// overflow 解釈に依存せず必ず枠内でスクロールし、スクロールバーも内容と一致する。
 async function renderTextFull(cont, first) {
   textVirtual = false;
   let text;
@@ -516,12 +499,25 @@ async function renderTextFull(cont, first) {
     text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
   }
   textFullContent = text;            // 編集用
-  const box = makeTextScrollBox();
-  const pre = makeTextPre();
-  pre.textContent = text;
-  box.appendChild(pre);
-  cont.replaceChildren(box);
-  fitScrollBox(box);                 // 内容高 or 70vh の小さい方に固定
+  const ta = document.createElement('textarea');
+  ta.id = 'fd-text-view';
+  ta.readOnly = true;
+  ta.value = text;
+  ta.style.cssText =
+    'display:block;width:100%;box-sizing:border-box;margin:0;padding:0.5rem 0.75rem;' +
+    'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.75rem;line-height:1.2rem;' +
+    'border:1px solid rgba(127,127,127,0.25);border-radius:0.375rem;background:rgba(127,127,127,0.06);' +
+    'resize:vertical';
+  cont.replaceChildren(ta);
+  // 内容高 or 70vh の小さい方に高さを明示（短い内容はぴったり、長い内容は枠内スクロール）。
+  const cap = Math.round(window.innerHeight * 0.7);
+  ta.style.height = Math.min(ta.scrollHeight + 2, cap) + 'px';
+  // 診断: スクロール不能の切り分け用（問題報告時にコンソールを確認）。
+  console.log('[yozist] text view', {
+    bytes: textTotalBytes, mode: 'full',
+    height: ta.style.height, scrollHeight: ta.scrollHeight, clientHeight: ta.clientHeight,
+    scrollable: ta.scrollHeight > ta.clientHeight,
+  });
 }
 
 // 仮想スクロール（巨大ファイル）: 推定高の slot を枠内に並べ、IntersectionObserver
