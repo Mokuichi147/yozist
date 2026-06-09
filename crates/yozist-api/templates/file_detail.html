@@ -168,6 +168,7 @@ let textSlots = [];                    // チャンク index → slot 要素
 let textLoaded = [];                   // チャンク index → ロード済みか
 let textWant = [];                     // チャンク index → 可視（ロード望む）か
 let textLoading = [];                  // チャンク index → 取得中か
+let textAbort = [];                    // チャンク index → 取得中の AbortController（範囲外で中断）
 let textObserver = null;               // 可視判定の IntersectionObserver
 let editKeepFrom = null;               // 部分編集時、保持する末尾の開始位置（UTF-8 バイト）
 
@@ -382,10 +383,10 @@ function looksBinary(buf) {
 // utf8=true でストレージの生 UTF-8 を取得（仮想スクロール／編集用）。
 // 返り値 { buf, total }。total はサーバの Content-Range から得た全体バイト数
 // （Range 非対応サーバが 200 で全体を返した場合は本文長）。
-async function fetchContentRange(start, len, utf8) {
+async function fetchContentRange(start, len, utf8, signal) {
   const end = start + len - 1; // inclusive
   const path = `/api/files/${fileId}/content` + (utf8 ? '?utf8=1' : '');
-  const r = await api(path, { headers: { Range: `bytes=${start}-${end}` } });
+  const r = await api(path, { headers: { Range: `bytes=${start}-${end}` }, signal });
   if (!r.ok && r.status !== 206) {
     throw new Error((await r.text().catch(() => '')) || r.statusText);
   }
@@ -400,11 +401,11 @@ async function fetchContentRange(start, len, utf8) {
 // チャンク i（UTF-8 ストレージ空間）のテキストを取得する。
 // 文字は「先頭バイトが属するチャンク」が所有する規約で分割し、境界の
 // マルチバイト文字を欠落・重複なく復元する（末尾を最大 3 バイト多めに読む）。
-async function fetchUtf8ChunkText(i) {
+async function fetchUtf8ChunkText(i, signal) {
   const start = i * TEXT_CHUNK_BYTES;
   const chunkEnd = Math.min(start + TEXT_CHUNK_BYTES, textTotalBytes); // exclusive
   const reqEnd = Math.min(chunkEnd + 3, textTotalBytes);              // 末尾文字の補完分
-  const { buf } = await fetchContentRange(start, reqEnd - start, true);
+  const { buf } = await fetchContentRange(start, reqEnd - start, true, signal);
   const bytes = new Uint8Array(buf);
   // 先頭: 継続バイト(0b10xxxxxx)は前チャンク所有の文字 → 読み飛ばす。
   let s = 0;
@@ -469,6 +470,7 @@ async function renderTextContent(cont, kind) {
   textLoaded = new Array(textNumChunks).fill(false);
   textWant = new Array(textNumChunks).fill(false);
   textLoading = new Array(textNumChunks).fill(false);
+  textAbort = new Array(textNumChunks).fill(null);
   textMaxLoadedChunk = 0;
   if (textObserver) { textObserver.disconnect(); textObserver = null; }
 
@@ -528,19 +530,26 @@ function onChunkIntersect(entries) {
 async function loadChunk(i) {
   if (textLoaded[i] || textLoading[i]) return;
   textLoading[i] = true;
+  const ac = new AbortController();
+  textAbort[i] = ac;
   try {
     // 高速スクロール中に通り過ぎる slot は取得しない（短い待機後に可視判定し直す）。
     // これで無駄なフェッチが減り、停止後に見えている slot のロードが優先される。
     await new Promise((r) => setTimeout(r, 60));
     if (!textWant[i]) return;
     showChunkLoading(i);                // 取得中は「読み込み中…」を表示（空白回避）
-    const text = await fetchUtf8ChunkText(i);
+    const text = await fetchUtf8ChunkText(i, ac.signal);
     if (!textWant[i]) return;           // 取得中に画面外へ出た → 破棄
     renderSlot(i, text);
   } catch (e) {
-    console.error('text chunk load failed:', i, e);
+    // 範囲外になり中断したものは無視（読み込む必要がない）。
+    if (!e || e.name !== 'AbortError') console.error('text chunk load failed:', i, e);
   } finally {
     textLoading[i] = false;
+    textAbort[i] = null;
+    // 中断したが再び可視へ戻っているとき（ジャンプの往復など）だけ読み直す。
+    // 通常エラーでは再試行しない（無限ループ防止）。
+    if (ac.signal.aborted && textWant[i] && !textLoaded[i]) loadChunk(i);
   }
 }
 
@@ -556,6 +565,8 @@ function showChunkLoading(i) {
 
 // slot を解放する。実測高を min-height に固定して geometry を保つ（再表示時にずれない）。
 function releaseChunk(i) {
+  // 取得中なら中断する（表示範囲外になったら読み込む必要はない）。
+  if (textLoading[i] && textAbort[i]) textAbort[i].abort();
   const el = textSlots[i];
   if (!el) return;
   if (textLoaded[i]) {
