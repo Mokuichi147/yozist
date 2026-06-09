@@ -36,7 +36,7 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
+    ActorId, CommitId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -57,6 +57,37 @@ pub struct ApiState {
     /// SMB(NTLM) 資格情報の同期先。SMB 無効時は `None`。
     /// register / login / change_password 成功時に平文パスワードを渡して反映する。
     pub smb_creds: Option<Arc<dyn yozist_auth::SmbCredentialSink>>,
+    /// 展開済み content の小さなキャッシュ。blob はファイル全体が 1 つの zstd
+    /// として保存されるため、Range リクエストのたびに全体を展開すると巨大ファイルの
+    /// 仮想スクロールが破綻する。直近に読んだ 1 ファイル分を保持し、同一コミットへの
+    /// 連続した範囲取得で再展開を避ける。
+    pub content_cache: Arc<ContentCache>,
+}
+
+/// 展開済み content の単一エントリキャッシュ（直近に読んだファイル）。
+/// キーは `(FileId, CommitId)`。コミットが変われば自然にミスして再読込される。
+#[derive(Default)]
+pub struct ContentCache {
+    inner: std::sync::Mutex<Option<(FileId, CommitId, Arc<Vec<u8>>)>>,
+}
+
+/// これを超えるサイズはキャッシュしない（サーバメモリ保護）。
+const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+impl ContentCache {
+    fn get(&self, file_id: FileId, commit_id: CommitId) -> Option<Arc<Vec<u8>>> {
+        let g = self.inner.lock().unwrap();
+        match g.as_ref() {
+            Some((f, c, b)) if *f == file_id && *c == commit_id => Some(b.clone()),
+            _ => None,
+        }
+    }
+    fn put(&self, file_id: FileId, commit_id: CommitId, bytes: Arc<Vec<u8>>) {
+        if bytes.len() > MAX_CACHE_BYTES {
+            return;
+        }
+        *self.inner.lock().unwrap() = Some((file_id, commit_id, bytes));
+    }
 }
 
 /// ルーター生成。
@@ -454,7 +485,7 @@ fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
 /// `Accept-Ranges: bytes` を付与する。解釈できるが範囲外の Range は 416 を返す。
 fn range_response(
     content_type: String,
-    body: Vec<u8>,
+    body: &[u8],
     range: Option<&axum::http::HeaderValue>,
 ) -> axum::response::Response {
     use axum::http::{header, HeaderValue};
@@ -490,7 +521,7 @@ fn range_response(
             resp
         }
         None => {
-            let mut resp = body.into_response();
+            let mut resp = body.to_vec().into_response();
             let h = resp.headers_mut();
             h.insert(header::CONTENT_TYPE, ct);
             h.insert(header::ACCEPT_RANGES, accept);
@@ -522,23 +553,37 @@ async fn get_content(
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    let bytes = s
-        .engine
-        .read_current(id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // 展開済み content をキャッシュから取得（なければ展開して保存）。
+    // 連続した Range 取得（仮想スクロール）で blob の再展開を避ける。
+    let bytes = match file.current_commit.and_then(|cid| s.content_cache.get(id, cid)) {
+        Some(b) => b,
+        None => {
+            let raw = s
+                .engine
+                .read_current(id)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            let arc = Arc::new(raw);
+            if let Some(cid) = file.current_commit {
+                s.content_cache.put(id, cid, arc.clone());
+            }
+            arc
+        }
+    };
+    let range = headers.get(axum::http::header::RANGE);
     let want_utf8 = q.utf8.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
-    let (ct, body) = if want_utf8 {
-        // blob は常に UTF-8。charset 再エンコードせず生のまま返す。
+    if want_utf8 {
+        // blob は常に UTF-8。charset 再エンコードせず生のまま、必要範囲だけ返す。
         let mut ct = file.mime.unwrap_or_else(|| "text/plain".to_string());
         if !ct.to_ascii_lowercase().contains("charset=") {
             ct = format!("{ct}; charset=utf-8");
         }
-        (ct, bytes)
+        Ok(range_response(ct, &bytes, range))
     } else {
-        encode_content(file.mime, file.charset, bytes)
-    };
-    Ok(range_response(ct, body, headers.get(axum::http::header::RANGE)))
+        // charset 再エンコードが必要な経路（ダウンロード/メディア/互換）。
+        let (ct, body) = encode_content(file.mime, file.charset, (*bytes).clone());
+        Ok(range_response(ct, &body, range))
+    }
 }
 
 #[derive(Deserialize)]
@@ -2352,7 +2397,7 @@ mod tests {
         use axum::http::{header, HeaderValue};
         let body = (0u8..=9).collect::<Vec<u8>>();
         let range = HeaderValue::from_static("bytes=2-5");
-        let resp = range_response("text/plain".into(), body.clone(), Some(&range));
+        let resp = range_response("text/plain".into(), &body, Some(&range));
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
             resp.headers().get(header::CONTENT_RANGE).unwrap(),
@@ -2361,13 +2406,13 @@ mod tests {
         assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
 
         // Range 無しは 200 で Accept-Ranges のみ付与。
-        let full = range_response("text/plain".into(), body.clone(), None);
+        let full = range_response("text/plain".into(), &body, None);
         assert_eq!(full.status(), StatusCode::OK);
         assert_eq!(full.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
 
         // 範囲外は 416。
         let bad = HeaderValue::from_static("bytes=100-200");
-        let oob = range_response("text/plain".into(), body, Some(&bad));
+        let oob = range_response("text/plain".into(), &body, Some(&bad));
         assert_eq!(oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     }
 
@@ -2422,6 +2467,7 @@ mod tests {
                 audit,
                 share_admin,
                 smb_creds: None,
+                content_cache: Arc::new(ContentCache::default()),
             },
             dir,
         )

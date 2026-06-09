@@ -533,6 +533,7 @@ async function loadChunk(i) {
     // これで無駄なフェッチが減り、停止後に見えている slot のロードが優先される。
     await new Promise((r) => setTimeout(r, 60));
     if (!textWant[i]) return;
+    showChunkLoading(i);                // 取得中は「読み込み中…」を表示（空白回避）
     const text = await fetchUtf8ChunkText(i);
     if (!textWant[i]) return;           // 取得中に画面外へ出た → 破棄
     renderSlot(i, text);
@@ -543,15 +544,29 @@ async function loadChunk(i) {
   }
 }
 
+// 取得中の slot に控えめなプレースホルダを出す（高さは推定 min-height のまま）。
+function showChunkLoading(i) {
+  const el = textSlots[i];
+  if (!el || textLoaded[i] || el.firstChild) return;
+  const ph = document.createElement('div');
+  ph.className = 'px-3 py-2 opacity-40';
+  ph.textContent = '読み込み中…';
+  el.appendChild(ph);
+}
+
 // slot を解放する。実測高を min-height に固定して geometry を保つ（再表示時にずれない）。
 function releaseChunk(i) {
-  if (!textLoaded[i]) return;
   const el = textSlots[i];
   if (!el) return;
-  const h = el.offsetHeight;
-  el.replaceChildren();
-  el.style.minHeight = (h || textEstChunkH) + 'px';
-  textLoaded[i] = false;
+  if (textLoaded[i]) {
+    const h = el.offsetHeight;
+    el.replaceChildren();
+    el.style.minHeight = (h || textEstChunkH) + 'px';
+    textLoaded[i] = false;
+  } else if (el.firstChild) {
+    // ロード中プレースホルダだけ消す（高さは推定 min-height のまま）。
+    el.replaceChildren();
+  }
 }
 
 // 先頭チャンクの生バイト（バイナリ判定用）・total・トリム済みテキストを取得する。
