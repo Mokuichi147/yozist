@@ -474,8 +474,12 @@ async function renderTextContent(cont, kind) {
   textMaxLoadedChunk = 0;
   if (textObserver) { textObserver.disconnect(); textObserver = null; }
 
+  // スクロールに関わる重要スタイルはインラインで確実に当てる
+  // （Tailwind v4 ブラウザ CDN は JS で動的注入した任意値クラスを生成しないことが
+  //   あり、max-height/overflow が当たらないとページ全体がスクロールしてしまう）。
   cont.innerHTML =
-    `<div id="fd-text-scroll" class="bg-base-300/50 rounded text-xs overflow-auto max-h-[75vh]"></div>`;
+    `<div id="fd-text-scroll" class="bg-base-300/50 rounded"` +
+    ` style="max-height:75vh;overflow:auto;font-size:0.75rem;line-height:1.15rem"></div>`;
   const scroll = $('fd-text-scroll');
 
   // 先頭 slot を描画して推定高を確定 → 残り slot を推定高で予約。
@@ -506,11 +510,13 @@ function makeSlot(i) {
 }
 
 // slot にチャンクテキストを描画する（min-height を外し自然高にする）。
+// 折り返し等の重要スタイルはインラインで確実に当てる（Tailwind CDN 非依存）。
 function renderSlot(i, text) {
   const el = textSlots[i];
   if (!el) return;
   const pre = document.createElement('pre');
-  pre.className = 'm-0 px-3 py-2 whitespace-pre-wrap break-words';
+  pre.style.cssText =
+    'margin:0;padding:0.4rem 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;font-family:inherit';
   pre.appendChild(document.createTextNode(text));
   el.replaceChildren(pre);
   el.style.minHeight = '';
@@ -558,7 +564,7 @@ function showChunkLoading(i) {
   const el = textSlots[i];
   if (!el || textLoaded[i] || el.firstChild) return;
   const ph = document.createElement('div');
-  ph.className = 'px-3 py-2 opacity-40';
+  ph.style.cssText = 'padding:0.4rem 0.75rem;opacity:0.4';
   ph.textContent = '読み込み中…';
   el.appendChild(ph);
 }
