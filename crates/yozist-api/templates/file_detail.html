@@ -160,7 +160,7 @@ let assignedTagIds = new Set(); // このファイルに割り当て済みのタ
 // ビューアはストレージの生 UTF-8 を読む（?utf8=1）。UTF-8 は継続バイトで文字
 // 境界を判定でき、チャンクを独立にデコード／解放／再ロードできるため。
 const TEXT_CHUNK_BYTES = 256 * 1024;        // 1 チャンクのバイト数
-const TEXT_FULL_LOAD_MAX = 16 * 1024 * 1024; // これ以下は全文ロード（textarea で確実にスクロール）
+const TEXT_FULL_LOAD_MAX = 32 * 1024 * 1024; // これ以下は全文ロード（textarea で確実にスクロール）
 let textVirtual = false;               // 仮想スクロール中か（巨大ファイル）
 let textFullContent = '';              // 全文ロード時の本文（編集用）
 let textTotalBytes = 0;                // content 全体のバイト数（UTF-8）

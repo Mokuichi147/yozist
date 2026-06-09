@@ -4,6 +4,9 @@
 //!   ダイアログ基盤を `base.html` に集約する。各ページはそれを `extends` した静的シェル + JS。
 //! - JS から REST API を叩く SPA 風実装。SMB / REST / WebUI のいずれも同じ MetaStore を参照する。
 //! - ダイアログは daisyUI のモーダル / トーストで実装し、ブラウザの prompt/confirm/alert は使わない。
+//!
+//! NOTE: テンプレートのみ変更したときに反映されるよう `build.rs` で `templates/` を
+//! 監視している（Askama はテンプレート単独変更を cargo が検知しないことがあるため）。
 
 use askama::Template;
 use axum::{
