@@ -687,19 +687,35 @@ async fn commit_partial(
     let body = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
         .await
         .map_err(|e| ApiError::BadRequest(format!("body: {e}")))?;
-    let current = s
-        .engine
-        .read_current(id)
+    // 直前まで表示していたファイルなら展開済みキャッシュが温まっているため、
+    // 現行内容の再解凍（GB 級で数秒）を避けられる。
+    let file = s
+        .meta
+        .get_file(&id)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let current = match file.current_commit.and_then(|cid| s.content_cache.get(id, cid)) {
+        Some(b) => b,
+        None => Arc::new(
+            s.engine
+                .read_current(id)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        ),
+    };
     let end = repl_end.unwrap_or(current.len() as u64);
     let new_full = splice_range(&body, &current, repl_start, end);
     // CRDT 差分を経ず直接 blob としてコミットする。結合済みの最終全文が手元に
     // あるため結果の blob は通常コミットと同一で、巨大ファイルでも軽い。
-    s.engine
+    let commit = s
+        .engine
         .commit_raw(id, &new_full, actor, message)
         .await
-        .map_err(|e| ApiError::Internal(e.to_string()))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // 保存直後の再表示（Range 取得）が再解凍なしで返るよう、新内容を事前投入する。
+    s.content_cache.put(id, commit.id, Arc::new(new_full));
+    Ok(commit)
 }
 
 /// `current[0..repl_start)` + `body` + `current[repl_end..]` を結合する。

@@ -32,7 +32,7 @@
             <div class="join w-full">
               <input id="fd-edit-message" class="input input-bordered input-sm join-item w-full"
                      placeholder="コミットメッセージ (任意)">
-              <button class="btn btn-primary btn-sm join-item" onclick="saveEdit()">保存</button>
+              <button id="fd-save-btn" class="btn btn-primary btn-sm join-item" onclick="saveEdit()">保存</button>
               <button class="btn btn-sm join-item" onclick="toggleEdit()">キャンセル</button>
             </div>
           </div>
@@ -929,16 +929,32 @@ async function saveEdit() {
   }
   const qs = params.toString();
   const url = `/api/files/${fileId}/content` + (qs ? `?${qs}` : '');
-  const r = await api(url, {
-    method: 'POST',
-    body: new TextEncoder().encode(newContent).buffer,
-    headers: { 'content-type': 'application/octet-stream' },
-  });
+  // 大きいファイルはコミットに時間がかかるため、二重送信を防ぎ進行中を明示する。
+  const btn = $('fd-save-btn');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  const restoreByte = editRange ? editRange.start : null;
+  let r;
+  try {
+    r = await api(url, {
+      method: 'POST',
+      body: new TextEncoder().encode(newContent).buffer,
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
   if (!r.ok) { uiToast('保存に失敗しました: ' + await r.text(), 'error'); return; }
   uiToast('保存しました', 'success');
   currentFile = await json('/api/files/' + fileId);
   $('fd-editor').classList.add('hidden');
   await loadDetail();
+  // 編集していた位置へ表示を戻す（再描画は先頭から始まるため）。
+  if (restoreByte != null && textVirtual && textTotalBytes > 0) {
+    virtJump(restoreByte / textTotalBytes);
+  }
 }
 
 // アップロードしたファイルで content を置き換える（新しいコミットとして記録）。

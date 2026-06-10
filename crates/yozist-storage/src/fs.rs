@@ -157,8 +157,19 @@ impl BlobStore for FsBlobStore {
     }
 }
 
+/// 大きな本文は圧縮レベルを下げて保存（コミット）のレイテンシを抑える。
+/// zstd レベル 1 はレベル 3 の概ね 2〜3 倍速く、圧縮率の差は数 % 程度。
+/// 巨大ファイルの部分編集でも保存が待たされないことを優先する。
+const ZSTD_FAST_THRESHOLD: usize = 8 * 1024 * 1024;
+const ZSTD_FAST_LEVEL: i32 = 1;
+
 fn compress(input: &[u8]) -> Result<Vec<u8>, StorageError> {
-    zstd::stream::encode_all(input, ZSTD_LEVEL).map_err(StorageError::Io)
+    let level = if input.len() >= ZSTD_FAST_THRESHOLD {
+        ZSTD_FAST_LEVEL
+    } else {
+        ZSTD_LEVEL
+    };
+    zstd::stream::encode_all(input, level).map_err(StorageError::Io)
 }
 
 fn decompress(input: &[u8]) -> Result<Vec<u8>, StorageError> {
