@@ -156,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
                 audit: audit.clone(),
                 share_admin,
                 smb_creds,
+                content_cache: std::sync::Arc::new(yozist_api::ContentCache::default()),
             };
             let app = yozist_api::router(state);
 

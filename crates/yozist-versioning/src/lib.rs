@@ -248,6 +248,73 @@ impl VersioningEngine {
         .await
     }
 
+    /// 既に「最終結果の全文」が手元にある場合に、CRDT 差分計算を経ずに直接 blob として
+    /// コミットする（巨大ファイルの部分編集用）。
+    ///
+    /// plain text の `serialize` 出力は本文そのものなので、結果の blob は通常の
+    /// `commit()` と同一になる。`commit()` が行う「前バージョンの全文読込 → yrs への
+    /// ロード → 文字差分 → serialize」を丸ごと省くため、GB 級でも軽い。FTS 用の本文は
+    /// 巨大ファイルでコミットが重くならないよう先頭のみに制限する。
+    pub async fn commit_raw(
+        &self,
+        file_id: FileId,
+        content: &[u8],
+        actor: ActorId,
+        message: Option<String>,
+    ) -> Result<Commit, VersioningError> {
+        let mut file = self
+            .meta
+            .get_file(&file_id)
+            .await?
+            .ok_or_else(|| VersioningError::NotFound(file_id))?;
+
+        let mut hint = FormatHint {
+            extension: ext_of(&file.display_name),
+            mime: file.mime.clone(),
+            first_bytes: Some(content.iter().take(64).copied().collect()),
+            display_name: Some(file.display_name.clone()),
+        };
+        if hint.mime.is_none() {
+            hint.mime = guess_mime(&file.display_name, content);
+        }
+        let fmt = self.registry.resolve(&hint);
+
+        let blob_id = self.blob.put(content).await?;
+        let now = time::OffsetDateTime::now_utc();
+        // charset は確定済みなら検出しない（巨大バイト列の走査を避ける）。
+        let charset = if fmt.format_id() == "text/plain" && file.charset.is_none() {
+            Some(text::detect_charset(content))
+        } else {
+            None
+        };
+        let size = presented_size(content, file.charset.as_deref().or(charset.as_deref()));
+        // FTS 本文は巨大ファイルで重くならないよう先頭 256KiB に制限する。
+        const FTS_MAX: usize = 256 * 1024;
+        let fts_content = if fmt.format_id() == "text/plain" {
+            let mut end = content.len().min(FTS_MAX);
+            // UTF-8 継続バイトの途中で切らない。
+            while end > 0 && end < content.len() && (content[end] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            String::from_utf8_lossy(&content[..end]).into_owned()
+        } else {
+            String::new()
+        };
+        self.persist_commit(
+            &mut file,
+            blob_id,
+            size,
+            fmt.format_id(),
+            actor,
+            message,
+            charset,
+            &fts_content,
+            now,
+            &hint,
+        )
+        .await
+    }
+
     /// 新規ファイルをストリームから作成する。
     ///
     /// フォーマット判定（拡張子/MIME）は本文を読む前に確定できるため、

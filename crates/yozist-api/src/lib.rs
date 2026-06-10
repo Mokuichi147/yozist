@@ -36,7 +36,7 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
+    ActorId, CommitId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -57,6 +57,37 @@ pub struct ApiState {
     /// SMB(NTLM) 資格情報の同期先。SMB 無効時は `None`。
     /// register / login / change_password 成功時に平文パスワードを渡して反映する。
     pub smb_creds: Option<Arc<dyn yozist_auth::SmbCredentialSink>>,
+    /// 展開済み content の小さなキャッシュ。blob はファイル全体が 1 つの zstd
+    /// として保存されるため、Range リクエストのたびに全体を展開すると巨大ファイルの
+    /// 仮想スクロールが破綻する。直近に読んだ 1 ファイル分を保持し、同一コミットへの
+    /// 連続した範囲取得で再展開を避ける。
+    pub content_cache: Arc<ContentCache>,
+}
+
+/// 展開済み content の単一エントリキャッシュ（直近に読んだファイル）。
+/// キーは `(FileId, CommitId)`。コミットが変われば自然にミスして再読込される。
+#[derive(Default)]
+pub struct ContentCache {
+    inner: std::sync::Mutex<Option<(FileId, CommitId, Arc<Vec<u8>>)>>,
+}
+
+/// これを超えるサイズはキャッシュしない（サーバメモリ保護）。
+const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+
+impl ContentCache {
+    fn get(&self, file_id: FileId, commit_id: CommitId) -> Option<Arc<Vec<u8>>> {
+        let g = self.inner.lock().unwrap();
+        match g.as_ref() {
+            Some((f, c, b)) if *f == file_id && *c == commit_id => Some(b.clone()),
+            _ => None,
+        }
+    }
+    fn put(&self, file_id: FileId, commit_id: CommitId, bytes: Arc<Vec<u8>>) {
+        if bytes.len() > MAX_CACHE_BYTES {
+            return;
+        }
+        *self.inner.lock().unwrap() = Some((file_id, commit_id, bytes));
+    }
 }
 
 /// ルーター生成。
@@ -372,17 +403,17 @@ async fn delete_file(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 保存済み MIME を Content-Type に設定して本文を返す。未設定なら octet-stream。
+/// 保存済み MIME と本文を、配信用の `(Content-Type, body)` に整える。
 ///
 /// テキストファイル（`charset` あり）は blob に UTF-8 で保存されているため、
 /// 取り込み時に判定した元エンコーディングへ再エンコードして「元の形式」で返す。
 /// 併せて `Content-Type` に `charset=` を付与し、ブラウザが正しくデコードできる
 /// ようにする。`charset` が `None`（バイナリ）はそのまま返す。
-fn content_response(
+fn encode_content(
     mime: Option<String>,
     charset: Option<String>,
     bytes: Vec<u8>,
-) -> impl IntoResponse {
+) -> (String, Vec<u8>) {
     let mut ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
     let body = match &charset {
         Some(cs) => {
@@ -396,14 +427,124 @@ fn content_response(
         }
         None => bytes,
     };
+    (ct, body)
+}
+
+/// 保存済み MIME を Content-Type に設定して本文を返す。未設定なら octet-stream。
+fn content_response(
+    mime: Option<String>,
+    charset: Option<String>,
+    bytes: Vec<u8>,
+) -> impl IntoResponse {
+    let (ct, body) = encode_content(mime, charset, bytes);
     ([(axum::http::header::CONTENT_TYPE, ct)], body)
+}
+
+/// `Range: bytes=START-END` を解釈して単一レンジ `(start, end)`（両端含む）を返す。
+/// 巨大ファイルをフロントが分割取得するための最小実装。複数レンジ・範囲外・
+/// 空ファイルは `None`（呼び出し側で 416 か全体返却に振り分ける）。
+///
+/// - `bytes=0-1023` → `(0, 1023)`
+/// - `bytes=1024-`  → `(1024, total-1)`
+/// - `bytes=-512`   → 末尾 512 バイト
+fn parse_byte_range(header: &str, total: u64) -> Option<(u64, u64)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = header.trim().strip_prefix("bytes=")?;
+    // 複数レンジ（カンマ区切り）は非対応。
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_s, end_s) = spec.split_once('-')?;
+    let (start, end) = if start_s.is_empty() {
+        // suffix レンジ: 末尾 N バイト。
+        let n: u64 = end_s.trim().parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let n = n.min(total);
+        (total - n, total - 1)
+    } else {
+        let start: u64 = start_s.trim().parse().ok()?;
+        let end: u64 = if end_s.trim().is_empty() {
+            total - 1
+        } else {
+            end_s.trim().parse().ok()?
+        };
+        (start, end.min(total - 1))
+    };
+    if start > end || start >= total {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// `Range` ヘッダがあれば 206 Partial Content で該当範囲のみ、無ければ 200 で全体を返す。
+/// テキスト/メディアともにフロントが必要な分だけ取得できるよう、常に
+/// `Accept-Ranges: bytes` を付与する。解釈できるが範囲外の Range は 416 を返す。
+fn range_response(
+    content_type: String,
+    body: &[u8],
+    range: Option<&axum::http::HeaderValue>,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let total = body.len() as u64;
+    let ct = HeaderValue::from_str(&content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let accept = HeaderValue::from_static("bytes");
+
+    let parsed = range
+        .and_then(|h| h.to_str().ok())
+        .map(|s| (s, parse_byte_range(s, total)));
+
+    match parsed {
+        Some((_, Some((start, end)))) => {
+            let slice = body[start as usize..=end as usize].to_vec();
+            let mut resp = (StatusCode::PARTIAL_CONTENT, slice).into_response();
+            let h = resp.headers_mut();
+            h.insert(header::CONTENT_TYPE, ct);
+            h.insert(header::ACCEPT_RANGES, accept);
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                h.insert(header::CONTENT_RANGE, v);
+            }
+            resp
+        }
+        Some((_, None)) => {
+            // Range ヘッダはあるが解釈不能/範囲外 → 416。
+            let mut resp = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+            let h = resp.headers_mut();
+            h.insert(header::ACCEPT_RANGES, accept);
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                h.insert(header::CONTENT_RANGE, v);
+            }
+            resp
+        }
+        None => {
+            let mut resp = body.to_vec().into_response();
+            let h = resp.headers_mut();
+            h.insert(header::CONTENT_TYPE, ct);
+            h.insert(header::ACCEPT_RANGES, accept);
+            resp
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ContentQuery {
+    /// 真値のときは charset 再エンコードせず、ストレージの生 UTF-8 を返す
+    /// （`Content-Type` は `charset=utf-8`）。仮想スクロールビューアが
+    /// チャンク境界の文字割れを安定処理するために使う。
+    utf8: Option<String>,
 }
 
 async fn get_content(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
+    Query(q): Query<ContentQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
     let file = s
@@ -412,12 +553,37 @@ async fn get_content(
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    let bytes = s
-        .engine
-        .read_current(id)
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(content_response(file.mime, file.charset, bytes))
+    // 展開済み content をキャッシュから取得（なければ展開して保存）。
+    // 連続した Range 取得（仮想スクロール）で blob の再展開を避ける。
+    let bytes = match file.current_commit.and_then(|cid| s.content_cache.get(id, cid)) {
+        Some(b) => b,
+        None => {
+            let raw = s
+                .engine
+                .read_current(id)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            let arc = Arc::new(raw);
+            if let Some(cid) = file.current_commit {
+                s.content_cache.put(id, cid, arc.clone());
+            }
+            arc
+        }
+    };
+    let range = headers.get(axum::http::header::RANGE);
+    let want_utf8 = q.utf8.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
+    if want_utf8 {
+        // blob は常に UTF-8。charset 再エンコードせず生のまま、必要範囲だけ返す。
+        let mut ct = file.mime.unwrap_or_else(|| "text/plain".to_string());
+        if !ct.to_ascii_lowercase().contains("charset=") {
+            ct = format!("{ct}; charset=utf-8");
+        }
+        Ok(range_response(ct, &bytes, range))
+    } else {
+        // charset 再エンコードが必要な経路（ダウンロード/メディア/互換）。
+        let (ct, body) = encode_content(file.mime, file.charset, (*bytes).clone());
+        Ok(range_response(ct, &body, range))
+    }
 }
 
 #[derive(Deserialize)]
@@ -427,7 +593,18 @@ struct CommitQuery {
     /// 指定時はファイル名を更新し、mime/charset を新しい名前＋内容から再判定する
     /// （アップロードによる「内容を更新」用）。テキスト編集等では送らない。
     name: Option<String>,
+    /// 部分編集用（範囲置換）。指定時はボディで現行内容の
+    /// `[repl_start, repl_end)`（ストレージ UTF-8 バイト空間）を置換し、その前後は
+    /// そのまま残して全文をコミットする。巨大ファイルでも表示中の範囲だけ編集できる。
+    /// 省略時の既定: repl_start=0, repl_end=現行長（= 全置換 / 末尾保持）。
+    repl_start: Option<u64>,
+    repl_end: Option<u64>,
+    /// 後方互換: repl_start=0, repl_end=keep_from と同義（先頭プレフィックス置換）。
+    keep_from: Option<u64>,
 }
+
+/// 部分編集で受け取る本文の最大バイト数。
+const MAX_EDIT_PREFIX_BYTES: usize = 512 * 1024 * 1024;
 
 async fn commit_file(
     State(s): State<ApiState>,
@@ -439,21 +616,30 @@ async fn commit_file(
     let id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::WRITE).await?;
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
-    // ボディをメモリに載せず 1 チャンクずつ blob ストアへ流す。
-    let stream = body
-        .into_data_stream()
-        .map_err(|e| StorageError::Other(e.to_string()))
-        .boxed();
     // name 指定時（アップロードによる「内容を更新」）は前バージョンとマージせず
     // 全置換する。形式・mime・charset・表示名を新しい名前＋内容から判定し直すため、
     // 別形式へ差し替えても旧バージョンの解釈に引きずられず破損しない。
-    // name 無し（テキスト編集など）は従来どおり CRDT マージ経路。
+    // repl_start/repl_end/keep_from 指定時（部分編集）は現行内容の該当範囲のみ置換する。
+    // どれも無い（テキスト全文編集など）は従来どおりストリーミング CRDT マージ経路。
+    let is_partial = q.repl_start.is_some() || q.repl_end.is_some() || q.keep_from.is_some();
     let result = if let Some(name) = q.name {
+        let stream = body
+            .into_data_stream()
+            .map_err(|e| StorageError::Other(e.to_string()))
+            .boxed();
         s.engine
             .replace_streaming(id, name, stream, actor, q.message)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
+    } else if is_partial {
+        let repl_start = q.repl_start.unwrap_or(0);
+        let repl_end = q.repl_end.or(q.keep_from); // keep_from は repl_end の別名
+        commit_partial(&s, id, repl_start, repl_end, body, actor, q.message).await
     } else {
+        let stream = body
+            .into_data_stream()
+            .map_err(|e| StorageError::Other(e.to_string()))
+            .boxed();
         s.engine
             .commit_streaming(id, stream, actor, q.message)
             .await
@@ -481,6 +667,78 @@ async fn commit_file(
     .await;
 
     Ok(Json(result?))
+}
+
+/// 部分編集コミット。受信した本文（UTF-8）で現行内容の `[repl_start, repl_end)` を
+/// 置換し、その前後を残して全文を作り、通常の CRDT コミットへ渡す。
+///
+/// 置換は **ストレージの UTF-8 バイト空間** で行う（blob は常に UTF-8）。オフセットは
+/// クライアントが読み込んだテキストの UTF-8 バイト位置で文字境界に一致する。安全のため
+/// サーバ側でも長さクランプと境界補正を行う。`repl_end=None` は現行長（末尾まで置換）。
+async fn commit_partial(
+    s: &ApiState,
+    id: FileId,
+    repl_start: u64,
+    repl_end: Option<u64>,
+    body: Body,
+    actor: ActorId,
+    message: Option<String>,
+) -> Result<yozist_core::Commit, ApiError> {
+    let body = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("body: {e}")))?;
+    // 直前まで表示していたファイルなら展開済みキャッシュが温まっているため、
+    // 現行内容の再解凍（GB 級で数秒）を避けられる。
+    let file = s
+        .meta
+        .get_file(&id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let current = match file.current_commit.and_then(|cid| s.content_cache.get(id, cid)) {
+        Some(b) => b,
+        None => Arc::new(
+            s.engine
+                .read_current(id)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+        ),
+    };
+    let end = repl_end.unwrap_or(current.len() as u64);
+    let new_full = splice_range(&body, &current, repl_start, end);
+    // CRDT 差分を経ず直接 blob としてコミットする。結合済みの最終全文が手元に
+    // あるため結果の blob は通常コミットと同一で、巨大ファイルでも軽い。
+    let commit = s
+        .engine
+        .commit_raw(id, &new_full, actor, message)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // 保存直後の再表示（Range 取得）が再解凍なしで返るよう、新内容を事前投入する。
+    s.content_cache.put(id, commit.id, Arc::new(new_full));
+    Ok(commit)
+}
+
+/// `current[0..repl_start)` + `body` + `current[repl_end..]` を結合する。
+///
+/// blob は文字コードに依らず常に UTF-8 保存で、`body` も UTF-8。オフセットは
+/// クライアントが読み込んだテキストの UTF-8 バイト位置（文字境界）。元の文字コード
+/// （Shift_JIS / EUC-JP / UTF-16 など）に依存せず正しく機能する。念のため
+/// サーバ側でも長さクランプと UTF-8 境界補正（継続バイトの途中で切らない）を行う。
+fn splice_range(body: &[u8], current: &[u8], repl_start: u64, repl_end: u64) -> Vec<u8> {
+    let to_boundary = |mut p: usize| {
+        p = p.min(current.len());
+        while p > 0 && p < current.len() && (current[p] & 0xC0) == 0x80 {
+            p -= 1;
+        }
+        p
+    };
+    let start = to_boundary(repl_start as usize);
+    let end = to_boundary((repl_end as usize).max(repl_start as usize));
+    let mut out = Vec::with_capacity(start + body.len() + (current.len() - end));
+    out.extend_from_slice(&current[..start]);
+    out.extend_from_slice(body);
+    out.extend_from_slice(&current[end..]);
+    out
 }
 
 async fn history(
@@ -2144,6 +2402,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_byte_range_handles_common_forms() {
+        // 通常レンジ・両端含む。
+        assert_eq!(parse_byte_range("bytes=0-1023", 4096), Some((0, 1023)));
+        // 開始のみ → 末尾まで。
+        assert_eq!(parse_byte_range("bytes=1024-", 4096), Some((1024, 4095)));
+        // 末尾 N バイト。
+        assert_eq!(parse_byte_range("bytes=-512", 4096), Some((3584, 4095)));
+        // end が total を超える場合は total-1 にクランプ。
+        assert_eq!(parse_byte_range("bytes=0-99999", 4096), Some((0, 4095)));
+        // suffix が total を超える場合は全体。
+        assert_eq!(parse_byte_range("bytes=-99999", 4096), Some((0, 4095)));
+        // 範囲外・複数レンジ・空ファイル・不正は None。
+        assert_eq!(parse_byte_range("bytes=5000-6000", 4096), None);
+        assert_eq!(parse_byte_range("bytes=0-100,200-300", 4096), None);
+        assert_eq!(parse_byte_range("bytes=0-100", 0), None);
+        assert_eq!(parse_byte_range("items=0-100", 4096), None);
+    }
+
+    #[test]
+    fn range_response_returns_partial_content() {
+        use axum::http::{header, HeaderValue};
+        let body = (0u8..=9).collect::<Vec<u8>>();
+        let range = HeaderValue::from_static("bytes=2-5");
+        let resp = range_response("text/plain".into(), &body, Some(&range));
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 2-5/10"
+        );
+        assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+
+        // Range 無しは 200 で Accept-Ranges のみ付与。
+        let full = range_response("text/plain".into(), &body, None);
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+
+        // 範囲外は 416。
+        let bad = HeaderValue::from_static("bytes=100-200");
+        let oob = range_response("text/plain".into(), &body, Some(&bad));
+        assert_eq!(oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[test]
+    fn splice_range_replaces_region() {
+        // 先頭プレフィックス置換（repl_start=0）: [0,4) を "XY" に → "XY"+"EFGH"。
+        assert_eq!(splice_range(b"XY", b"ABCDEFGH", 0, 4), b"XYEFGH".to_vec());
+        // 中間範囲置換: [2,6) を "xy" に → "AB"+"xy"+"GH"。
+        assert_eq!(splice_range(b"xy", b"ABCDEFGH", 2, 6), b"ABxyGH".to_vec());
+        // 末尾範囲置換: [6,8) を "Z" に → "ABCDEF"+"Z"。
+        assert_eq!(splice_range(b"Z", b"ABCDEFGH", 6, 8), b"ABCDEFZ".to_vec());
+        // end=len は末尾保持なし（全置換相当）。
+        assert_eq!(splice_range(b"NEW", b"OLD", 0, 3), b"NEW".to_vec());
+        // 範囲外はクランプ。
+        assert_eq!(splice_range(b"NEW", b"OLD", 0, 999), b"NEW".to_vec());
+    }
+
+    #[test]
+    fn splice_range_respects_utf8_boundaries() {
+        // 「あいうえお」= 各 3 バイトの UTF-8。blob は文字コードに依らず UTF-8 保存。
+        let current = "あいうえお".as_bytes(); // 15 bytes
+        // [6,9)（「う」）を "X" に置換 → "あいXえお"。
+        let spliced = splice_range("X".as_bytes(), current, 6, 9);
+        assert_eq!(String::from_utf8(spliced).unwrap(), "あいXえお");
+        // 継続バイトの途中(7,10)でも境界(6,9)へ補正され破損しない。
+        let spliced = splice_range("X".as_bytes(), current, 7, 10);
+        assert_eq!(String::from_utf8(spliced).unwrap(), "あいXえお");
+    }
+
     async fn make_state() -> (ApiState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteMetaStore::open_in_memory().await.unwrap();
@@ -2172,6 +2499,7 @@ mod tests {
                 audit,
                 share_admin,
                 smb_creds: None,
+                content_cache: Arc::new(ContentCache::default()),
             },
             dir,
         )
