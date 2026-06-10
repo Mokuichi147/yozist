@@ -756,7 +756,9 @@ async fn read_commit(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path((id, cid)): Path<(String, String)>,
-) -> Result<impl IntoResponse, ApiError> {
+    Query(q): Query<ContentQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
     let file_id = parse_file_id(&id)?;
     require_permission(&*s.authz, &ctx, &Target::file(file_id), PermissionMask::READ).await?;
     let commit_id = uuid::Uuid::parse_str(&cid)
@@ -768,15 +770,36 @@ async fn read_commit(
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    let bytes = s
-        .engine
-        .read_at_commit(file_id, commit_id)
-        .await
-        .map_err(|e| match e {
-            yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
-            other => ApiError::Internal(other.to_string()),
-        })?;
-    Ok(content_response(file.mime, file.charset, bytes))
+    // get_content と同じく展開済みキャッシュ＋Range 対応（過去バージョンの仮想スクロール用）。
+    let bytes = match s.content_cache.get(file_id, commit_id) {
+        Some(b) => b,
+        None => {
+            let raw = s
+                .engine
+                .read_at_commit(file_id, commit_id)
+                .await
+                .map_err(|e| match e {
+                    yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
+                    other => ApiError::Internal(other.to_string()),
+                })?;
+            let arc = Arc::new(raw);
+            s.content_cache.put(file_id, commit_id, arc.clone());
+            arc
+        }
+    };
+    let range = headers.get(axum::http::header::RANGE);
+    let want_utf8 = q.utf8.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
+    if want_utf8 {
+        // blob は常に UTF-8。charset 再エンコードせず生のまま、必要範囲だけ返す。
+        let mut ct = file.mime.unwrap_or_else(|| "text/plain".to_string());
+        if !ct.to_ascii_lowercase().contains("charset=") {
+            ct = format!("{ct}; charset=utf-8");
+        }
+        Ok(range_response(ct, &bytes, range))
+    } else {
+        let (ct, body) = encode_content(file.mime, file.charset, (*bytes).clone());
+        Ok(range_response(ct, &body, range))
+    }
 }
 
 #[derive(Deserialize)]
