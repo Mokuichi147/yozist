@@ -694,8 +694,10 @@ async fn commit_partial(
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     let end = repl_end.unwrap_or(current.len() as u64);
     let new_full = splice_range(&body, &current, repl_start, end);
+    // CRDT 差分を経ず直接 blob としてコミットする。結合済みの最終全文が手元に
+    // あるため結果の blob は通常コミットと同一で、巨大ファイルでも軽い。
     s.engine
-        .commit(id, &new_full, actor, message)
+        .commit_raw(id, &new_full, actor, message)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
