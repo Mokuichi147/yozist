@@ -182,6 +182,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let format_id: String = row.try_get("format_id")?;
     let timestamp: String = row.try_get("timestamp")?;
     let message: Option<String> = row.try_get("message")?;
+    let committed_by: Option<String> = row.try_get("committed_by")?;
     Ok(Commit {
         id: CommitId::from_uuid(parse_uuid(&id)?),
         file_id: FileId::from_uuid(parse_uuid(&file_id)?),
@@ -193,6 +194,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
         format_id,
         timestamp: parse_dt(&timestamp)?,
         message,
+        committed_by,
     })
 }
 
@@ -600,8 +602,8 @@ impl MetaStore for SqliteMetaStore {
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError> {
         sqlx::query(
             r#"INSERT INTO commits
-               (id, file_id, parent, actor, blob, format_id, timestamp, message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, file_id, parent, actor, blob, format_id, timestamp, message, committed_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(commit.id.to_string())
         .bind(commit.file_id.to_string())
@@ -611,6 +613,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(&commit.format_id)
         .bind(fmt_dt(commit.timestamp))
         .bind(&commit.message)
+        .bind(&commit.committed_by)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -935,6 +938,7 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc(),
             message: Some("init".into()),
+            committed_by: None,
         };
         let c2 = Commit {
             id: CommitId::new(),
@@ -945,6 +949,7 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc() + time::Duration::seconds(1),
             message: Some("edit".into()),
+            committed_by: Some("alice".into()),
         };
         s.insert_commit(&c1).await.unwrap();
         s.insert_commit(&c2).await.unwrap();
@@ -952,6 +957,9 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].id, c1.id);
         assert_eq!(log[1].id, c2.id);
+        // committed_by が往復で保持される（NULL/値の両方）
+        assert_eq!(log[0].committed_by, None);
+        assert_eq!(log[1].committed_by.as_deref(), Some("alice"));
     }
 
     #[tokio::test]

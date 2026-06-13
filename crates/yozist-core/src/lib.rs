@@ -187,6 +187,11 @@ pub struct Commit {
     pub format_id: String,
     pub timestamp: time::OffsetDateTime,
     pub message: Option<String>,
+    /// コミットを実行したユーザー名ラベル。CRDT マージ用の `actor` とは別物で、
+    /// 「誰が変更したか」の表示・監査用。ユーザー削除後も残るよう ID ではなくラベルで保持。
+    /// 旧データや SMB 経由の書き込みでは NULL。
+    #[serde(default)]
+    pub committed_by: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

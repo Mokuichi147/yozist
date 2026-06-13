@@ -352,11 +352,15 @@ async function loadHistory() {
     : history.map(c => {
         const isCurrent = c.id === currentCommitId;
         const time = fmtTs(c.timestamp);
+        const by = c.committed_by
+          ? `<span class="opacity-70">${escapeHtml(c.committed_by)}</span>`
+          : '<span class="opacity-40">不明</span>';
         return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
           <div class="truncate">
             ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
             <span class="opacity-70">${time}</span>
             <span class="opacity-60">${escapeHtml(c.format_id)}</span>
+            <span class="opacity-50">·</span> ${by}
             ${escapeHtml(c.message || '')}
           </div>
           <div class="flex gap-1 shrink-0">
