@@ -15,7 +15,7 @@
             <label class="text-xs opacity-70 block mb-1">全文検索 (FTS5)</label>
             <div class="join w-full">
               <input id="f-search" class="input input-bordered input-sm join-item w-full"
-                     placeholder="本文・名前を検索"
+                     placeholder="本文・名前を検索 ( / )"
                      onkeydown="if(event.key==='Enter')applyFilters()">
               <button class="btn btn-sm join-item btn-ghost" onclick="$('f-search').value='';applyFilters()" title="クリア">×</button>
             </div>
@@ -37,6 +37,8 @@
 
           <div>
             <label class="text-xs opacity-70 block mb-1">タグ (AND)</label>
+            <input id="f-tag-search" class="input input-bordered input-xs w-full mb-1"
+                   placeholder="タグを絞り込み" oninput="renderTags()">
             <div id="f-tags" class="flex flex-wrap gap-1 max-h-60 overflow-y-auto"></div>
           </div>
 
@@ -47,17 +49,44 @@
 
     <!-- 右カラム: 結果 -->
     <div class="space-y-4">
-      <div class="card bg-base-100 shadow-sm">
+      <div id="drop-zone" class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
-          <div class="flex items-center justify-between mb-2">
+
+          <!-- ツールバー -->
+          <div class="flex flex-wrap items-center gap-2 mb-2">
             <h2 class="text-sm font-semibold">
               files <span class="opacity-60" id="files-count"></span>
             </h2>
-            <div id="filter-summary" class="text-xs opacity-60"></div>
+            <div class="flex-1"></div>
+            <select id="f-sort" class="select select-bordered select-xs" onchange="applyFilters()" title="並び順">
+              <option value="updated_desc">更新が新しい順</option>
+              <option value="updated_asc">更新が古い順</option>
+              <option value="name_asc">名前 (昇順)</option>
+              <option value="name_desc">名前 (降順)</option>
+              <option value="size_desc">サイズが大きい順</option>
+              <option value="size_asc">サイズが小さい順</option>
+              <option value="created_desc">作成が新しい順</option>
+            </select>
+            <button class="btn btn-xs" onclick="newFile()">＋ 新規ファイル</button>
+            <button class="btn btn-xs btn-primary" onclick="$('upload-input').click()">⬆ アップロード</button>
+            <input type="file" id="upload-input" class="hidden" multiple
+                   onchange="uploadFiles(this.files).then(()=>{this.value='';})">
           </div>
-          <ul class="divide-y divide-base-300" id="file-list">
+
+          <!-- アクティブフィルタのチップ表示（× で個別解除） -->
+          <div id="active-filters" class="flex flex-wrap gap-1 mb-2 empty:hidden"></div>
+
+          <ul class="space-y-0.5" id="file-list">
             <li class="px-2 py-2 opacity-50 text-sm">読み込み中…</li>
           </ul>
+
+          <div id="load-more-wrap" class="hidden pt-3 text-center">
+            <button id="load-more" class="btn btn-sm btn-wide" onclick="loadMore()">さらに読み込む</button>
+          </div>
+
+          <div class="text-xs opacity-40 mt-3 text-center">
+            ファイルをここにドラッグ＆ドロップしてアップロードできます
+          </div>
         </div>
       </div>
     </div>
@@ -66,11 +95,21 @@
 </div>
 {% endblock %}
 
+{% block style %}
+  #drop-zone.drag-over { outline: 2px dashed var(--color-primary, #6366f1); outline-offset: -4px; }
+{% endblock %}
+
 {% block script %}
 <script>
+const PAGE = 100;
+
 let allTags = [];
 let selectedTags = new Set();
-let allFiles = [];
+let allFiles = [];          // 表示中のファイル
+let tagsByFile = {};        // file_id -> [Tag]
+let hasMore = false;        // ブラウズモード時にまだ続きがあるか (X-Has-More)
+let browseOffset = 0;       // ブラウズモードの DB オフセット
+let browseMode = true;      // フィルタなし（サーバページング）かどうか
 
 async function init() {
   const me = await requireAuth();
@@ -81,35 +120,46 @@ async function init() {
   await applyFilters();
 }
 
+// ---- 左カラム: タグ / シリーズ ----
+
 async function loadTags() {
   try {
-    allTags = await json('/api/tags');
+    allTags = await json('/api/tags?sort=usage');
     renderTags();
   } catch (e) { allTags = []; }
 }
 
 function renderTags() {
   const el = $('f-tags');
-  if (allTags.length === 0) {
-    el.innerHTML = '<span class="text-xs opacity-50">タグなし</span>';
+  const filter = ($('f-tag-search').value || '').trim().toLowerCase();
+  // 選択中タグは絞り込みに関わらず常に先頭へ（解除手段を見失わないように）
+  const visible = allTags.filter(t =>
+    selectedTags.has(t.name) || !filter || t.name.toLowerCase().includes(filter));
+  if (visible.length === 0) {
+    el.innerHTML = '<span class="text-xs opacity-50">' +
+      (allTags.length === 0 ? 'タグなし' : '該当するタグなし') + '</span>';
     return;
   }
+  visible.sort((a, b) =>
+    (selectedTags.has(b.name) - selectedTags.has(a.name)) || a.name.localeCompare(b.name));
   el.innerHTML = '';
-  allTags.forEach(t => {
+  visible.forEach(t => {
     const active = selectedTags.has(t.name);
     const btn = document.createElement('button');
     btn.className = 'badge badge-sm cursor-pointer ' +
       (active ? 'badge-primary' : 'badge-outline');
     const icon = t.kind === 'system' ? ' ⚙' : t.kind === 'ai' ? ' 🤖' : '';
     btn.textContent = t.name + icon;
-    btn.onclick = () => {
-      if (selectedTags.has(t.name)) selectedTags.delete(t.name);
-      else selectedTags.add(t.name);
-      renderTags();
-      applyFilters();
-    };
+    btn.onclick = () => toggleTag(t.name);
     el.appendChild(btn);
   });
+}
+
+function toggleTag(name) {
+  if (selectedTags.has(name)) selectedTags.delete(name);
+  else selectedTags.add(name);
+  renderTags();
+  applyFilters();
 }
 
 async function loadSeries() {
@@ -120,6 +170,8 @@ async function loadSeries() {
       list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
   } catch (e) {}
 }
+
+// ---- フィルタ状態 ----
 
 let debounceTimer = null;
 function applyFiltersDebounced() {
@@ -136,6 +188,8 @@ function resetFilters() {
   applyFilters();
 }
 
+function sortVal() { return $('f-sort').value || 'updated_desc'; }
+
 function saveFiltersToUrl() {
   const params = new URLSearchParams();
   const q = $('f-search').value.trim();
@@ -145,6 +199,7 @@ function saveFiltersToUrl() {
   if (name) params.set('name', name);
   if (series) params.set('series', series);
   if (selectedTags.size) params.set('tags', [...selectedTags].join(','));
+  if (sortVal() !== 'updated_desc') params.set('sort', sortVal());
   const qs = params.toString();
   history.replaceState(null, '', qs ? '?' + qs : location.pathname);
 }
@@ -155,8 +210,11 @@ function restoreFiltersFromUrl() {
   if (p.get('name')) $('f-name').value = p.get('name');
   if (p.get('series')) $('f-series').value = p.get('series');
   if (p.get('tags')) p.get('tags').split(',').filter(Boolean).forEach(t => selectedTags.add(t));
+  if (p.get('sort')) $('f-sort').value = p.get('sort');
   renderTags();
 }
+
+// ---- 一覧取得 ----
 
 async function applyFilters() {
   saveFiltersToUrl();
@@ -165,22 +223,31 @@ async function applyFilters() {
   const seriesId = $('f-series').value;
   const tags = [...selectedTags];
 
-  let url = '/api/files';
-  if (q) {
-    url = '/api/search?q=' + encodeURIComponent(q);
-  } else if (tags.length > 0) {
-    url = '/api/files/by-tags?tags=' + encodeURIComponent(tags.join(','));
+  browseMode = !q && tags.length === 0 && !seriesId && !name;
+
+  if (browseMode) {
+    browseOffset = 0;
+    allFiles = [];
+    await fetchBrowsePage();
+    return;
   }
 
+  // フィルタモード: 各エンドポイントは完全な結果集合を返すのでクライアント側で AND・ソート
   let files;
   try {
-    files = await json(url);
+    if (q) {
+      files = await json('/api/search?q=' + encodeURIComponent(q) + '&limit=500');
+    } else if (tags.length > 0) {
+      files = await json('/api/files/by-tags?tags=' + encodeURIComponent(tags.join(',')));
+    } else {
+      // 名前 / シリーズのみ → ベース集合をソート済みで広めに取得
+      files = await json('/api/files?limit=1000&sort=' + sortParams().sort + '&order=' + sortParams().order);
+    }
   } catch (e) {
     $('file-list').innerHTML = '<li class="px-2 py-2 text-error text-sm">取得失敗</li>';
     return;
   }
 
-  // 全文検索 + タグ AND の組み合わせはサーバ未対応のためクライアントで AND
   if (q && tags.length > 0) {
     const tagged = await json('/api/files/by-tags?tags=' + encodeURIComponent(tags.join(','))).catch(() => []);
     const allowed = new Set(tagged.map(f => f.id));
@@ -198,36 +265,273 @@ async function applyFilters() {
     files = files.filter(f => f.display_name.toLowerCase().includes(lower));
   }
 
+  // FTS は関連度順を保つ。それ以外（または明示的に並び替えた場合）はクライアントでソート
+  if (!q || sortVal() !== 'updated_desc') clientSort(files);
+
   allFiles = files;
+  hasMore = false;
   renderFiles();
+  fetchTagsFor(files.map(f => f.id));
+}
+
+function sortParams() {
+  const [key, dir] = sortVal().split('_');
+  return { sort: key, order: dir };
+}
+
+async function fetchBrowsePage() {
+  const p = sortParams();
+  let resp;
+  try {
+    resp = await api(`/api/files?limit=${PAGE}&offset=${browseOffset}&sort=${p.sort}&order=${p.order}`);
+    if (!resp.ok) throw new Error(await resp.text());
+  } catch (e) {
+    $('file-list').innerHTML = '<li class="px-2 py-2 text-error text-sm">取得失敗</li>';
+    return;
+  }
+  hasMore = resp.headers.get('x-has-more') === '1';
+  const page = await resp.json();
+  // 権限フィルタでページが縮むため、次オフセットはサーバが返す DB 上の位置を使う
+  const next = parseInt(resp.headers.get('x-next-offset') || '', 10);
+  browseOffset = Number.isNaN(next) ? browseOffset + PAGE : next;
+  allFiles = allFiles.concat(page);
+  renderFiles();
+  fetchTagsFor(page.map(f => f.id));
+}
+
+async function loadMore() {
+  const btn = $('load-more');
+  btn.disabled = true;
+  btn.textContent = '読み込み中…';
+  try { await fetchBrowsePage(); }
+  finally { btn.disabled = false; btn.textContent = 'さらに読み込む'; }
+}
+
+function clientSort(files) {
+  const [key, dir] = sortVal().split('_');
+  const m = dir === 'asc' ? 1 : -1;
+  files.sort((a, b) => {
+    let r;
+    if (key === 'name') r = a.display_name.localeCompare(b.display_name, 'ja');
+    else if (key === 'size') r = a.size - b.size;
+    else if (key === 'created') r = fmtTs(a.created_at).localeCompare(fmtTs(b.created_at));
+    else r = fmtTs(a.updated_at).localeCompare(fmtTs(b.updated_at));
+    return r * m;
+  });
+}
+
+// ---- タグ一括取得 ----
+
+async function fetchTagsFor(ids) {
+  ids = ids.filter(id => !(id in tagsByFile));
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    try {
+      const map = await json('/api/files/tags?ids=' + encodeURIComponent(chunk.join(',')));
+      Object.assign(tagsByFile, map);
+    } catch (e) { return; }
+  }
+  // 取得済みタグを表示中の行へ反映
+  document.querySelectorAll('[data-tags-for]').forEach(el => {
+    renderRowTags(el, el.dataset.tagsFor);
+  });
+}
+
+function renderRowTags(el, fileId) {
+  // システムタグ (ext:* / type:*) は拡張子から自明なので行には出さない
+  const tags = (tagsByFile[fileId] || []).filter(t => t.kind !== 'system');
+  if (tags.length === 0) { el.innerHTML = ''; return; }
+  const MAX = 4;
+  const shown = tags.slice(0, MAX);
+  el.innerHTML = shown.map(t => {
+    const active = selectedTags.has(t.name);
+    return `<button class="badge badge-xs ${active ? 'badge-primary' : 'badge-ghost'}"
+                    data-tag="${escapeHtml(t.name)}"
+                    title="このタグで絞り込み">${escapeHtml(t.name)}</button>`;
+  }).join('') +
+  (tags.length > MAX ? `<span class="badge badge-xs badge-ghost opacity-60">+${tags.length - MAX}</span>` : '');
+}
+
+// ---- 一覧描画 ----
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return n.toFixed(n >= 100 ? 0 : 1) + ' ' + units[i];
+}
+
+// 更新者（なければ作成者）を「 · name」形式で返す。未記録（旧データ・SMB 経由）は空。
+function actorLabel(f) {
+  const who = f.updated_by || f.created_by;
+  return who ? ` · ${escapeHtml(who)}` : '';
+}
+
+function fileIcon(f) {
+  const m = (f.mime || '').toLowerCase();
+  const n = f.display_name.toLowerCase();
+  if (m.startsWith('image/')) return '🖼️';
+  if (m.startsWith('video/')) return '🎬';
+  if (m.startsWith('audio/')) return '🎵';
+  if (m.includes('pdf')) return '📕';
+  if (m.includes('zip') || m.includes('compressed') || /\.(zip|gz|7z|rar|tar|xz|zst)$/.test(n)) return '🗜️';
+  if (/\.(md|markdown|txt)$/.test(n)) return '📝';
+  if (/\.(js|ts|jsx|tsx|py|rs|go|java|kt|c|cpp|h|hpp|sh|rb|php|html|css|json|yaml|yml|toml|sql|xml)$/.test(n)) return '💻';
+  if (/\.(csv|tsv|xlsx|xls)$/.test(n)) return '📊';
+  if (m.startsWith('text/')) return '📄';
+  if (m && m !== 'application/octet-stream') return '📦';
+  return '📄';
+}
+
+function renderActiveFilters() {
+  const el = $('active-filters');
+  const chips = [];
+  const q = $('f-search').value.trim();
+  const name = $('f-name').value.trim();
+  const sel = $('f-series');
+  if (q) chips.push({ label: `検索: "${q}"`, clear: () => { $('f-search').value = ''; } });
+  if (name) chips.push({ label: `名前: "${name}"`, clear: () => { $('f-name').value = ''; } });
+  if (sel.value) chips.push({
+    label: 'シリーズ: ' + sel.options[sel.selectedIndex].text,
+    clear: () => { sel.value = ''; },
+  });
+  selectedTags.forEach(t => chips.push({
+    label: 'タグ: ' + t,
+    clear: () => { selectedTags.delete(t); renderTags(); },
+  }));
+  el.innerHTML = '';
+  chips.forEach(c => {
+    const b = document.createElement('button');
+    b.className = 'badge badge-sm badge-outline gap-1 cursor-pointer hover:badge-error';
+    b.title = 'このフィルタを解除';
+    b.textContent = c.label + ' ×';
+    b.onclick = () => { c.clear(); applyFilters(); };
+    el.appendChild(b);
+  });
 }
 
 function renderFiles() {
-  $('files-count').textContent = `(${allFiles.length})`;
-  const parts = [];
-  if ($('f-search').value.trim()) parts.push(`検索: "${$('f-search').value.trim()}"`);
-  if (selectedTags.size) parts.push('タグ: ' + [...selectedTags].join(' AND '));
-  if ($('f-series').value) {
-    const sel = $('f-series');
-    parts.push('シリーズ: ' + sel.options[sel.selectedIndex].text);
-  }
-  if ($('f-name').value.trim()) parts.push(`名前: "${$('f-name').value.trim()}"`);
-  $('filter-summary').textContent = parts.join(' / ');
+  // 総数は権限フィルタ済みの値を安価に出せないため、読み込み済み件数 + 「+」表記のみ
+  $('files-count').textContent = `(${allFiles.length}${browseMode && hasMore ? '+' : ''})`;
+  renderActiveFilters();
 
   const el = $('file-list');
   if (allFiles.length === 0) {
-    el.innerHTML = '<li class="px-2 py-4 opacity-60 text-sm text-center">該当ファイルなし</li>';
-    return;
+    el.innerHTML = browseMode
+      ? '<li class="px-2 py-8 opacity-60 text-sm text-center">ファイルがありません。「アップロード」または「新規テキスト」で追加できます。</li>'
+      : '<li class="px-2 py-8 opacity-60 text-sm text-center">該当ファイルなし — フィルタ条件を見直してください。</li>';
+  } else {
+    el.innerHTML = allFiles.map(f => `
+      <li>
+        <a href="/ui/files/${f.id}" class="flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200">
+          <span class="text-lg shrink-0" aria-hidden="true">${fileIcon(f)}</span>
+          <span class="min-w-0 flex-1">
+            <span class="font-semibold truncate block">${escapeHtml(f.display_name)}</span>
+            <span class="flex flex-wrap gap-1 mt-0.5 empty:hidden" data-tags-for="${f.id}"></span>
+          </span>
+          <!-- base.html の .hidden は !important なので sm:block で上書きできない。max-sm:hidden を使う -->
+          <span class="text-xs opacity-60 shrink-0 text-right block max-sm:hidden w-32">
+            <span class="block" title="更新日時">${fmtTs(f.updated_at)}</span>
+            <span class="block">${fmtSize(f.size)}${actorLabel(f)}</span>
+          </span>
+        </a>
+      </li>
+    `).join('');
+    // 取得済みタグがあれば即時反映
+    el.querySelectorAll('[data-tags-for]').forEach(t => renderRowTags(t, t.dataset.tagsFor));
   }
-  el.innerHTML = allFiles.map(f => `
-    <li>
-      <a href="/ui/files/${f.id}" class="px-2 py-2 rounded hover:bg-base-200 flex items-center justify-between gap-2">
-        <span class="font-semibold truncate">${escapeHtml(f.display_name)}</span>
-        <span class="text-xs opacity-60 shrink-0">${f.size}B</span>
-      </a>
-    </li>
-  `).join('');
+
+  $('load-more-wrap').classList.toggle('hidden', !(browseMode && hasMore));
 }
+
+// 行内のタグチップはイベントデリゲーションで処理（クリックで絞り込みトグル）
+$('file-list').addEventListener('click', e => {
+  const tagBtn = e.target.closest('[data-tag]');
+  if (!tagBtn) return;
+  e.preventDefault();
+  toggleTag(tagBtn.dataset.tag);
+});
+
+// ---- アップロード ----
+
+async function uploadFiles(fileList) {
+  const files = [...fileList];
+  if (files.length === 0) return;
+  let ok = 0;
+  for (const f of files) {
+    try {
+      const r = await api('/api/files?name=' + encodeURIComponent(f.name), {
+        method: 'POST',
+        body: await f.arrayBuffer(),
+        headers: { 'content-type': 'application/octet-stream' },
+      });
+      if (!r.ok) throw new Error(await r.text());
+      ok++;
+    } catch (e) {
+      uiToast(`"${f.name}" のアップロードに失敗しました: ${e.message}`, 'error');
+    }
+  }
+  if (ok > 0) {
+    uiToast(`${ok} 件アップロードしました`, 'success');
+    await applyFilters();
+  }
+}
+
+async function newFile() {
+  const r = await uiPrompt({
+    title: '新規ファイル', okText: '作成',
+    fields: [
+      { name: 'name', label: 'ファイル名', placeholder: '例: memo.md' },
+      { name: 'content', label: '本文 (省略可)', type: 'textarea', rows: 6 },
+    ],
+  });
+  if (!r || !r.name.trim()) return;
+  try {
+    const resp = await api('/api/files?name=' + encodeURIComponent(r.name.trim()), {
+      method: 'POST',
+      body: new TextEncoder().encode(r.content || '').buffer,
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const meta = await resp.json();
+    uiToast('作成しました', 'success');
+    location.href = `/ui/files/${meta.id}`;
+  } catch (e) {
+    uiToast('作成に失敗しました: ' + e.message, 'error');
+  }
+}
+
+// ドラッグ＆ドロップアップロード
+{
+  const zone = $('drop-zone');
+  let depth = 0;
+  zone.addEventListener('dragenter', e => {
+    if (![...e.dataTransfer.types].includes('Files')) return;
+    e.preventDefault();
+    depth++;
+    zone.classList.add('drag-over');
+  });
+  zone.addEventListener('dragover', e => e.preventDefault());
+  zone.addEventListener('dragleave', () => {
+    if (--depth <= 0) { depth = 0; zone.classList.remove('drag-over'); }
+  });
+  zone.addEventListener('drop', e => {
+    e.preventDefault();
+    depth = 0;
+    zone.classList.remove('drag-over');
+    uploadFiles(e.dataTransfer.files);
+  });
+}
+
+// "/" で検索ボックスへフォーカス
+document.addEventListener('keydown', e => {
+  if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  e.preventDefault();
+  $('f-search').focus();
+});
 
 init();
 </script>

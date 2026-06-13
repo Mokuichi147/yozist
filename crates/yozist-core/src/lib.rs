@@ -102,6 +102,13 @@ pub struct FileMeta {
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,
     pub deleted: bool,
+    /// 作成者のユーザー名ラベル。ユーザー削除後も表示が残るよう ID ではなく
+    /// ラベルを保存する。`None` は記録なし（旧データ・SMB 経由など）。
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// 最終更新者のユーザー名ラベル。意味は `created_by` と同じ。
+    #[serde(default)]
+    pub updated_by: Option<String>,
 }
 
 /// CRDT/LWW のフォーマット選択ヒント。

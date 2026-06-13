@@ -24,6 +24,20 @@ pub mod sqlite;
 pub use audit::{AuditEntry, AuditLog, AuditRecord, SharedAuditLog};
 pub use sqlite::SqliteMetaStore;
 
+/// ファイル一覧のソートキー。`list_files_sorted` で使用する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileSort {
+    /// 更新日時（既定）
+    #[default]
+    UpdatedAt,
+    /// 作成日時
+    CreatedAt,
+    /// 表示名（大文字小文字を無視）
+    Name,
+    /// サイズ
+    Size,
+}
+
 /// メタデータ保存の統一インターフェース。
 #[async_trait]
 pub trait MetaStore: Send + Sync {
@@ -32,6 +46,14 @@ pub trait MetaStore: Send + Sync {
     async fn get_file(&self, id: &FileId) -> Result<Option<FileMeta>, DbError>;
     async fn update_file(&self, meta: &FileMeta) -> Result<(), DbError>;
     async fn list_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError>;
+    /// ソートキー・昇降順を指定した一覧。ページングと組み合わせて WebUI が使う。
+    async fn list_files_sorted(
+        &self,
+        limit: u32,
+        offset: u32,
+        sort: FileSort,
+        asc: bool,
+    ) -> Result<Vec<FileMeta>, DbError>;
 
     // ---- tags ----
     async fn upsert_tag(&self, tag: &Tag) -> Result<TagId, DbError>;
@@ -45,6 +67,11 @@ pub trait MetaStore: Send + Sync {
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn detach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn list_tags_of(&self, file: &FileId) -> Result<Vec<Tag>, DbError>;
+    /// 複数ファイルのタグを 1 クエリでまとめて取得する（一覧ページのタグ表示用）。
+    async fn list_tags_of_many(
+        &self,
+        files: &[FileId],
+    ) -> Result<Vec<(FileId, Tag)>, DbError>;
     async fn list_files_by_tags(&self, tags: &[TagId]) -> Result<Vec<FileMeta>, DbError>;
 
     // ---- series ----
