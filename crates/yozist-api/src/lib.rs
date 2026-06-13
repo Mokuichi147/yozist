@@ -1744,12 +1744,18 @@ async fn list_audit(
     Ok(Json(entries))
 }
 
-/// コミット履歴へ記録する実行ユーザー名ラベル。CRDT 用の ActorId とは別に
-/// 「誰が変更したか」を残す。files.created_by/updated_by と揃え、ログイン済み
-/// ユーザーのみ名前を残し、匿名/システムは None（＝履歴上 NULL）とする。
+/// コミット履歴へ記録する実行ユーザーラベル。CRDT 用の ActorId とは別に
+/// 「誰が変更したか」を残す。git の `name <email>` に倣い
+/// `表示名 <ユーザーID>`（例: `もくいち <mokuichi147>`）の形で焼き込む。
+/// username は UNIQUE なので追跡キーとして機能し、display_name は可読性のために添える。
+/// 内部の数値 user.id は露出させない。コミット時点の値で固定されるため、
+/// 後の改名は過去コミットへ遡及しない（履歴を壊さない方針）。
+/// ログイン済みユーザーのみ記録し、匿名/システムは None（＝履歴上 NULL）とする。
 fn committed_by_label(ctx: &AuthContext) -> Option<String> {
     match ctx {
-        AuthContext::User { user, .. } => Some(user.username.clone()),
+        AuthContext::User { user, .. } => {
+            Some(format!("{} <{}>", user.display_name, user.username))
+        }
         _ => None,
     }
 }
