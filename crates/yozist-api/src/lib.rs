@@ -97,6 +97,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(redirect_to_ui))
         .route("/health", get(health))
         .route("/api/files", get(list_files).post(create_file))
+        // 注意: 静的セグメント "tags" は `:id` より優先マッチする（matchit の仕様）。
+        .route("/api/files/tags", get(list_tags_batch))
         .route("/api/files/:id", get(get_file).delete(delete_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
@@ -275,13 +277,144 @@ struct CreateFileQuery {
     actor: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ListFilesQuery {
+    /// 1 ページの件数（1〜1000、既定 100）。
+    limit: Option<u32>,
+    offset: Option<u32>,
+    /// "updated"（既定） | "created" | "name" | "size"
+    sort: Option<String>,
+    /// "asc" | "desc"。省略時は sort に応じた自然な向き
+    /// （updated/created/size は desc、name は asc）。
+    order: Option<String>,
+}
+
 async fn list_files(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
-) -> Result<Json<Vec<FileMeta>>, ApiError> {
-    let files = s.meta.list_files(100, 0).await.map_err(ApiError::from_db)?;
-    let visible = filter_visible_files(&*s.authz, &ctx, files).await?;
-    Ok(Json(visible))
+    Query(q): Query<ListFilesQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0);
+    let sort = match q.sort.as_deref().unwrap_or("updated") {
+        "updated" => yozist_db::FileSort::UpdatedAt,
+        "created" => yozist_db::FileSort::CreatedAt,
+        "name" => yozist_db::FileSort::Name,
+        "size" => yozist_db::FileSort::Size,
+        other => return Err(ApiError::BadRequest(format!("unknown sort: {other}"))),
+    };
+    let asc = match q.order.as_deref() {
+        Some("asc") => true,
+        Some("desc") => false,
+        None => matches!(sort, yozist_db::FileSort::Name),
+        Some(other) => return Err(ApiError::BadRequest(format!("unknown order: {other}"))),
+    };
+    // 権限フィルタで空に近いページが返り続けると「0 件なのに続きがある」と
+    // 表示され、他ユーザーのファイルの存在が露見する。可視ファイルが limit 件
+    // 集まるか DB を読み切るまでページを進めて吸収する（スキャン上限あり）。
+    // 総数は権限フィルタ前の値しか安価に得られない（漏えいになる）ため返さない。
+    const MAX_SCAN_PAGES: u32 = 10;
+    let mut visible = Vec::new();
+    let mut db_offset = offset;
+    let mut has_more = false;
+    for _ in 0..MAX_SCAN_PAGES {
+        let files = s
+            .meta
+            .list_files_sorted(limit, db_offset, sort, asc)
+            .await
+            .map_err(ApiError::from_db)?;
+        let fetched = files.len() as u32;
+        visible.extend(filter_visible_files(&*s.authz, &ctx, files).await?);
+        db_offset += fetched;
+        if fetched < limit {
+            has_more = false;
+            break;
+        }
+        has_more = true;
+        if visible.len() as u32 >= limit {
+            break;
+        }
+    }
+    let mut resp = Json(visible).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        "x-has-more",
+        axum::http::HeaderValue::from_static(if has_more { "1" } else { "0" }),
+    );
+    // 次ページ取得に使う DB オフセット（権限フィルタでページが縮むため
+    // クライアント側では計算できない）。続きが無いときは返さない —
+    // 読み切り時の値は「不可視ファイル込みの総行数」であり、漏えいになる。
+    if has_more {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&db_offset.to_string()) {
+            h.insert("x-next-offset", v);
+        }
+    }
+    Ok(resp)
+}
+
+#[derive(Deserialize)]
+struct TagsBatchQuery {
+    /// カンマ区切りの FileId（最大 1000 件）。
+    ids: String,
+}
+
+/// 複数ファイルのタグを一括取得（一覧ページのタグチップ表示用）。
+/// VIEW 権限のないファイルは黙って結果から除外する。
+async fn list_tags_batch(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Query(q): Query<TagsBatchQuery>,
+) -> Result<Json<std::collections::HashMap<String, Vec<Tag>>>, ApiError> {
+    let mut ids = Vec::new();
+    for spec in q.ids.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+        ids.push(parse_file_id(spec)?);
+        if ids.len() > 1000 {
+            return Err(ApiError::BadRequest("too many ids (max 1000)".into()));
+        }
+    }
+    let mut visible = Vec::with_capacity(ids.len());
+    for id in ids {
+        let ok = s
+            .authz
+            .check(&ctx, &Target::file(id), PermissionMask::VIEW)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if ok {
+            visible.push(id);
+        }
+    }
+    let pairs = s
+        .meta
+        .list_tags_of_many(&visible)
+        .await
+        .map_err(ApiError::from_db)?;
+    let mut out: std::collections::HashMap<String, Vec<Tag>> = std::collections::HashMap::new();
+    // タグなしのファイルも空配列で返す（クライアント側の存在チェックを簡単にする）。
+    for id in &visible {
+        out.entry(id.to_string()).or_default();
+    }
+    for (file_id, tag) in pairs {
+        out.entry(file_id.to_string()).or_default().push(tag);
+    }
+    Ok(Json(out))
+}
+
+/// 書き込み成功後に作成者/更新者ラベルをファイルメタへ記録する（表示用）。
+/// 本体の書き込みは既に成功しているため、ここでの失敗は無視して None を返す。
+async fn record_file_actor(
+    s: &ApiState,
+    id: FileId,
+    ctx: &AuthContext,
+    created: bool,
+) -> Option<FileMeta> {
+    let AuthContext::User { user, .. } = ctx else { return None };
+    let mut meta = s.meta.get_file(&id).await.ok().flatten()?;
+    if created {
+        meta.created_by = Some(user.username.clone());
+    }
+    meta.updated_by = Some(user.username.clone());
+    s.meta.update_file(&meta).await.ok()?;
+    Some(meta)
 }
 
 async fn create_file(
@@ -343,6 +476,7 @@ async fn create_file(
             .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
 
+    let file = record_file_actor(&s, file.id, &ctx, true).await.unwrap_or(file);
     Ok((StatusCode::CREATED, Json(file)))
 }
 
@@ -384,6 +518,9 @@ async fn delete_file(
             .ok_or(ApiError::NotFound)?;
         meta.deleted = true;
         meta.updated_at = time::OffsetDateTime::now_utc();
+        if let AuthContext::User { user, .. } = &ctx {
+            meta.updated_by = Some(user.username.clone());
+        }
         s.meta.update_file(&meta).await.map_err(ApiError::from_db)?;
         let _ = s.meta.delete_fts(&file_id).await;
         Ok::<_, ApiError>(())
@@ -666,7 +803,9 @@ async fn commit_file(
     )
     .await;
 
-    Ok(Json(result?))
+    let commit = result?;
+    record_file_actor(&s, id, &ctx, false).await;
+    Ok(Json(commit))
 }
 
 /// 部分編集コミット。受信した本文（UTF-8）で現行内容の `[repl_start, repl_end)` を
@@ -839,7 +978,9 @@ async fn rollback(
         &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
     )
     .await;
-    Ok(Json(res?))
+    let commit = res?;
+    record_file_actor(&s, file_id, &ctx, false).await;
+    Ok(Json(commit))
 }
 
 // ---------------------------------------------------------------------------

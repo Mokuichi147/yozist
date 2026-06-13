@@ -20,7 +20,7 @@ use yozist_core::{
     Series, SeriesId, SeriesMember, Tag, TagId, TagKind,
 };
 
-use crate::{DbError, MetaStore};
+use crate::{DbError, FileSort, MetaStore};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -91,6 +91,8 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let deleted: i64 = row.try_get("deleted")?;
+    let created_by: Option<String> = row.try_get("created_by")?;
+    let updated_by: Option<String> = row.try_get("updated_by")?;
     Ok(FileMeta {
         id: FileId::from_uuid(parse_uuid(&id)?),
         display_name,
@@ -103,6 +105,8 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
         deleted: deleted != 0,
+        created_by,
+        updated_by,
     })
 }
 
@@ -202,8 +206,8 @@ impl MetaStore for SqliteMetaStore {
         sqlx::query(
             r#"INSERT INTO files
                (id, display_name, size, mime, charset, current_commit,
-                created_at, updated_at, deleted, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
+                created_at, updated_at, deleted, created_by, updated_by, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(meta.id.to_string())
         .bind(&meta.display_name)
@@ -214,6 +218,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(fmt_dt(meta.created_at))
         .bind(fmt_dt(meta.updated_at))
         .bind(meta.deleted as i64)
+        .bind(&meta.created_by)
+        .bind(&meta.updated_by)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -233,6 +239,7 @@ impl MetaStore for SqliteMetaStore {
             r#"UPDATE files SET
                  display_name = ?, size = ?, mime = ?, charset = ?,
                  current_commit = ?, updated_at = ?, deleted = ?,
+                 created_by = ?, updated_by = ?,
                  version = version + 1
                WHERE id = ?"#,
         )
@@ -243,6 +250,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(meta.current_commit.map(|c| c.to_string()))
         .bind(fmt_dt(meta.updated_at))
         .bind(meta.deleted as i64)
+        .bind(&meta.created_by)
+        .bind(&meta.updated_by)
         .bind(meta.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -253,18 +262,36 @@ impl MetaStore for SqliteMetaStore {
     }
 
     async fn list_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError> {
-        let rows = sqlx::query(
-            r#"SELECT * FROM files
-               WHERE deleted = 0
-               ORDER BY updated_at DESC
-               LIMIT ? OFFSET ?"#,
-        )
-        .bind(limit as i64)
-        .bind(offset as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        self.list_files_sorted(limit, offset, FileSort::UpdatedAt, false)
+            .await
+    }
+
+    async fn list_files_sorted(
+        &self,
+        limit: u32,
+        offset: u32,
+        sort: FileSort,
+        asc: bool,
+    ) -> Result<Vec<FileMeta>, DbError> {
+        // ORDER BY は固定の候補からの選択のみ（バインド不可のため文字列結合だが注入余地なし）。
+        let dir = if asc { "ASC" } else { "DESC" };
+        let order = match sort {
+            FileSort::UpdatedAt => format!("updated_at {dir}"),
+            FileSort::CreatedAt => format!("created_at {dir}"),
+            FileSort::Name => format!("display_name COLLATE NOCASE {dir}, updated_at DESC"),
+            FileSort::Size => format!("size {dir}, updated_at DESC"),
+        };
+        let sql = format!(
+            "SELECT * FROM files WHERE deleted = 0 ORDER BY {order} LIMIT ? OFFSET ?"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(row_to_file).collect()
     }
+
 
     async fn upsert_tag(&self, tag: &Tag) -> Result<TagId, DbError> {
         // 同名タグがあればそのIDを返す（kindの優先度: Manual > AI > System）。
@@ -371,6 +398,36 @@ impl MetaStore for SqliteMetaStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(row_to_tag).collect()
+    }
+
+    async fn list_tags_of_many(
+        &self,
+        files: &[FileId],
+    ) -> Result<Vec<(FileId, Tag)>, DbError> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; files.len()].join(",");
+        let sql = format!(
+            r#"SELECT ft.file_id AS file_id, t.id, t.name, t.kind, t.confidence
+               FROM tags t
+               JOIN file_tags ft ON ft.tag_id = t.id
+               WHERE ft.file_id IN ({placeholders})
+               ORDER BY ft.file_id, t.name ASC"#
+        );
+        let mut q = sqlx::query(&sql);
+        for f in files {
+            q = q.bind(f.to_string());
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|row| {
+                let file_id: String = row.try_get("file_id")?;
+                let file_id = FileId::from_uuid(parse_uuid(&file_id)?);
+                let tag = row_to_tag(row)?;
+                Ok((file_id, tag))
+            })
+            .collect()
     }
 
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError> {
@@ -729,6 +786,8 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted: false,
+            created_by: Some("tester".into()),
+            updated_by: Some("tester".into()),
         }
     }
 

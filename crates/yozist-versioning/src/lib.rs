@@ -530,6 +530,9 @@ impl VersioningEngine {
             created_at: now,
             updated_at: now,
             deleted: false,
+            // 作成者/更新者ラベルは利用者を知る上位層（API 等）が書き込む。
+            created_by: None,
+            updated_by: None,
         };
         self.meta.insert_file(&file).await?;
 
@@ -612,6 +615,10 @@ impl VersioningEngine {
         file.current_commit = Some(commit.id);
         file.size = size;
         file.updated_at = now;
+        // 更新者ラベルはユーザーを知る層（REST API）がコミット後に書き込む。
+        // ここでリセットしないと SMB 等の経路で更新した際に前回の名前が残り、
+        // 誤った更新者が表示され続ける。
+        file.updated_by = None;
         // mime 未設定だった既存ファイルを確定済み hint で補完する。
         if file.mime.is_none() {
             file.mime = hint.mime.clone();
@@ -1025,6 +1032,8 @@ mod engine_tests {
             created_at: now,
             updated_at: now,
             deleted: false,
+            created_by: None,
+            updated_by: None,
         };
         eng.meta.insert_file(&file).await.unwrap();
         // commit すると mime が補完され ext:/type: タグが付く。
