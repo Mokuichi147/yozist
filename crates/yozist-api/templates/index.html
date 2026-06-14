@@ -387,7 +387,7 @@ function setupUpload() {
 async function doUpload() {
   if (selectedFiles.length === 0) { uiToast('アップロードするファイルを選択してください', 'warning'); return; }
 
-  const asSeries = $('as-series').checked && selectedFiles.length >= 2;
+  const asSeries = $('as-series').checked;
   let seriesName = null;
   if (asSeries) {
     const r = await uiPrompt({
