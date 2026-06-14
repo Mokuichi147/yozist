@@ -25,22 +25,41 @@
     <div class="space-y-4">
 
       <div class="card bg-base-100 shadow-sm">
-        <div class="card-body p-4">
-          <div class="flex items-center justify-between mb-2">
-            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">upload</h2>
+        <div class="card-body p-4 sm:p-6">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="card-title text-base">ファイルのアップロード</h2>
             <a href="/ui/files" class="text-xs link link-primary">ファイル一覧へ →</a>
           </div>
-          <div class="space-y-2">
-            <input id="upload-name" class="input input-bordered input-sm w-full"
-                   placeholder="新規ファイル名 (例: memo.md)">
-            <textarea id="upload-content" class="textarea textarea-bordered w-full text-sm"
-                      placeholder="本文 (省略可)" rows="3"></textarea>
-            <div class="flex flex-wrap items-center gap-2">
-              <input type="file" id="upload-file" class="file-input file-input-bordered file-input-xs flex-1 min-w-[160px]">
-              <button class="btn btn-primary btn-sm" onclick="doUpload()">登録</button>
-            </div>
-            <div id="upload-result" class="text-xs"></div>
+
+          <!-- ドラッグ&ドロップ / クリックで選択 -->
+          <div id="dropzone"
+               class="border-2 border-dashed border-base-300 rounded-lg px-6 py-10 text-center cursor-pointer transition-colors hover:border-primary hover:bg-base-200/40">
+            <p class="text-base sm:text-lg font-medium opacity-90">ここにファイルをドラッグ&amp;ドロップするか、クリックして選択</p>
+            <p class="text-xs opacity-50 mt-2">
+              フォルダごとドロップ、または
+              <button type="button" id="pick-folder" class="link link-primary">フォルダを選択</button>
+            </p>
           </div>
+          <input type="file" id="upload-file" class="hidden" multiple>
+          <input type="file" id="upload-folder" class="hidden" webkitdirectory directory>
+
+          <!-- 選択済みファイル一覧 -->
+          <div id="file-summary" class="hidden mt-3 flex items-center justify-between text-sm">
+            <span id="file-count" class="font-medium"></span>
+            <button type="button" id="clear-files" class="text-xs link link-error">すべてクリア</button>
+          </div>
+          <ul id="file-list" class="hidden mt-2 space-y-1 max-h-48 overflow-y-auto"></ul>
+
+          <!-- シリーズ登録 -->
+          <label class="label cursor-pointer justify-start gap-2 mt-4 py-1">
+            <input type="checkbox" id="as-series" class="checkbox checkbox-sm">
+            <span class="label-text">これらのファイルをシリーズとして登録する <span class="opacity-60">(2 件以上のときアップロード順で並び付け)</span></span>
+          </label>
+
+          <div class="mt-3">
+            <button class="btn btn-primary btn-sm" id="upload-btn" onclick="doUpload()">アップロード</button>
+          </div>
+          <div id="upload-result" class="text-xs mt-2"></div>
         </div>
       </div>
 
@@ -199,34 +218,222 @@ async function loadSeries() {
   el.appendChild(add);
 }
 
-async function doUpload() {
-  const fileInput = $('upload-file');
-  let name = $('upload-name').value.trim();
-  let body;
-  if (fileInput.files.length > 0) {
-    const f = fileInput.files[0];
-    if (!name) name = f.name;
-    body = await f.arrayBuffer();
-  } else {
-    if (!name) { uiToast('ファイル名またはアップロードファイルを指定してください', 'warning'); return; }
-    body = new TextEncoder().encode($('upload-content').value || '').buffer;
+// ===== アップロード（ドラッグ&ドロップ / 複数ファイル / フォルダ）=====
+
+// 選択済みファイル（File オブジェクトに相対パス relPath を付与して保持）
+let selectedFiles = [];
+
+// File の表示／登録に使う名前。フォルダ選択時はフォルダ構造を保った相対パス。
+function relPathOf(f) {
+  return f.relPath || f.webkitRelativePath || f.name;
+}
+
+// 複数ファイル選択時のシリーズ名候補（フォルダ名 → 先頭ファイルのベース名）
+function guessSeriesName() {
+  for (const f of selectedFiles) {
+    const p = relPathOf(f);
+    const slash = p.indexOf('/');
+    if (slash > 0) return p.slice(0, slash);
   }
-  const r = await api('/api/files?name=' + encodeURIComponent(name), {
-    method: 'POST',
-    body,
-    headers: { 'content-type': 'application/octet-stream' },
+  const first = selectedFiles[0];
+  if (!first) return '';
+  return relPathOf(first).split('/').pop().replace(/\.[^.]+$/, '');
+}
+
+// 同じ相対パスのファイルは重複登録しない
+function addFiles(files) {
+  const seen = new Set(selectedFiles.map(relPathOf));
+  for (const f of files) {
+    const p = relPathOf(f);
+    if (seen.has(p)) continue;
+    seen.add(p);
+    selectedFiles.push(f);
+  }
+  renderFileList();
+}
+
+function clearFiles() {
+  selectedFiles = [];
+  renderFileList();
+}
+
+function renderFileList() {
+  const summary = $('file-summary');
+  const list = $('file-list');
+  const countEl = $('file-count');
+  list.innerHTML = '';
+  if (selectedFiles.length === 0) {
+    summary.classList.add('hidden');
+    list.classList.add('hidden');
+    return;
+  }
+  const total = selectedFiles.reduce((a, f) => a + f.size, 0);
+  countEl.textContent = `${selectedFiles.length} 件 (${fmtSize(total)})`;
+  summary.classList.remove('hidden');
+  list.classList.remove('hidden');
+  selectedFiles.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.className = 'flex items-center justify-between gap-2 text-xs px-2 py-1 rounded bg-base-200/50';
+    li.innerHTML = `<span class="truncate flex-1" title="${escapeHtml(relPathOf(f))}">${escapeHtml(relPathOf(f))}</span>` +
+      `<span class="opacity-50 shrink-0">${fmtSize(f.size)}</span>`;
+    const rm = document.createElement('button');
+    rm.className = 'btn btn-xs btn-ghost px-1 text-error shrink-0';
+    rm.textContent = '×';
+    rm.title = '除外';
+    rm.onclick = () => { selectedFiles.splice(i, 1); renderFileList(); };
+    li.appendChild(rm);
+    list.appendChild(li);
   });
-  if (!r.ok) { uiToast('登録に失敗しました: ' + await r.text(), 'error'); return; }
-  const meta = await r.json();
-  $('upload-name').value = '';
-  $('upload-content').value = '';
-  fileInput.value = '';
-  $('upload-result').innerHTML =
-    `登録しました: <a class="link link-primary" href="/ui/files/${meta.id}">${escapeHtml(meta.display_name)}</a>`;
-  uiToast('ファイルを登録しました', 'success');
+}
+
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+// ---- DataTransfer からフォルダ込みで File を再帰収集 ----
+async function filesFromDataTransfer(dt) {
+  const entries = [];
+  if (dt.items && dt.items.length) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const it = dt.items[i];
+      const entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+      if (entry) entries.push(entry);
+    }
+  }
+  if (entries.length === 0) {
+    // フォルダ非対応ブラウザ向けフォールバック
+    return Array.from(dt.files || []);
+  }
+  const out = [];
+  for (const entry of entries) await walkEntry(entry, out, '');
+  return out;
+}
+
+function walkEntry(entry, out, prefix) {
+  return new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(f => {
+        f.relPath = prefix + entry.name;
+        out.push(f);
+        resolve();
+      }, () => resolve());
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const collected = [];
+      const readBatch = () => reader.readEntries(async batch => {
+        if (!batch.length) {
+          for (const e of collected) await walkEntry(e, out, prefix + entry.name + '/');
+          resolve();
+        } else {
+          collected.push(...batch);
+          readBatch();
+        }
+      }, () => resolve());
+      readBatch();
+    } else {
+      resolve();
+    }
+  });
+}
+
+function setupUpload() {
+  const dz = $('dropzone');
+  const fileInput = $('upload-file');
+  const folderInput = $('upload-folder');
+
+  dz.onclick = () => fileInput.click();
+  $('pick-folder').onclick = e => { e.stopPropagation(); folderInput.click(); };
+  $('clear-files').onclick = clearFiles;
+
+  fileInput.onchange = () => { addFiles(Array.from(fileInput.files)); fileInput.value = ''; };
+  folderInput.onchange = () => { addFiles(Array.from(folderInput.files)); folderInput.value = ''; };
+
+  ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault();
+    dz.classList.add('border-primary', 'bg-base-200/40');
+  }));
+  ['dragleave', 'dragend'].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault();
+    dz.classList.remove('border-primary', 'bg-base-200/40');
+  }));
+  dz.addEventListener('drop', async e => {
+    e.preventDefault();
+    dz.classList.remove('border-primary', 'bg-base-200/40');
+    const files = await filesFromDataTransfer(e.dataTransfer);
+    if (files.length) addFiles(files);
+  });
+}
+
+async function doUpload() {
+  if (selectedFiles.length === 0) { uiToast('アップロードするファイルを選択してください', 'warning'); return; }
+
+  const asSeries = $('as-series').checked && selectedFiles.length >= 2;
+  let seriesName = null;
+  if (asSeries) {
+    const r = await uiPrompt({
+      title: 'シリーズとして登録', okText: '作成',
+      fields: [{ name: 'name', label: 'シリーズ名', value: guessSeriesName() }],
+    });
+    if (!r || !r.name.trim()) return; // キャンセル時は中断
+    seriesName = r.name.trim();
+  }
+
+  const btn = $('upload-btn');
+  const resultEl = $('upload-result');
+  btn.disabled = true;
+  btn.classList.add('btn-disabled');
+  const total = selectedFiles.length;
+  const created = [];
+  let failed = 0;
+
+  for (let i = 0; i < total; i++) {
+    const f = selectedFiles[i];
+    resultEl.textContent = `アップロード中… ${i + 1} / ${total}`;
+    try {
+      const buf = await f.arrayBuffer();
+      const res = await api('/api/files?name=' + encodeURIComponent(relPathOf(f)), {
+        method: 'POST', body: buf, headers: { 'content-type': 'application/octet-stream' },
+      });
+      if (!res.ok) { failed++; continue; }
+      created.push(await res.json());
+    } catch (_) { failed++; }
+  }
+
+  if (asSeries && created.length >= 1) {
+    try {
+      const series = await json('/api/series', { method: 'POST', body: { name: seriesName } });
+      for (let i = 0; i < created.length; i++) {
+        await json(`/api/series/${series.id}/members`, {
+          method: 'POST', body: { file_id: created[i].id, order_index: (i + 1) * 10 },
+        });
+      }
+    } catch (_) {
+      uiToast('シリーズへの登録に一部失敗しました', 'error');
+    }
+  }
+
+  btn.disabled = false;
+  btn.classList.remove('btn-disabled');
+
+  if (created.length === 0) {
+    resultEl.textContent = '';
+    uiToast('アップロードに失敗しました', 'error');
+    return;
+  }
+
+  clearFiles();
+  $('as-series').checked = false;
+  const seriesNote = asSeries ? `（シリーズ「${escapeHtml(seriesName)}」に登録）` : '';
+  const failNote = failed > 0 ? ` / ${failed} 件失敗` : '';
+  resultEl.innerHTML = `${created.length} 件アップロードしました${failNote} ${seriesNote} ` +
+    `<a class="link link-primary" href="/ui/files">ファイル一覧へ →</a>`;
+  uiToast(`${created.length} 件アップロードしました`, failed > 0 ? 'warning' : 'success');
   await refresh();
 }
 
+setupUpload();
 init();
 </script>
 {% endblock %}
