@@ -99,7 +99,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files", get(list_files).post(create_file))
         // 注意: 静的セグメント "tags" は `:id` より優先マッチする（matchit の仕様）。
         .route("/api/files/tags", get(list_tags_batch))
-        .route("/api/files/:id", get(get_file).delete(delete_file))
+        .route(
+            "/api/files/:id",
+            get(get_file).patch(rename_file).delete(delete_file),
+        )
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
         .route("/api/files/:id/commits/:cid", get(read_commit))
@@ -503,6 +506,53 @@ async fn get_file(
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(meta))
+}
+
+#[derive(Deserialize)]
+struct RenameFileInput {
+    display_name: String,
+}
+
+/// ファイル名（display_name）を変更する。内容コミットは作らず、拡張子変更に
+/// 追従して mime・system タグ・FTS を更新する（処理は versioning Engine に集約）。
+async fn rename_file(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<RenameFileInput>,
+) -> Result<Json<FileMeta>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::file(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let new_name = input.display_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err(ApiError::BadRequest("ファイル名が空です".into()));
+    }
+    let updated_by = match &ctx {
+        AuthContext::User { user, .. } => Some(user.username.clone()),
+        _ => None,
+    };
+    let res = s
+        .engine
+        .rename_file(file_id, new_name, updated_by, ctx.user_id())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()));
+    audit_event(
+        &s,
+        &ctx,
+        "rename_file",
+        Some("file"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    Ok(Json(res?))
 }
 
 async fn delete_file(

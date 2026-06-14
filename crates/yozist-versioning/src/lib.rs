@@ -738,6 +738,91 @@ impl VersioningEngine {
             .await
     }
 
+    /// ファイル名（display_name）だけを変更する。新しいコミットは作らない。
+    ///
+    /// 拡張子の変更に追従して mime と system タグ（ext:/type:）を貼り替え、
+    /// FTS を新しい名前で更新する。テキストファイルは検索インデックスから本文が
+    /// 消えないよう、現行内容を読み直して FTS の content も維持する。
+    pub async fn rename_file(
+        &self,
+        file_id: FileId,
+        new_name: impl Into<String>,
+        updated_by: Option<String>,
+        updated_by_user_id: Option<i64>,
+    ) -> Result<FileMeta, VersioningError> {
+        let new_name = new_name.into();
+        let mut file = self
+            .meta
+            .get_file(&file_id)
+            .await?
+            .ok_or(VersioningError::NotFound(file_id))?;
+
+        // テキストファイルのみ現行内容を読む（FTS 本文の維持と mime 判定に使う）。
+        // バイナリは FTS 本文を持たず mime は拡張子で判定するため、巨大 blob を
+        // 読み込まない。
+        let content: Vec<u8> = if file.charset.is_some() {
+            self.read_current(file_id).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        file.display_name = new_name;
+        file.updated_at = time::OffsetDateTime::now_utc();
+        file.updated_by = updated_by;
+        file.updated_by_user_id = updated_by_user_id;
+        // 拡張子から mime を再判定。判定できなければ従来値を保持する。
+        if let Some(m) = guess_mime(&file.display_name, &content) {
+            if m != "application/octet-stream" {
+                file.mime = Some(m);
+            }
+        }
+        self.meta.update_file(&file).await?;
+
+        // system タグ（ext:/type:）を貼り替える。旧 system タグを外し、
+        // 新しい名前・mime から再付与する（手動/AI タグはそのまま残す）。
+        let hint = FormatHint {
+            extension: ext_of(&file.display_name),
+            mime: file.mime.clone(),
+            first_bytes: None,
+            display_name: Some(file.display_name.clone()),
+        };
+        if let Ok(existing) = self.meta.list_tags_of(&file_id).await {
+            for t in existing
+                .iter()
+                .filter(|t| t.kind == yozist_core::TagKind::System)
+            {
+                let _ = self.meta.detach_tag(&file_id, &t.id).await;
+            }
+        }
+        for tag in yozist_tagging::system_tags_for(&hint) {
+            if let Ok(tag_id) = self.meta.upsert_tag(&tag).await {
+                let _ = self.meta.attach_tag(&file_id, &tag_id).await;
+            }
+        }
+
+        // FTS 更新（display_name + タグ + 本文）。本文はテキストのみ。
+        let tag_names = self
+            .meta
+            .list_tags_of(&file_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fts_content = if file.charset.is_some() {
+            String::from_utf8_lossy(&content).into_owned()
+        } else {
+            String::new()
+        };
+        let _ = self
+            .meta
+            .upsert_fts(&file_id, &file.display_name, &tag_names, &fts_content)
+            .await;
+
+        Ok(file)
+    }
+
     /// 現在の内容を取得する。
     pub async fn read_current(&self, file_id: FileId) -> Result<Vec<u8>, VersioningError> {
         let file = self
