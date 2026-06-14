@@ -119,6 +119,7 @@ impl VersioningEngine {
         content: &[u8],
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         hint_override: Option<FormatHint>,
     ) -> Result<(FileMeta, Commit), VersioningError> {
         let display_name = display_name.into();
@@ -165,6 +166,7 @@ impl VersioningEngine {
             fmt.format_id(),
             actor,
             committed_by,
+            committed_by_user_id,
             &content_str,
             now,
             &hint,
@@ -179,6 +181,7 @@ impl VersioningEngine {
         new_content: &[u8],
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -243,6 +246,7 @@ impl VersioningEngine {
             fmt.format_id(),
             actor,
             committed_by,
+            committed_by_user_id,
             message,
             charset,
             &content_str,
@@ -265,6 +269,7 @@ impl VersioningEngine {
         content: &[u8],
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -312,6 +317,7 @@ impl VersioningEngine {
             fmt.format_id(),
             actor,
             committed_by,
+            committed_by_user_id,
             message,
             charset,
             &fts_content,
@@ -333,6 +339,7 @@ impl VersioningEngine {
         stream: ByteStream,
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         hint_override: Option<FormatHint>,
     ) -> Result<(FileMeta, Commit), VersioningError> {
         let display_name = display_name.into();
@@ -367,6 +374,7 @@ impl VersioningEngine {
                 fmt.format_id(),
                 actor,
                 committed_by,
+                committed_by_user_id,
                 "",
                 now,
                 &hint,
@@ -375,8 +383,15 @@ impl VersioningEngine {
         } else {
             // CRDT 経路へフォールバック。MIME 確定済みの hint を渡し二重推測を避ける。
             let buf = collect_stream(stream).await?;
-            self.create_file(display_name, &buf, actor, committed_by, Some(hint))
-                .await
+            self.create_file(
+                display_name,
+                &buf,
+                actor,
+                committed_by,
+                committed_by_user_id,
+                Some(hint),
+            )
+            .await
         }
     }
 
@@ -388,6 +403,7 @@ impl VersioningEngine {
         stream: ByteStream,
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -422,6 +438,7 @@ impl VersioningEngine {
                 fmt.format_id(),
                 actor,
                 committed_by,
+                committed_by_user_id,
                 message,
                 None, // ストリーミング経路は LWW（バイナリ）のみ。charset は持たない。
                 "",
@@ -431,7 +448,8 @@ impl VersioningEngine {
             .await
         } else {
             let buf = collect_stream(stream).await?;
-            self.commit(file_id, &buf, actor, committed_by, message).await
+            self.commit(file_id, &buf, actor, committed_by, committed_by_user_id, message)
+                .await
         }
     }
 
@@ -450,6 +468,7 @@ impl VersioningEngine {
         stream: ByteStream,
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -481,8 +500,8 @@ impl VersioningEngine {
             // バイナリ(LWW): 本文をメモリに載せず blob へ直接流す。
             let (blob_id, size) = self.blob.put_stream(stream).await?;
             self.persist_commit(
-                &mut file, blob_id, size, fmt.format_id(), actor, committed_by, message, None, "",
-                now, &hint,
+                &mut file, blob_id, size, fmt.format_id(), actor, committed_by,
+                committed_by_user_id, message, None, "", now, &hint,
             )
             .await
         } else {
@@ -508,6 +527,7 @@ impl VersioningEngine {
                 fmt.format_id(),
                 actor,
                 committed_by,
+                committed_by_user_id,
                 message,
                 charset,
                 &content_str,
@@ -531,6 +551,7 @@ impl VersioningEngine {
         format_id: &str,
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         fts_content: &str,
         now: time::OffsetDateTime,
         hint: &FormatHint,
@@ -548,6 +569,8 @@ impl VersioningEngine {
             // 作成者/更新者ラベルは利用者を知る上位層（API 等）が書き込む。
             created_by: None,
             updated_by: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
         };
         self.meta.insert_file(&file).await?;
 
@@ -561,6 +584,7 @@ impl VersioningEngine {
             timestamp: now,
             message: Some("create".into()),
             committed_by,
+            committed_by_user_id,
         };
         self.meta.insert_commit(&commit).await?;
 
@@ -611,6 +635,7 @@ impl VersioningEngine {
         format_id: &str,
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         message: Option<String>,
         charset: Option<String>,
         fts_content: &str,
@@ -627,6 +652,7 @@ impl VersioningEngine {
             timestamp: now,
             message,
             committed_by,
+            committed_by_user_id,
         };
         self.meta.insert_commit(&commit).await?;
 
@@ -703,11 +729,12 @@ impl VersioningEngine {
         commit_id: CommitId,
         actor: ActorId,
         committed_by: Option<String>,
+        committed_by_user_id: Option<i64>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let bytes = self.read_at_commit(file_id, commit_id).await?;
         let msg = message.unwrap_or_else(|| format!("rollback to {commit_id}"));
-        self.commit(file_id, &bytes, actor, committed_by, Some(msg))
+        self.commit(file_id, &bytes, actor, committed_by, committed_by_user_id, Some(msg))
             .await
     }
 
@@ -884,7 +911,7 @@ mod engine_tests {
     async fn create_and_read_roundtrip() {
         let (eng, _td) = engine().await;
         let (file, commit) = eng
-            .create_file("note.md", b"hello", ActorId::new(), None, None)
+            .create_file("note.md", b"hello", ActorId::new(), None, None, None)
             .await
             .unwrap();
         assert!(file.current_commit.is_some());
@@ -898,15 +925,15 @@ mod engine_tests {
         let (eng, _td) = engine().await;
         let actor = ActorId::new();
         let (file, c1) = eng
-            .create_file("doc.txt", b"v1", actor, None, None)
+            .create_file("doc.txt", b"v1", actor, None, None, None)
             .await
             .unwrap();
         let c2 = eng
-            .commit(file.id, b"v2", actor, None, Some("update".into()))
+            .commit(file.id, b"v2", actor, None, None, Some("update".into()))
             .await
             .unwrap();
         let c3 = eng
-            .commit(file.id, b"v3", actor, None, None)
+            .commit(file.id, b"v3", actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(c2.parent, Some(c1.id));
@@ -921,29 +948,35 @@ mod engine_tests {
     async fn records_committed_by_label() {
         let (eng, _td) = engine().await;
         let actor = ActorId::new();
-        // 作成・更新ともに実行ユーザー名ラベルが各コミットへ記録される。
+        // 作成・更新ともに実行ユーザーのラベルと不変キー(user.id)が各コミットへ記録される。
         let (file, c1) = eng
-            .create_file("note.txt", b"v1", actor, Some("alice".into()), None)
+            .create_file("note.txt", b"v1", actor, Some("alice".into()), Some(1), None)
             .await
             .unwrap();
         assert_eq!(c1.committed_by.as_deref(), Some("alice"));
+        assert_eq!(c1.committed_by_user_id, Some(1));
         let c2 = eng
-            .commit(file.id, b"v2", actor, Some("bob".into()), None)
+            .commit(file.id, b"v2", actor, Some("bob".into()), Some(2), None)
             .await
             .unwrap();
         assert_eq!(c2.committed_by.as_deref(), Some("bob"));
-        // ラベル未指定（SMB 等）は NULL のまま。
+        assert_eq!(c2.committed_by_user_id, Some(2));
+        // ラベル・user.id 未指定（SMB 等）は NULL のまま。
         let c3 = eng
-            .commit(file.id, b"v3", actor, None, None)
+            .commit(file.id, b"v3", actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(c3.committed_by, None);
+        assert_eq!(c3.committed_by_user_id, None);
 
         // DB へ往復しても保持される。
         let log = eng.meta.list_commits(&file.id).await.unwrap();
         assert_eq!(log[0].committed_by.as_deref(), Some("alice"));
+        assert_eq!(log[0].committed_by_user_id, Some(1));
         assert_eq!(log[1].committed_by.as_deref(), Some("bob"));
+        assert_eq!(log[1].committed_by_user_id, Some(2));
         assert_eq!(log[2].committed_by, None);
+        assert_eq!(log[2].committed_by_user_id, None);
     }
 
     #[tokio::test]
@@ -952,7 +985,7 @@ mod engine_tests {
         let actor = ActorId::new();
         let bytes = vec![0xFFu8, 0xD8, 0xFF]; // JPEG マジック
         let (file, commit) = eng
-            .create_file("photo.jpg", &bytes, actor, None, None)
+            .create_file("photo.jpg", &bytes, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(commit.format_id, "_/lww");
@@ -975,7 +1008,7 @@ mod engine_tests {
         // バイナリ（.bin）は LWW 経路でストリーム保存される。
         let stream = byte_stream(vec![b"\x00\x01\x02", b"\x03\x04"]);
         let (file, commit) = eng
-            .create_file_streaming("movie.bin", stream, actor, None, None)
+            .create_file_streaming("movie.bin", stream, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(commit.format_id, "_/lww");
@@ -984,7 +1017,7 @@ mod engine_tests {
 
         // 続けて commit_streaming で全置換できる。
         let c2 = eng
-            .commit_streaming(file.id, byte_stream(vec![b"\xAA\xBB"]), actor, None, None)
+            .commit_streaming(file.id, byte_stream(vec![b"\xAA\xBB"]), actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(c2.parent, Some(commit.id));
@@ -1005,6 +1038,7 @@ mod engine_tests {
                 actor,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1019,6 +1053,7 @@ mod engine_tests {
                 "notes.txt".into(),
                 byte_stream(vec![text]),
                 actor,
+                None,
                 None,
                 Some("upload notes.txt".into()),
             )
@@ -1042,7 +1077,7 @@ mod engine_tests {
         // JPEG マジックを持つ .jpg。拡張子から image/jpeg を確定する。
         let bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
         let (file, _c) = eng
-            .create_file("photo.jpg", &bytes, actor, None, None)
+            .create_file("photo.jpg", &bytes, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(file.mime.as_deref(), Some("image/jpeg"));
@@ -1055,7 +1090,7 @@ mod engine_tests {
         // 拡張子なしのファイル名。先頭の PNG マジックから image/png を判定する。
         let stream = byte_stream(vec![b"\x89PNG\r\n\x1a\n", b"\x00\x00rest"]);
         let (file, commit) = eng
-            .create_file_streaming("blob", stream, actor, None, None)
+            .create_file_streaming("blob", stream, actor, None, None, None)
             .await
             .unwrap();
         // LWW 経路を通り、本文は欠落せず保存される。
@@ -1085,10 +1120,12 @@ mod engine_tests {
             deleted: false,
             created_by: None,
             updated_by: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
         };
         eng.meta.insert_file(&file).await.unwrap();
         // commit すると mime が補完され ext:/type: タグが付く。
-        eng.commit(file.id, &[0xFF, 0xD8, 0xFF, 0xE0], actor, None, None)
+        eng.commit(file.id, &[0xFF, 0xD8, 0xFF, 0xE0], actor, None, None, None)
             .await
             .unwrap();
         let got = eng.meta.get_file(&file.id).await.unwrap().unwrap();
@@ -1110,7 +1147,7 @@ mod engine_tests {
         let (eng, _td) = engine().await;
         let actor = ActorId::new();
         let (file, _c) = eng
-            .create_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], actor, None, None)
+            .create_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], actor, None, None, None)
             .await
             .unwrap();
         let names: Vec<String> = eng
@@ -1139,7 +1176,7 @@ mod engine_tests {
             display_name: None,
         };
         let (file, commit) = eng
-            .create_file("data", b"hello", actor, None, Some(hint))
+            .create_file("data", b"hello", actor, None, None, Some(hint))
             .await
             .unwrap();
         assert_eq!(commit.format_id, "text/plain");
@@ -1154,7 +1191,7 @@ mod engine_tests {
         // resolve 前に確定した MIME により CRDT 経路が選ばれる。
         let stream = byte_stream(vec![b"WEBVTT\n\n", b"00:00.000 --> 00:01.000\nhi"]);
         let (file, commit) = eng
-            .create_file_streaming("subtitle.vtt", stream, actor, None, None)
+            .create_file_streaming("subtitle.vtt", stream, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(commit.format_id, "text/plain");
@@ -1171,7 +1208,7 @@ mod engine_tests {
 
         // 以前は from_utf8 で失敗していたケース。今は取り込めて charset が記録される。
         let (file, commit) = eng
-            .create_file("memo.txt", &sjis, actor, None, None)
+            .create_file("memo.txt", &sjis, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(commit.format_id, "text/plain");
@@ -1196,7 +1233,7 @@ mod engine_tests {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
         let (file, _commit) = eng
-            .create_file("note.txt", &bytes, actor, None, None)
+            .create_file("note.txt", &bytes, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(file.charset.as_deref(), Some("UTF-16LE"));
@@ -1211,7 +1248,7 @@ mod engine_tests {
         let (eng, _td) = engine().await;
         let actor = ActorId::new();
         let (file, _c) = eng
-            .create_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], actor, None, None)
+            .create_file("photo.jpg", &[0xFF, 0xD8, 0xFF, 0xE0], actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(file.charset, None);
@@ -1224,7 +1261,7 @@ mod engine_tests {
         // テキスト（.md）は CRDT 経路へフォールバックし text/plain になる。
         let stream = byte_stream(vec![b"hello ", b"world"]);
         let (file, commit) = eng
-            .create_file_streaming("note.md", stream, actor, None, None)
+            .create_file_streaming("note.md", stream, actor, None, None, None)
             .await
             .unwrap();
         assert_eq!(commit.format_id, "text/plain");

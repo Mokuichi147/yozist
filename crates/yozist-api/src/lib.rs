@@ -411,8 +411,10 @@ async fn record_file_actor(
     let mut meta = s.meta.get_file(&id).await.ok().flatten()?;
     if created {
         meta.created_by = Some(user.username.clone());
+        meta.created_by_user_id = Some(user.id);
     }
     meta.updated_by = Some(user.username.clone());
+    meta.updated_by_user_id = Some(user.id);
     s.meta.update_file(&meta).await.ok()?;
     Some(meta)
 }
@@ -433,7 +435,14 @@ async fn create_file(
         .boxed();
     let result = s
         .engine
-        .create_file_streaming(q.name, stream, actor, committed_by_label(&ctx), None)
+        .create_file_streaming(
+            q.name,
+            stream,
+            actor,
+            committed_by_label(&ctx),
+            ctx.user_id(),
+            None,
+        )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
 
@@ -765,7 +774,15 @@ async fn commit_file(
             .map_err(|e| StorageError::Other(e.to_string()))
             .boxed();
         s.engine
-            .replace_streaming(id, name, stream, actor, committed_by_label(&ctx), q.message)
+            .replace_streaming(
+                id,
+                name,
+                stream,
+                actor,
+                committed_by_label(&ctx),
+                ctx.user_id(),
+                q.message,
+            )
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
     } else if is_partial {
@@ -779,6 +796,7 @@ async fn commit_file(
             body,
             actor,
             committed_by_label(&ctx),
+            ctx.user_id(),
             q.message,
         )
         .await
@@ -788,7 +806,7 @@ async fn commit_file(
             .map_err(|e| StorageError::Other(e.to_string()))
             .boxed();
         s.engine
-            .commit_streaming(id, stream, actor, committed_by_label(&ctx), q.message)
+            .commit_streaming(id, stream, actor, committed_by_label(&ctx), ctx.user_id(), q.message)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
     };
@@ -832,6 +850,7 @@ async fn commit_partial(
     body: Body,
     actor: ActorId,
     committed_by: Option<String>,
+    committed_by_user_id: Option<i64>,
     message: Option<String>,
 ) -> Result<yozist_core::Commit, ApiError> {
     let body = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
@@ -860,7 +879,7 @@ async fn commit_partial(
     // あるため結果の blob は通常コミットと同一で、巨大ファイルでも軽い。
     let commit = s
         .engine
-        .commit_raw(id, &new_full, actor, committed_by, message)
+        .commit_raw(id, &new_full, actor, committed_by, committed_by_user_id, message)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     // 保存直後の再表示（Range 取得）が再解凍なしで返るよう、新内容を事前投入する。
@@ -972,7 +991,7 @@ async fn rollback(
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let res = s
         .engine
-        .rollback_to(file_id, commit_id, actor, committed_by_label(&ctx), q.message)
+        .rollback_to(file_id, commit_id, actor, committed_by_label(&ctx), ctx.user_id(), q.message)
         .await
         .map_err(|e| match e {
             yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,

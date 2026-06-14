@@ -109,6 +109,14 @@ pub struct FileMeta {
     /// 最終更新者のユーザー名ラベル。意味は `created_by` と同じ。
     #[serde(default)]
     pub updated_by: Option<String>,
+    /// 作成者の不変キー（users.id）。表示ラベル `created_by` とは別に、改名・
+    /// 同名再登録に強い内部追跡用に持つ。API/UI には出さない（`serde(skip)`）。
+    /// `None` は記録なし（旧データ・SMB/匿名）。
+    #[serde(skip)]
+    pub created_by_user_id: Option<i64>,
+    /// 最終更新者の不変キー（users.id）。意味は `created_by_user_id` と同じ。
+    #[serde(skip)]
+    pub updated_by_user_id: Option<i64>,
 }
 
 /// CRDT/LWW のフォーマット選択ヒント。
@@ -192,6 +200,11 @@ pub struct Commit {
     /// 旧データや SMB 経由の書き込みでは NULL。
     #[serde(default)]
     pub committed_by: Option<String>,
+    /// 実行ユーザーの不変キー（users.id）。表示ラベル `committed_by` とは別に、
+    /// 改名・同名再登録に強い内部追跡用に持つ。API/UI には出さない（`serde(skip)`）。
+    /// 旧データや SMB/匿名では NULL。
+    #[serde(skip)]
+    pub committed_by_user_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

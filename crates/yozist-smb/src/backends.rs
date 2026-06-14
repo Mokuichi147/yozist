@@ -345,7 +345,7 @@ impl AllBackend {
                 let r = self
                     .deps
                     .engine
-                    .commit(id, &content, yozist_core::ActorId::new(), None, Some("smb".into()))
+                    .commit(id, &content, yozist_core::ActorId::new(), None, None, Some("smb".into()))
                     .await
                     .map_err(io_err)
                     .map(|_| id.to_string());
@@ -365,7 +365,7 @@ impl AllBackend {
                 let r = self
                     .deps
                     .engine
-                    .create_file(display, &content, yozist_core::ActorId::new(), None, None)
+                    .create_file(display, &content, yozist_core::ActorId::new(), None, None, None)
                     .await
                     .map_err(io_err);
                 match r {
@@ -773,6 +773,7 @@ impl ShareBackend for AllBackend {
                             target.id,
                             &content,
                             yozist_core::ActorId::new(),
+                            None,
                             None,
                             Some("smb safe-save".into()),
                         )
@@ -1869,7 +1870,7 @@ mod all_backend_tests {
         // WebUI アップロード相当: 元ファイル作成 + オーナー ACL 付与。
         let (orig, _) = deps
             .engine
-            .create_file("report.txt", b"original", ActorId::new(), None, None)
+            .create_file("report.txt", b"original", ActorId::new(), None, None, None)
             .await
             .unwrap();
         deps.acl_admin
@@ -1993,7 +1994,7 @@ mod all_backend_tests {
         // 本体ファイルを用意（オーナー ACL 付き）。
         let (orig, _) = deps
             .engine
-            .create_file("report.txt", b"original", ActorId::new(), None, None)
+            .create_file("report.txt", b"original", ActorId::new(), None, None, None)
             .await
             .unwrap();
         deps.acl_admin
@@ -2066,7 +2067,7 @@ mod all_backend_tests {
         let id = user_identity("bob");
         let (orig, _) = deps
             .engine
-            .create_file("note.txt", b"v1", ActorId::new(), None, None)
+            .create_file("note.txt", b"v1", ActorId::new(), None, None, None)
             .await
             .unwrap();
         let orig_name = format!("{}{}{}", orig.id, ID_SEP, "note.txt");
@@ -2095,7 +2096,7 @@ mod all_backend_tests {
         let id = user_identity("carol");
         let (orig, _) = deps
             .engine
-            .create_file("a.txt", b"hi", ActorId::new(), None, None)
+            .create_file("a.txt", b"hi", ActorId::new(), None, None, None)
             .await
             .unwrap();
         let canonical = format!("{}{}{}", orig.id, ID_SEP, "a.txt");
@@ -2123,7 +2124,7 @@ mod all_backend_tests {
         let id = user_identity("dave");
         let (orig, _) = deps
             .engine
-            .create_file("photo.jpg", b"\xff\xd8\xff\xe0jpegbytes", ActorId::new(), None, None)
+            .create_file("photo.jpg", b"\xff\xd8\xff\xe0jpegbytes", ActorId::new(), None, None, None)
             .await
             .unwrap();
         let name = format!("{}{}{}", orig.id, ID_SEP, "photo.jpg");
@@ -2166,7 +2167,7 @@ mod all_backend_tests {
         let sjis = yozist_versioning::encode_text(text, "Shift_JIS");
         let (meta, _) = deps
             .engine
-            .create_file("ja.txt", &sjis, ActorId::new(), None, None)
+            .create_file("ja.txt", &sjis, ActorId::new(), None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2260,7 +2261,7 @@ mod all_backend_tests {
         let id = user_identity("gina");
         let (orig, _) = deps
             .engine
-            .create_file("doc.txt", b"old content here", ActorId::new(), None, None)
+            .create_file("doc.txt", b"old content here", ActorId::new(), None, None, None)
             .await
             .unwrap();
         let name = format!("{}{}{}", orig.id, ID_SEP, "doc.txt");
@@ -2353,7 +2354,7 @@ mod all_backend_tests {
         let id = user_identity("hana");
         let (orig, _) = deps
             .engine
-            .create_file("pic.jpg", b"OLD-IMAGE-BYTES", ActorId::new(), None, None)
+            .create_file("pic.jpg", b"OLD-IMAGE-BYTES", ActorId::new(), None, None, None)
             .await
             .unwrap();
         deps.acl_admin
@@ -2453,7 +2454,7 @@ mod all_backend_tests {
         let id = user_identity("hana");
         let (orig, _) = deps
             .engine
-            .create_file("pic.jpg", b"OLD-IMAGE-BYTES", ActorId::new(), None, None)
+            .create_file("pic.jpg", b"OLD-IMAGE-BYTES", ActorId::new(), None, None, None)
             .await
             .unwrap();
         deps.acl_admin
@@ -2513,7 +2514,7 @@ mod all_backend_tests {
         let id = user_identity("hana");
         let (orig, _) = deps
             .engine
-            .create_file("pic.jpg", b"OLD-IMAGE-BYTES", ActorId::new(), None, None)
+            .create_file("pic.jpg", b"OLD-IMAGE-BYTES", ActorId::new(), None, None, None)
             .await
             .unwrap();
         deps.acl_admin
