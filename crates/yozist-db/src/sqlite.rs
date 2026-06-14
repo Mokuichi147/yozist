@@ -93,6 +93,8 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
     let deleted: i64 = row.try_get("deleted")?;
     let created_by: Option<String> = row.try_get("created_by")?;
     let updated_by: Option<String> = row.try_get("updated_by")?;
+    let created_by_user_id: Option<i64> = row.try_get("created_by_user_id")?;
+    let updated_by_user_id: Option<i64> = row.try_get("updated_by_user_id")?;
     Ok(FileMeta {
         id: FileId::from_uuid(parse_uuid(&id)?),
         display_name,
@@ -107,6 +109,8 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
         deleted: deleted != 0,
         created_by,
         updated_by,
+        created_by_user_id,
+        updated_by_user_id,
     })
 }
 
@@ -182,6 +186,8 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let format_id: String = row.try_get("format_id")?;
     let timestamp: String = row.try_get("timestamp")?;
     let message: Option<String> = row.try_get("message")?;
+    let committed_by: Option<String> = row.try_get("committed_by")?;
+    let committed_by_user_id: Option<i64> = row.try_get("committed_by_user_id")?;
     Ok(Commit {
         id: CommitId::from_uuid(parse_uuid(&id)?),
         file_id: FileId::from_uuid(parse_uuid(&file_id)?),
@@ -193,6 +199,8 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
         format_id,
         timestamp: parse_dt(&timestamp)?,
         message,
+        committed_by,
+        committed_by_user_id,
     })
 }
 
@@ -206,8 +214,9 @@ impl MetaStore for SqliteMetaStore {
         sqlx::query(
             r#"INSERT INTO files
                (id, display_name, size, mime, charset, current_commit,
-                created_at, updated_at, deleted, created_by, updated_by, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
+                created_at, updated_at, deleted, created_by, updated_by,
+                created_by_user_id, updated_by_user_id, version)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(meta.id.to_string())
         .bind(&meta.display_name)
@@ -220,6 +229,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(meta.deleted as i64)
         .bind(&meta.created_by)
         .bind(&meta.updated_by)
+        .bind(meta.created_by_user_id)
+        .bind(meta.updated_by_user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -240,6 +251,7 @@ impl MetaStore for SqliteMetaStore {
                  display_name = ?, size = ?, mime = ?, charset = ?,
                  current_commit = ?, updated_at = ?, deleted = ?,
                  created_by = ?, updated_by = ?,
+                 created_by_user_id = ?, updated_by_user_id = ?,
                  version = version + 1
                WHERE id = ?"#,
         )
@@ -252,6 +264,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(meta.deleted as i64)
         .bind(&meta.created_by)
         .bind(&meta.updated_by)
+        .bind(meta.created_by_user_id)
+        .bind(meta.updated_by_user_id)
         .bind(meta.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -600,8 +614,9 @@ impl MetaStore for SqliteMetaStore {
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError> {
         sqlx::query(
             r#"INSERT INTO commits
-               (id, file_id, parent, actor, blob, format_id, timestamp, message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+               (id, file_id, parent, actor, blob, format_id, timestamp, message,
+                committed_by, committed_by_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(commit.id.to_string())
         .bind(commit.file_id.to_string())
@@ -611,6 +626,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(&commit.format_id)
         .bind(fmt_dt(commit.timestamp))
         .bind(&commit.message)
+        .bind(&commit.committed_by)
+        .bind(commit.committed_by_user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -788,6 +805,8 @@ mod tests {
             deleted: false,
             created_by: Some("tester".into()),
             updated_by: Some("tester".into()),
+            created_by_user_id: Some(7),
+            updated_by_user_id: Some(7),
         }
     }
 
@@ -935,6 +954,8 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc(),
             message: Some("init".into()),
+            committed_by: None,
+            committed_by_user_id: None,
         };
         let c2 = Commit {
             id: CommitId::new(),
@@ -945,6 +966,8 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc() + time::Duration::seconds(1),
             message: Some("edit".into()),
+            committed_by: Some("alice".into()),
+            committed_by_user_id: Some(42),
         };
         s.insert_commit(&c1).await.unwrap();
         s.insert_commit(&c2).await.unwrap();
@@ -952,6 +975,11 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].id, c1.id);
         assert_eq!(log[1].id, c2.id);
+        // committed_by / committed_by_user_id が往復で保持される（NULL/値の両方）
+        assert_eq!(log[0].committed_by, None);
+        assert_eq!(log[0].committed_by_user_id, None);
+        assert_eq!(log[1].committed_by.as_deref(), Some("alice"));
+        assert_eq!(log[1].committed_by_user_id, Some(42));
     }
 
     #[tokio::test]

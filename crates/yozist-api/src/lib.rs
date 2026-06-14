@@ -411,8 +411,10 @@ async fn record_file_actor(
     let mut meta = s.meta.get_file(&id).await.ok().flatten()?;
     if created {
         meta.created_by = Some(user.username.clone());
+        meta.created_by_user_id = Some(user.id);
     }
     meta.updated_by = Some(user.username.clone());
+    meta.updated_by_user_id = Some(user.id);
     s.meta.update_file(&meta).await.ok()?;
     Some(meta)
 }
@@ -433,7 +435,14 @@ async fn create_file(
         .boxed();
     let result = s
         .engine
-        .create_file_streaming(q.name, stream, actor, None)
+        .create_file_streaming(
+            q.name,
+            stream,
+            actor,
+            committed_by_label(&ctx),
+            ctx.user_id(),
+            None,
+        )
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
 
@@ -765,20 +774,39 @@ async fn commit_file(
             .map_err(|e| StorageError::Other(e.to_string()))
             .boxed();
         s.engine
-            .replace_streaming(id, name, stream, actor, q.message)
+            .replace_streaming(
+                id,
+                name,
+                stream,
+                actor,
+                committed_by_label(&ctx),
+                ctx.user_id(),
+                q.message,
+            )
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
     } else if is_partial {
         let repl_start = q.repl_start.unwrap_or(0);
         let repl_end = q.repl_end.or(q.keep_from); // keep_from は repl_end の別名
-        commit_partial(&s, id, repl_start, repl_end, body, actor, q.message).await
+        commit_partial(
+            &s,
+            id,
+            repl_start,
+            repl_end,
+            body,
+            actor,
+            committed_by_label(&ctx),
+            ctx.user_id(),
+            q.message,
+        )
+        .await
     } else {
         let stream = body
             .into_data_stream()
             .map_err(|e| StorageError::Other(e.to_string()))
             .boxed();
         s.engine
-            .commit_streaming(id, stream, actor, q.message)
+            .commit_streaming(id, stream, actor, committed_by_label(&ctx), ctx.user_id(), q.message)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
     };
@@ -821,6 +849,8 @@ async fn commit_partial(
     repl_end: Option<u64>,
     body: Body,
     actor: ActorId,
+    committed_by: Option<String>,
+    committed_by_user_id: Option<i64>,
     message: Option<String>,
 ) -> Result<yozist_core::Commit, ApiError> {
     let body = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
@@ -849,7 +879,7 @@ async fn commit_partial(
     // あるため結果の blob は通常コミットと同一で、巨大ファイルでも軽い。
     let commit = s
         .engine
-        .commit_raw(id, &new_full, actor, message)
+        .commit_raw(id, &new_full, actor, committed_by, committed_by_user_id, message)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     // 保存直後の再表示（Range 取得）が再解凍なしで返るよう、新内容を事前投入する。
@@ -961,7 +991,7 @@ async fn rollback(
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let res = s
         .engine
-        .rollback_to(file_id, commit_id, actor, q.message)
+        .rollback_to(file_id, commit_id, actor, committed_by_label(&ctx), ctx.user_id(), q.message)
         .await
         .map_err(|e| match e {
             yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
@@ -1731,6 +1761,22 @@ async fn list_audit(
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(entries))
+}
+
+/// コミット履歴へ記録する実行ユーザーラベル。CRDT 用の ActorId とは別に
+/// 「誰が変更したか」を残す。git の `name <email>` に倣い
+/// `表示名 <ユーザーID>`（例: `もくいち <mokuichi147>`）の形で焼き込む。
+/// username は UNIQUE なので追跡キーとして機能し、display_name は可読性のために添える。
+/// 内部の数値 user.id は露出させない。コミット時点の値で固定されるため、
+/// 後の改名は過去コミットへ遡及しない（履歴を壊さない方針）。
+/// ログイン済みユーザーのみ記録し、匿名/システムは None（＝履歴上 NULL）とする。
+fn committed_by_label(ctx: &AuthContext) -> Option<String> {
+    match ctx {
+        AuthContext::User { user, .. } => {
+            Some(format!("{} <{}>", user.display_name, user.username))
+        }
+        _ => None,
+    }
 }
 
 fn actor_info(ctx: &AuthContext) -> (Option<String>, Option<String>) {

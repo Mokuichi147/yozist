@@ -357,7 +357,7 @@ impl Handle for YozistFileHandle {
         // 新規ファイル（file_id=None）は close 時の create_file に委ねる。
         if let Some(id) = file_id {
             self.engine
-                .commit(id, &buffer, self.actor, Some("smb".into()))
+                .commit(id, &buffer, self.actor, None, None, Some("smb".into()))
                 .await
                 .map_err(|e| {
                     smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
@@ -431,7 +431,7 @@ impl Handle for YozistFileHandle {
             match file_id {
                 Some(id) => {
                     self.engine
-                        .commit(id, &buffer, self.actor, Some("smb".into()))
+                        .commit(id, &buffer, self.actor, None, None, Some("smb".into()))
                         .await
                         .map_err(|e| {
                             smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
@@ -441,7 +441,7 @@ impl Handle for YozistFileHandle {
                 None => {
                     let (file, _commit) = self
                         .engine
-                        .create_file(name, &buffer, self.actor, None)
+                        .create_file(name, &buffer, self.actor, None, None, None)
                         .await
                         .map_err(|e| {
                             smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
