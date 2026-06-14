@@ -27,13 +27,12 @@
           <div id="fd-editor" class="hidden space-y-2">
             <div id="fd-edit-note" class="hidden text-xs text-warning"></div>
             <textarea id="fd-edit-textarea"
-                      class="textarea textarea-bordered w-full font-mono text-xs"
+                      class="textarea textarea-bordered w-full font-mono text-xs leading-[1.2rem]"
                       rows="18"></textarea>
             <div class="join w-full">
               <input id="fd-edit-message" class="input input-bordered input-sm join-item w-full"
                      placeholder="コミットメッセージ (任意)">
               <button id="fd-save-btn" class="btn btn-primary btn-sm join-item" onclick="saveEdit()">保存</button>
-              <button class="btn btn-sm join-item" onclick="toggleEdit()">キャンセル</button>
             </div>
           </div>
 
@@ -187,6 +186,7 @@ let twIgnoreScroll = 0;                // プログラム起因 scroll イベン
 let twPinBottom = false;               // 終端ジャンプ後、終端を表示し続ける
 let twScheduled = false;               // scroll の rAF スロットル
 let editRange = null;                  // 部分編集の置換範囲 {start,end}（null=全置換）
+let editOriginal = '';                 // 編集開始時の本文（未保存変更の判定用）
 
 // 拡張子 → MIME（mime 未設定ファイルのフォールバック）
 const EXT_MIME = {
@@ -531,9 +531,8 @@ async function renderTextFull(cont, first) {
     'border:1px solid rgba(127,127,127,0.25);border-radius:0.375rem;background:rgba(127,127,127,0.06);' +
     'resize:vertical';
   cont.replaceChildren(ta);
-  // 内容高 or 70vh の小さい方に高さを明示（短い内容はぴったり、長い内容は枠内スクロール）。
-  const cap = Math.round(window.innerHeight * 0.7);
-  ta.style.height = Math.min(ta.scrollHeight + 2, cap) + 'px';
+  // 高さは常に 70vh（最大）に固定（内容の長短にかかわらず枠を最大化する）。
+  ta.style.height = Math.round(window.innerHeight * 0.7) + 'px';
   // 診断: スクロール不能の切り分け用（問題報告時にコンソールを確認）。
   console.log('[yozist] text view', {
     bytes: textTotalBytes, mode: 'full',
@@ -875,17 +874,40 @@ async function toggleEdit() {
       }
     }
     $('fd-edit-message').value = '';
-    // 表示専用欄と同じ高さで編集できるよう、隠す前に現在の表示高さを引き継ぐ
-    // （rows 固定だと内容に対して欄サイズが飛んでしまうのを防ぐ）
-    const h = cont.offsetHeight;
-    if (h > 0) ta.style.height = h + 'px';
+    // 表示専用欄と同じ 70vh（最大）で編集する。
+    ta.style.height = Math.round(window.innerHeight * 0.7) + 'px';
     ed.classList.remove('hidden');
     // 表示専用欄を隠し、編集ボックスとの2重表示を防ぐ
     cont.classList.add('hidden');
+    editOriginal = ta.value;            // 未保存変更の判定基準
+    $('fd-edit-btn').textContent = '完了';
   } else {
-    ed.classList.add('hidden');
-    cont.classList.remove('hidden');
+    await finishEdit();
   }
+}
+
+// 編集モードを終了する。未保存の変更があれば保存／破棄／戻るを選ばせる。
+async function finishEdit() {
+  const dirty = $('fd-edit-textarea').value !== editOriginal;
+  if (dirty) {
+    const choice = await uiConfirm('保存していない変更があります。保存しますか？', {
+      title: '編集の終了',
+      okText: '保存',
+      extraText: '変更を破棄',
+      cancelText: '戻る',
+    });
+    if (choice === false) return;       // 戻る → 編集を継続
+    if (choice === true) { await saveEdit(true); return; }  // 保存して表示モードへ戻す
+    // choice === 'extra' → 変更を破棄してそのまま終了
+  }
+  exitEditMode();
+}
+
+// 編集ボックスを閉じて表示専用欄へ戻す（ボタン表示も「編集」に戻す）。
+function exitEditMode() {
+  $('fd-editor').classList.add('hidden');
+  $('fd-content').classList.remove('hidden');
+  $('fd-edit-btn').textContent = '編集';
 }
 
 // 画面に見えている表示先頭のファイル内バイト位置（概算）を返す（編集対象の決定用）。
@@ -921,7 +943,9 @@ async function loadEditWindow(startByte) {
   return { text, start: reqStart + s, end: reqStart + e };
 }
 
-async function saveEdit() {
+// exit=true のときのみ保存後に表示モードへ戻す（完了ボタン経由）。
+// 保存ボタンから直接呼ぶ場合は編集モードを維持する。
+async function saveEdit(exit = false) {
   const newContent = $('fd-edit-textarea').value;
   const msg = $('fd-edit-message').value;
   // 部分編集（editRange != null）のときは置換範囲を付けて前後の保持を依頼する。
@@ -953,12 +977,22 @@ async function saveEdit() {
   if (!r.ok) { uiToast('保存に失敗しました: ' + await r.text(), 'error'); return; }
   uiToast('保存しました', 'success');
   currentFile = await json('/api/files/' + fileId);
-  $('fd-editor').classList.add('hidden');
-  await loadDetail();
-  // 編集していた位置へ表示を戻す（再描画は先頭から始まるため）。
-  if (restoreByte != null && textVirtual && textTotalBytes > 0) {
-    virtJump(restoreByte / textTotalBytes);
+  if (exit) {
+    // 完了からの保存: 表示モードへ戻し、編集していた位置へ表示を戻す。
+    exitEditMode();
+    await loadDetail();
+    if (restoreByte != null && textVirtual && textTotalBytes > 0) {
+      virtJump(restoreByte / textTotalBytes);
+    }
+    return;
   }
+  // 保存ボタンからの保存: 編集モードを維持する。
+  // 置換範囲は保存後の長さに合わせて更新（次回保存のズレ防止）。
+  if (editRange) editRange.end = editRange.start + new TextEncoder().encode(newContent).length;
+  editOriginal = newContent;                 // 未保存状態を解消
+  $('fd-edit-message').value = '';            // メッセージは保存ごとにクリア
+  await loadDetail();                         // メタ・履歴・表示内容を最新化
+  $('fd-content').classList.add('hidden');    // 編集継続のため表示専用欄は隠したまま
 }
 
 // アップロードしたファイルで content を置き換える（新しいコミットとして記録）。
@@ -983,7 +1017,7 @@ async function uploadContent(file) {
     if (!r.ok) { uiToast('更新に失敗しました: ' + await r.text(), 'error'); return; }
     uiToast('更新しました', 'success');
     currentFile = await json('/api/files/' + fileId);
-    $('fd-editor').classList.add('hidden');
+    exitEditMode();
     await loadDetail();
   } finally {
     // 同じファイルを連続で選んでも change が発火するようリセット
