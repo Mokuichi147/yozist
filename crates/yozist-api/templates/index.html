@@ -223,9 +223,21 @@ async function loadSeries() {
 // 選択済みファイル（File オブジェクトに相対パス relPath を付与して保持）
 let selectedFiles = [];
 
-// File の表示／登録に使う名前。フォルダ選択時はフォルダ構造を保った相対パス。
+// File の相対パス。フォルダ選択／フォルダドロップ時はフォルダ構造を保つ。
 function relPathOf(f) {
   return f.relPath || f.webkitRelativePath || f.name;
+}
+
+// 登録に使うファイル名（フォルダ部分を除いたベース名のみ）。
+function baseNameOf(f) {
+  return relPathOf(f).split('/').pop();
+}
+
+// 相対パスに含まれるフォルダ名（タグとして付与する）。ネストは各階層を返す。
+function folderTagsOf(f) {
+  const parts = relPathOf(f).split('/');
+  parts.pop(); // ファイル名を除外
+  return parts.filter(p => p && p !== '.');
 }
 
 // 複数ファイル選択時のシリーズ名候補（フォルダ名 → 先頭ファイルのベース名）
@@ -274,7 +286,13 @@ function renderFileList() {
   selectedFiles.forEach((f, i) => {
     const li = document.createElement('li');
     li.className = 'flex items-center justify-between gap-2 text-xs px-2 py-1 rounded bg-base-200/50';
-    li.innerHTML = `<span class="truncate flex-1" title="${escapeHtml(relPathOf(f))}">${escapeHtml(relPathOf(f))}</span>` +
+    const badges = folderTagsOf(f)
+      .map(d => `<span class="badge badge-ghost badge-xs shrink-0">${escapeHtml(d)}</span>`)
+      .join('');
+    li.innerHTML =
+      `<span class="flex items-center gap-1 flex-1 min-w-0" title="${escapeHtml(relPathOf(f))}">` +
+        `<span class="truncate">${escapeHtml(baseNameOf(f))}</span>${badges}` +
+      `</span>` +
       `<span class="opacity-50 shrink-0">${fmtSize(f.size)}</span>`;
     const rm = document.createElement('button');
     rm.className = 'btn btn-xs btn-ghost px-1 text-error shrink-0';
@@ -387,17 +405,40 @@ async function doUpload() {
   const total = selectedFiles.length;
   const created = [];
   let failed = 0;
+  let tagged = false;
+
+  // タグ名 → tag_id のキャッシュ（同じフォルダ名で重複生成しない）。
+  const tagCache = new Map();
+  async function ensureTag(name) {
+    if (tagCache.has(name)) return tagCache.get(name);
+    try {
+      const t = await json('/api/tags', { method: 'POST', body: { name } });
+      tagCache.set(name, t.id);
+      return t.id;
+    } catch (_) { return null; }
+  }
 
   for (let i = 0; i < total; i++) {
     const f = selectedFiles[i];
     resultEl.textContent = `アップロード中… ${i + 1} / ${total}`;
     try {
       const buf = await f.arrayBuffer();
-      const res = await api('/api/files?name=' + encodeURIComponent(relPathOf(f)), {
+      // フォルダ部分を除いたファイル名のみで登録する。
+      const res = await api('/api/files?name=' + encodeURIComponent(baseNameOf(f)), {
         method: 'POST', body: buf, headers: { 'content-type': 'application/octet-stream' },
       });
       if (!res.ok) { failed++; continue; }
-      created.push(await res.json());
+      const meta = await res.json();
+      created.push(meta);
+      // フォルダ名をタグとして付与（ネスト時は各階層）。
+      for (const dir of folderTagsOf(f)) {
+        const tagId = await ensureTag(dir);
+        if (!tagId) continue;
+        try {
+          await json(`/api/files/${meta.id}/tags`, { method: 'POST', body: { tag_id: tagId } });
+          tagged = true;
+        } catch (_) { /* タグ付け失敗は致命ではないので継続 */ }
+      }
     } catch (_) { failed++; }
   }
 
@@ -426,8 +467,9 @@ async function doUpload() {
   clearFiles();
   $('as-series').checked = false;
   const seriesNote = asSeries ? `（シリーズ「${escapeHtml(seriesName)}」に登録）` : '';
+  const tagNote = tagged ? '（フォルダ名をタグとして付与）' : '';
   const failNote = failed > 0 ? ` / ${failed} 件失敗` : '';
-  resultEl.innerHTML = `${created.length} 件アップロードしました${failNote} ${seriesNote} ` +
+  resultEl.innerHTML = `${created.length} 件アップロードしました${failNote} ${seriesNote}${tagNote} ` +
     `<a class="link link-primary" href="/ui/files">ファイル一覧へ →</a>`;
   uiToast(`${created.length} 件アップロードしました`, failed > 0 ? 'warning' : 'success');
   await refresh();
