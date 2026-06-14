@@ -52,6 +52,7 @@
     <h3 id="ui-confirm-title" class="font-bold text-lg"></h3>
     <p id="ui-confirm-msg" class="py-3 whitespace-pre-wrap text-sm"></p>
     <div class="modal-action">
+      <button id="ui-confirm-extra" class="btn btn-sm btn-error hidden"></button>
       <button id="ui-confirm-cancel" class="btn btn-sm">キャンセル</button>
       <button id="ui-confirm-ok" class="btn btn-sm btn-primary">OK</button>
     </div>
@@ -186,10 +187,21 @@ function uiConfirm(message, opts = {}) {
     const okBtn = $('ui-confirm-ok');
     okBtn.className = 'btn btn-sm ' + (opts.danger ? 'btn-error' : 'btn-primary');
     okBtn.textContent = opts.okText || 'OK';
+    const cancelBtn = $('ui-confirm-cancel');
+    cancelBtn.textContent = opts.cancelText || 'キャンセル';
+    // 第3の選択肢（extraText 指定時のみ表示）。resolve 値は 'extra'。
+    const extraBtn = $('ui-confirm-extra');
+    if (opts.extraText) {
+      extraBtn.textContent = opts.extraText;
+      extraBtn.classList.remove('hidden');
+    } else {
+      extraBtn.classList.add('hidden');
+    }
     let done = false;
     const finish = v => { if (done) return; done = true; dlg.close(); resolve(v); };
     okBtn.onclick = () => finish(true);
-    $('ui-confirm-cancel').onclick = () => finish(false);
+    cancelBtn.onclick = () => finish(false);
+    extraBtn.onclick = () => finish('extra');
     dlg.onclose = () => finish(false);
     dlg.showModal();
   });
