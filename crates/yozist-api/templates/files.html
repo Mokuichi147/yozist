@@ -483,14 +483,14 @@ async function newFile() {
     title: '新規ファイル', okText: '作成',
     fields: [
       { name: 'name', label: 'ファイル名', placeholder: '例: memo.md' },
-      { name: 'content', label: '本文 (省略可)', type: 'textarea', rows: 6 },
     ],
   });
   if (!r || !r.name.trim()) return;
   try {
+    // 本文は空で作成し、内容は詳細ページで編集する。
     const resp = await api('/api/files?name=' + encodeURIComponent(r.name.trim()), {
       method: 'POST',
-      body: new TextEncoder().encode(r.content || '').buffer,
+      body: new ArrayBuffer(0),
       headers: { 'content-type': 'application/octet-stream' },
     });
     if (!resp.ok) throw new Error(await resp.text());
