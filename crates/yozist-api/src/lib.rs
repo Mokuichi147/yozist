@@ -640,6 +640,17 @@ fn range_response(
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     let accept = HeaderValue::from_static("bytes");
 
+    // 空リソースには範囲が無い。Range の有無に関わらず 200 で空本文を返す。
+    // 416 を返すとフロントのテキストビューアが取得に失敗し、本文が空の
+    // テキストファイルを一切編集できなくなる。
+    if total == 0 {
+        let mut resp = Vec::<u8>::new().into_response();
+        let h = resp.headers_mut();
+        h.insert(header::CONTENT_TYPE, ct);
+        h.insert(header::ACCEPT_RANGES, accept);
+        return resp;
+    }
+
     let parsed = range
         .and_then(|h| h.to_str().ok())
         .map(|s| (s, parse_byte_range(s, total)));
@@ -2653,6 +2664,13 @@ mod tests {
         let bad = HeaderValue::from_static("bytes=100-200");
         let oob = range_response("text/plain".into(), &body, Some(&bad));
         assert_eq!(oob.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+
+        // 空ファイルへの Range は 416 ではなく 200(空本文)。本文の無いテキスト
+        // ファイルをビューア/エディタが読めるようにするため。
+        let empty = HeaderValue::from_static("bytes=0-262143");
+        let resp = range_response("text/plain".into(), &[], Some(&empty));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
     }
 
     #[test]
