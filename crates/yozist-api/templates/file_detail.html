@@ -20,7 +20,8 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
           <div class="flex items-start justify-between gap-2">
-            <h2 id="fd-name" class="card-title text-lg break-all">…</h2>
+            <h2 id="fd-name" class="card-title text-lg break-all cursor-text hover:opacity-70"
+                title="クリックでファイル名を変更" onclick="startRename()">…</h2>
             <button id="fd-edit-btn" class="btn btn-sm hidden shrink-0" onclick="toggleEdit()">編集</button>
           </div>
 
@@ -817,6 +818,62 @@ async function downloadContent() {
     setTimeout(() => URL.revokeObjectURL(u), 1000);
   } catch (e) {
     uiToast('ダウンロードに失敗しました: ' + e.message, 'error');
+  }
+}
+
+// ファイル名の見出しをその場で input に差し替えてインライン編集する。
+// Enter / フォーカス外しで確定、Escape で取り消し。
+let renaming = false;
+function startRename() {
+  if (renaming || !currentFile) return;
+  renaming = true;
+  const h = $('fd-name');
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = currentFile.display_name;
+  // daisyUI の .input は固定高さ・パディングを持ち見出しより下にずれるため使わない。
+  // 見出しの字形・位置をそのまま保つよう font を継承し、box model を打ち消す。
+  input.className = 'w-full';
+  input.style.cssText =
+    'font:inherit;color:inherit;width:100%;margin:0;padding:0;height:auto;line-height:inherit;' +
+    'background:transparent;border:0;border-bottom:1px solid currentColor;outline:none;border-radius:0';
+  let done = false;
+  const cancel = () => {
+    if (done) return;
+    done = true; renaming = false;
+    h.textContent = currentFile.display_name;
+  };
+  const commit = async () => {
+    if (done) return;
+    const name = input.value.trim();
+    if (!name || name === currentFile.display_name) { cancel(); return; }
+    done = true; renaming = false;
+    await commitRename(name);
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  };
+  input.onblur = commit;
+  h.replaceChildren(input);
+  input.focus();
+  // 拡張子を除いた本体部分を選択（拡張子はそのまま使い回しやすいように）。
+  const dot = input.value.lastIndexOf('.');
+  input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+}
+
+// 確定した新ファイル名を PATCH で保存し、表示を更新する。
+async function commitRename(name) {
+  try {
+    currentFile = await json(`/api/files/${fileId}`, {
+      method: 'PATCH', body: { display_name: name },
+    });
+    document.title = 'yozist - ' + currentFile.display_name;
+    uiToast('ファイル名を変更しました', 'success');
+    await loadDetail();
+  } catch (e) {
+    uiToast('ファイル名の変更に失敗しました: ' + e.message, 'error');
+    $('fd-name').textContent = currentFile.display_name;
   }
 }
 
