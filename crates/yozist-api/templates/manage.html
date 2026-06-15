@@ -17,23 +17,6 @@
   <div class="card bg-base-100 shadow-sm">
     <div class="card-body p-4">
       <div class="flex items-center justify-between mb-2">
-        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">条件付きパス (saved queries)</h2>
-        <button class="btn btn-xs" onclick="createQuery()">+ 新規</button>
-      </div>
-      <p class="text-xs opacity-60 mb-2 leading-relaxed">
-        タグの AND / NOT 条件にマッチするファイル群へ任意の名前を付けて、
-        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/&lt;名前&gt;/</span> で直接アクセスできます。
-        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/</span> に接続すれば、全ての条件付きパスと
-        組込みビュー (all / tags / series / queries) を 1 か所から辿れます。
-        名前と条件は作成したユーザーがいつでも変更できます。
-      </p>
-      <div id="query-list" class="text-sm space-y-1">…</div>
-    </div>
-  </div>
-
-  <div class="card bg-base-100 shadow-sm">
-    <div class="card-body p-4">
-      <div class="flex items-center justify-between mb-2">
         <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">active shares</h2>
         <button class="btn btn-xs btn-ghost" onclick="loadShares()">refresh</button>
       </div>
@@ -81,13 +64,12 @@
 async function init() {
   const me = await requireAuth();
   if (!me) return;
-  myUserId = me.user && me.user.id;
   $('main').classList.remove('hidden');
   await refresh();
 }
 
 async function refresh() {
-  await Promise.all([loadGroups(), loadQueries(), loadShares(), loadAudit()]);
+  await Promise.all([loadGroups(), loadShares(), loadAudit()]);
 }
 
 // ---- groups ----
@@ -171,124 +153,6 @@ async function removeMember(uid) {
     uiToast('除外しました', 'success');
     await renderGroupMembers();
   } catch (e) { uiToast('除外に失敗しました', 'error'); }
-}
-
-// ---- saved queries (条件付きパス) ----
-// 作成者本人のみ編集・削除を許可（サーバ側でも検証）。
-let myUserId = null;
-
-function splitTags(s) {
-  return s ? s.split(',').map(x => x.trim()).filter(Boolean) : [];
-}
-
-function canEditQuery(q) {
-  // created_by 未設定の旧データはログイン済みなら誰でも、それ以外は作成者のみ。
-  return q.created_by == null || q.created_by === myUserId;
-}
-
-async function loadQueries() {
-  const el = $('query-list');
-  try {
-    const list = await json('/api/queries');
-    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">条件付きパスなし</div>'; return; }
-    el.innerHTML = list.map(q => {
-      const cond = [];
-      if (q.query.tags_and && q.query.tags_and.length) cond.push('AND: ' + q.query.tags_and.join(', '));
-      if (q.query.tags_not && q.query.tags_not.length) cond.push('NOT: ' + q.query.tags_not.join(', '));
-      const path = `smb://&lt;サーバ&gt;/yozist/${escapeHtml(q.name)}/`;
-      const mine = canEditQuery(q);
-      const editBtns = mine ? `
-          <button class="btn btn-xs" onclick="editQuery('${q.id}')">編集</button>
-          <button class="btn btn-xs btn-error btn-outline" onclick="deleteQuery('${q.id}','${escapeHtml(q.name)}')">削除</button>` : '';
-      return `<div class="flex items-start justify-between row-compact gap-2">
-        <div class="min-w-0">
-          <div><span class="font-semibold break-all">${escapeHtml(q.name)}</span>
-            <span class="text-xs opacity-60 ml-1">${cond.join(' / ') || '全件'}</span></div>
-          <div class="text-xs font-mono opacity-50 break-all">${path}</div>
-          ${q.description ? `<div class="text-xs opacity-60 break-all">${escapeHtml(q.description)}</div>` : ''}
-        </div>
-        <div class="flex gap-1 shrink-0">
-          <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
-          ${editBtns}
-        </div>
-      </div>`;
-    }).join('');
-  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
-}
-
-async function createQuery() {
-  const r = await uiPrompt({
-    title: '条件付きパスの作成', okText: '作成',
-    fields: [
-      { name: 'name', label: 'パス名 (任意)', placeholder: '例: 仕事メモ' },
-      { name: 'and', label: 'ANDタグ (カンマ区切り、空可)', placeholder: '仕事, 2026' },
-      { name: 'not', label: 'NOTタグ (カンマ区切り、空可)' },
-      { name: 'desc', label: '説明 (任意)' },
-    ],
-  });
-  if (!r || !r.name.trim()) return;
-  const body = {
-    name: r.name.trim(),
-    tags_and: splitTags(r.and),
-    tags_not: splitTags(r.not),
-    description: r.desc && r.desc.trim() ? r.desc.trim() : null,
-  };
-  try {
-    await json('/api/queries', { method: 'POST', body });
-    uiToast('条件付きパスを作成しました', 'success');
-    await loadQueries();
-  } catch (e) { uiToast('作成に失敗しました: ' + e.message, 'error'); }
-}
-
-async function editQuery(id) {
-  let q;
-  try { q = await json(`/api/queries/${id}`); }
-  catch (e) { uiToast('取得に失敗しました', 'error'); return; }
-  const r = await uiPrompt({
-    title: '条件付きパスの編集', okText: '保存',
-    fields: [
-      { name: 'name', label: 'パス名 (任意)', value: q.name },
-      { name: 'and', label: 'ANDタグ (カンマ区切り、空可)', value: (q.query.tags_and || []).join(', ') },
-      { name: 'not', label: 'NOTタグ (カンマ区切り、空可)', value: (q.query.tags_not || []).join(', ') },
-      { name: 'desc', label: '説明 (任意)', value: q.description || '' },
-    ],
-  });
-  if (!r || !r.name.trim()) return;
-  const body = {
-    name: r.name.trim(),
-    tags_and: splitTags(r.and),
-    tags_not: splitTags(r.not),
-    description: r.desc && r.desc.trim() ? r.desc.trim() : null,
-  };
-  try {
-    await json(`/api/queries/${id}`, { method: 'PATCH', body });
-    uiToast('更新しました', 'success');
-    await loadQueries();
-  } catch (e) { uiToast('更新に失敗しました: ' + e.message, 'error'); }
-}
-
-async function deleteQuery(id, name) {
-  if (!await uiConfirm(`条件付きパス「${name}」を削除しますか？\n対応する SMB パスも無効になります。`, { danger: true })) return;
-  try {
-    await api(`/api/queries/${id}`, { method: 'DELETE' });
-    uiToast('削除しました', 'success');
-    await loadQueries();
-  } catch (e) { uiToast('削除に失敗しました', 'error'); }
-}
-
-async function shareQuery(id, name) {
-  const r = await uiPrompt({
-    title: `「${name}」の共有URLを発行`, okText: '発行',
-    fields: [{ name: 'ttl', label: '有効期限 (秒)', type: 'number', value: '3600' }],
-  });
-  if (!r) return;
-  const ttl = parseInt(r.ttl, 10);
-  if (!ttl) { uiToast('有効期限を正しく入力してください', 'warning'); return; }
-  try {
-    const res = await json(`/api/queries/${id}/share`, { method: 'POST', body: { ttl_secs: ttl } });
-    await loadShares();
-    await uiCopyUrl(location.origin + res.url, 'クエリ共有URL');
-  } catch (e) { uiToast('共有URL発行に失敗しました: ' + e.message, 'error'); }
 }
 
 // ---- active shares ----
