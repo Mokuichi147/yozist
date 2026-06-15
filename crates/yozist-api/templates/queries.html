@@ -153,8 +153,7 @@ async function loadQueries() {
       return `<div class="flex items-start justify-between row-compact gap-2 border-b border-base-200 last:border-0 py-2">
         <div class="min-w-0">
           <div><span class="font-semibold break-all">${escapeHtml(q.name)}</span></div>
-          <div class="text-xs opacity-60 break-all">${escapeHtml(queryText(q))}</div>
-          ${q.description ? `<div class="text-xs opacity-60 break-all">${escapeHtml(q.description)}</div>` : ''}
+          <div class="text-xs opacity-60 break-all">${escapeHtml(q.description || queryText(q))}</div>
         </div>
         <div class="flex gap-1 shrink-0">
           <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
@@ -206,20 +205,21 @@ function opOptions(type, op) {
 
 function renderControls(type, op, value, unit, field) {
   const v = escapeHtml(value || '');
+  // 演算子（「を含む」等）は日本語として自然になるよう値の右側（末尾）に置く。
   const opSel = w => `<select class="q-op select select-bordered select-sm ${w} shrink-0">${opOptions(type, op)}</select>`;
   if (type === 'tag') {
     const list = TAG_DATALIST[field] || 'tag-options-all';
-    return `${opSel('w-32')}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="${list}" placeholder="タグ名" value="${v}" />`;
+    return `<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="${list}" placeholder="タグ名" value="${v}" />${opSel('w-32')}`;
   }
   if (type === 'series') {
-    return `${opSel('w-32')}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />`;
+    return `<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />${opSel('w-32')}`;
   }
   if (type === 'mime') {
     const opts = MIME_PRESETS.map(([val, lbl]) => `<option value="${val}"${val === value ? ' selected' : ''}>${lbl}</option>`).join('');
-    return `${opSel('w-32')}<select class="q-val select select-bordered select-sm flex-1 min-w-0">${opts}</select>`;
+    return `<select class="q-val select select-bordered select-sm flex-1 min-w-0">${opts}</select>${opSel('w-32')}`;
   }
   if (type === 'text') {
-    return `${opSel('w-32')}<input class="q-val input input-bordered input-sm flex-1 min-w-0" placeholder="文字列" value="${v}" />`;
+    return `<input class="q-val input input-bordered input-sm flex-1 min-w-0" placeholder="文字列" value="${v}" />${opSel('w-32')}`;
   }
   // date: [数値][単位][演算子]
   const units = [['day', '日'], ['month', 'か月'], ['year', '年']]
