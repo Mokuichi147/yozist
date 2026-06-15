@@ -31,7 +31,7 @@
     {% if active != "login" %}
     <nav class="flex items-center gap-3 text-sm">
       <a href="/ui/files" class="link link-hover {% if active == "files" %}font-semibold{% endif %}">ファイル</a>
-      <a href="/ui/queries" class="link link-hover {% if active == "queries" %}font-semibold{% endif %}">条件付きパス</a>
+      <a href="/ui/queries" class="link link-hover {% if active == "queries" %}font-semibold{% endif %}">クエリ一覧</a>
       {% block subtabs %}{% endblock %}
     </nav>
     {% endif %}
