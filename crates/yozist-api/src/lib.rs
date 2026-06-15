@@ -1651,7 +1651,7 @@ struct CreateFilterInput {
     tags_and: Vec<String>,
     #[serde(default)]
     tags_not: Vec<String>,
-    /// スマートフォルダ風の条件群（タグ種別 / シリーズ / 種類 / 名前 / 日付）。
+    /// 条件群（タグ種別 / シリーズ / 種類 / 名前 / 日付）。
     #[serde(default)]
     match_mode: yozist_core::MatchMode,
     #[serde(default)]

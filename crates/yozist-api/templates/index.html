@@ -2,55 +2,44 @@
 {% block title %}yozist{% endblock %}
 
 {% block content %}
-<div id="main" class="hidden max-w-7xl mx-auto p-4">
-  <div class="grid grid-cols-1 md:grid-cols-[240px_1fr] gap-4">
-
-    <!-- 左カラム: tags / series -->
-    <div class="space-y-4">
-      <div class="card bg-base-100 shadow-sm">
-        <div class="card-body p-4">
-          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold mb-2">tags</h2>
-          <ul class="menu menu-sm p-0 max-h-[60vh] overflow-y-auto w-full" id="tag-list"></ul>
-        </div>
-      </div>
-      <div class="card bg-base-100 shadow-sm">
-        <div class="card-body p-4">
-          <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold mb-2">series</h2>
-          <ul class="menu menu-sm p-0 max-h-[60vh] overflow-y-auto w-full" id="series-list"></ul>
-        </div>
-      </div>
-    </div>
-
-    <!-- 右カラム: upload -->
-    <div class="space-y-4">
+<div id="main" class="hidden max-w-2xl mx-auto p-4">
 
       <div class="card bg-base-100 shadow-sm">
-        <div class="card-body p-4">
-          <div class="flex items-center justify-between mb-2">
-            <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">upload</h2>
-            <a href="/ui/files" class="text-xs link link-primary">ファイル一覧へ →</a>
+        <div class="card-body p-4 sm:p-6">
+          <h2 class="card-title text-base mb-4">ファイルのアップロード</h2>
+
+          <!-- ドラッグ&ドロップ / クリックで選択 -->
+          <div id="dropzone"
+               class="border-2 border-dashed border-base-300 rounded-lg px-6 py-10 text-center cursor-pointer transition-colors hover:border-primary hover:bg-base-200/40">
+            <p class="text-base sm:text-lg font-medium opacity-90">ここにファイルをドラッグ&amp;ドロップするか、クリックして選択</p>
+            <p class="text-xs opacity-50 mt-2">
+              フォルダごとドロップ、または
+              <button type="button" id="pick-folder" class="link link-primary">フォルダを選択</button>
+            </p>
           </div>
-          <div class="space-y-2">
-            <input id="upload-name" class="input input-bordered input-sm w-full"
-                   placeholder="新規ファイル名 (例: memo.md)">
-            <textarea id="upload-content" class="textarea textarea-bordered w-full text-sm"
-                      placeholder="本文 (省略可)" rows="3"></textarea>
-            <div class="flex flex-wrap items-center gap-2">
-              <input type="file" id="upload-file" class="file-input file-input-bordered file-input-xs flex-1 min-w-[160px]">
-              <button class="btn btn-primary btn-sm" onclick="doUpload()">登録</button>
-            </div>
-            <div id="upload-result" class="text-xs"></div>
+          <input type="file" id="upload-file" class="hidden" multiple>
+          <input type="file" id="upload-folder" class="hidden" webkitdirectory directory>
+
+          <!-- 選択済みファイル一覧 -->
+          <div id="file-summary" class="hidden mt-3 flex items-center justify-between text-sm">
+            <span id="file-count" class="font-medium"></span>
+            <button type="button" id="clear-files" class="text-xs link link-error">すべてクリア</button>
           </div>
+          <ul id="file-list" class="hidden mt-2 space-y-1 max-h-48 overflow-y-auto"></ul>
+
+          <!-- シリーズ登録 -->
+          <label class="label cursor-pointer justify-start gap-2 mt-4 py-1">
+            <input type="checkbox" id="as-series" class="checkbox checkbox-sm">
+            <span class="label-text">シリーズとして登録する</span>
+          </label>
+
+          <div class="mt-3">
+            <button class="btn btn-primary btn-sm" id="upload-btn" onclick="doUpload()">アップロード</button>
+          </div>
+          <div id="upload-result" class="text-xs mt-2"></div>
         </div>
       </div>
 
-      <div class="text-xs opacity-60 px-1">
-        グループ・フィルター・共有・監査ログは
-        <a href="/ui/manage" class="link link-primary">管理ページ</a> へ移動しました。
-      </div>
-
-    </div>
-  </div>
 </div>
 {% endblock %}
 
@@ -60,173 +49,265 @@ async function init() {
   const me = await requireAuth();
   if (!me) return;
   $('main').classList.remove('hidden');
-  await refresh();
 }
 
-async function refresh() {
-  await Promise.all([loadTags(), loadSeries()]);
+// ===== アップロード（ドラッグ&ドロップ / 複数ファイル / フォルダ）=====
+
+// 選択済みファイル（File オブジェクトに相対パス relPath を付与して保持）
+let selectedFiles = [];
+
+// File の相対パス。フォルダ選択／フォルダドロップ時はフォルダ構造を保つ。
+function relPathOf(f) {
+  return f.relPath || f.webkitRelativePath || f.name;
 }
 
-async function loadTags() {
-  const tags = await fetch('/api/tags').then(r => r.json());
-  const el = $('tag-list');
-  el.innerHTML = '';
-  if (tags.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs px-2 py-1">タグなし</div>'; return; }
-  tags.forEach(t => {
+// 登録に使うファイル名（フォルダ部分を除いたベース名のみ）。
+function baseNameOf(f) {
+  return relPathOf(f).split('/').pop();
+}
+
+// 相対パスに含まれるフォルダ名（タグとして付与する）。ネストは各階層を返す。
+function folderTagsOf(f) {
+  const parts = relPathOf(f).split('/');
+  parts.pop(); // ファイル名を除外
+  return parts.filter(p => p && p !== '.');
+}
+
+// 複数ファイル選択時のシリーズ名候補（フォルダ名 → 先頭ファイルのベース名）
+function guessSeriesName() {
+  for (const f of selectedFiles) {
+    const p = relPathOf(f);
+    const slash = p.indexOf('/');
+    if (slash > 0) return p.slice(0, slash);
+  }
+  const first = selectedFiles[0];
+  if (!first) return '';
+  return relPathOf(first).split('/').pop().replace(/\.[^.]+$/, '');
+}
+
+// 同じ相対パスのファイルは重複登録しない
+function addFiles(files) {
+  const seen = new Set(selectedFiles.map(relPathOf));
+  for (const f of files) {
+    const p = relPathOf(f);
+    if (seen.has(p)) continue;
+    seen.add(p);
+    selectedFiles.push(f);
+  }
+  renderFileList();
+}
+
+function clearFiles() {
+  selectedFiles = [];
+  renderFileList();
+}
+
+function renderFileList() {
+  const summary = $('file-summary');
+  const list = $('file-list');
+  const countEl = $('file-count');
+  list.innerHTML = '';
+  if (selectedFiles.length === 0) {
+    summary.classList.add('hidden');
+    list.classList.add('hidden');
+    return;
+  }
+  const total = selectedFiles.reduce((a, f) => a + f.size, 0);
+  countEl.textContent = `${selectedFiles.length} 件 (${fmtSize(total)})`;
+  summary.classList.remove('hidden');
+  list.classList.remove('hidden');
+  selectedFiles.forEach((f, i) => {
     const li = document.createElement('li');
-    const icon = t.kind === 'system' ? '⚙' : t.kind === 'ai' ? '🤖' : '';
-    const a = document.createElement('a');
-    a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded hover:bg-base-200';
-    a.href = '/ui/files?tags=' + encodeURIComponent(t.name);
-    a.title = 'このタグでファイル一覧を絞り込む';
-    a.innerHTML = `<span class="flex-1 truncate">${escapeHtml(t.name)} ${icon}</span>`;
-    const renameBtn = document.createElement('button');
-    renameBtn.className = 'btn btn-xs btn-ghost px-1';
-    renameBtn.title = 'リネーム';
-    renameBtn.textContent = '✎';
-    const delBtn = document.createElement('button');
-    delBtn.className = 'btn btn-xs btn-ghost px-1 text-error';
-    delBtn.title = '削除';
-    delBtn.textContent = '×';
-    a.append(renameBtn, delBtn);
-    renameBtn.onclick = async (e) => {
-      e.stopPropagation(); e.preventDefault();
-      const r = await uiPrompt({
-        title: 'タグ名の変更', okText: '変更',
-        fields: [{ name: 'name', label: '新しいタグ名', value: t.name }],
-      });
-      if (!r) return;
-      const name = r.name.trim();
-      if (!name || name === t.name) return;
-      const rr = await api(`/api/tags/${t.id}`, {
-        method: 'PATCH', body: JSON.stringify({ name }),
-        headers: { 'content-type': 'application/json' },
-      });
-      if (!rr.ok) { uiToast('変更に失敗しました', 'error'); return; }
-      uiToast('タグ名を変更しました', 'success');
-      await refresh();
-    };
-    delBtn.onclick = async (e) => {
-      e.stopPropagation(); e.preventDefault();
-      if (!await uiConfirm(`タグ "${t.name}" を削除しますか？\n(ファイル本体は残りますが、このタグの紐付けは全て解除されます)`, { danger: true, okText: '削除' })) return;
-      const rr = await api(`/api/tags/${t.id}`, { method: 'DELETE' });
-      if (!rr.ok) { uiToast('削除に失敗しました', 'error'); return; }
-      uiToast('タグを削除しました', 'success');
-      await refresh();
-    };
-    li.appendChild(a);
-    el.appendChild(li);
+    li.className = 'flex items-center justify-between gap-2 text-xs px-2 py-1 rounded bg-base-200/50';
+    const badges = folderTagsOf(f)
+      .map(d => `<span class="badge badge-ghost badge-xs shrink-0">${escapeHtml(d)}</span>`)
+      .join('');
+    li.innerHTML =
+      `<span class="flex items-center gap-1 flex-1 min-w-0" title="${escapeHtml(relPathOf(f))}">` +
+        `<span class="truncate">${escapeHtml(baseNameOf(f))}</span>${badges}` +
+      `</span>` +
+      `<span class="opacity-50 shrink-0">${fmtSize(f.size)}</span>`;
+    const rm = document.createElement('button');
+    rm.className = 'btn btn-xs btn-ghost px-1 text-error shrink-0';
+    rm.textContent = '×';
+    rm.title = '除外';
+    rm.onclick = () => { selectedFiles.splice(i, 1); renderFileList(); };
+    li.appendChild(rm);
+    list.appendChild(li);
   });
 }
 
-async function loadSeries() {
-  const list = await fetch('/api/series').then(r => r.json());
-  const el = $('series-list');
-  el.innerHTML = '';
-  if (list.length === 0) {
-    el.innerHTML = '<div class="opacity-50 text-xs px-2 py-1">シリーズなし</div>';
-  } else {
-    list.forEach(s => {
-      const li = document.createElement('li');
-      const a = document.createElement('a');
-      a.className = 'flex items-center justify-between gap-1 px-2 py-1 rounded hover:bg-base-200';
-      // クリックでそのシリーズのファイル一覧へ (旧: メンバーを alert 表示)
-      a.href = '/ui/files?series=' + encodeURIComponent(s.id);
-      a.title = s.description || 'このシリーズのファイル一覧を表示';
-      a.innerHTML = `<span class="flex-1 truncate">${escapeHtml(s.name)}</span>`;
-      const renameBtn = document.createElement('button');
-      renameBtn.className = 'btn btn-xs btn-ghost px-1';
-      renameBtn.title = 'リネーム';
-      renameBtn.textContent = '✎';
-      const delBtn = document.createElement('button');
-      delBtn.className = 'btn btn-xs btn-ghost px-1 text-error';
-      delBtn.title = '削除';
-      delBtn.textContent = '×';
-      a.append(renameBtn, delBtn);
-      renameBtn.onclick = async (e) => {
-        e.stopPropagation(); e.preventDefault();
-        const r = await uiPrompt({
-          title: 'シリーズの編集', okText: '保存',
-          fields: [
-            { name: 'name', label: 'シリーズ名', value: s.name },
-            { name: 'description', label: '説明 (空可)', value: s.description || '' },
-          ],
-        });
-        if (!r) return;
-        const name = r.name.trim();
-        if (!name) return;
-        const rr = await api(`/api/series/${s.id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ name, description: r.description || null }),
-          headers: { 'content-type': 'application/json' },
-        });
-        if (!rr.ok) { uiToast('変更に失敗しました', 'error'); return; }
-        uiToast('シリーズを更新しました', 'success');
-        await refresh();
-      };
-      delBtn.onclick = async (e) => {
-        e.stopPropagation(); e.preventDefault();
-        if (!await uiConfirm(`シリーズ "${s.name}" を削除しますか？\n(ファイル本体は残ります)`, { danger: true, okText: '削除' })) return;
-        const rr = await api(`/api/series/${s.id}`, { method: 'DELETE' });
-        if (!rr.ok) { uiToast('削除に失敗しました', 'error'); return; }
-        uiToast('シリーズを削除しました', 'success');
-        await refresh();
-      };
-      li.appendChild(a);
-      el.appendChild(li);
-    });
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+// ---- DataTransfer からフォルダ込みで File を再帰収集 ----
+async function filesFromDataTransfer(dt) {
+  const entries = [];
+  if (dt.items && dt.items.length) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const it = dt.items[i];
+      const entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+      if (entry) entries.push(entry);
+    }
   }
-  // 「+ 新規シリーズ」リンク
-  const add = document.createElement('li');
-  const addLink = document.createElement('a');
-  addLink.className = 'text-xs text-primary px-2 py-1';
-  addLink.href = '#';
-  addLink.textContent = '+ 新規シリーズ';
-  addLink.onclick = async (e) => {
+  if (entries.length === 0) {
+    // フォルダ非対応ブラウザ向けフォールバック
+    return Array.from(dt.files || []);
+  }
+  const out = [];
+  for (const entry of entries) await walkEntry(entry, out, '');
+  return out;
+}
+
+function walkEntry(entry, out, prefix) {
+  return new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(f => {
+        f.relPath = prefix + entry.name;
+        out.push(f);
+        resolve();
+      }, () => resolve());
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const collected = [];
+      const readBatch = () => reader.readEntries(async batch => {
+        if (!batch.length) {
+          for (const e of collected) await walkEntry(e, out, prefix + entry.name + '/');
+          resolve();
+        } else {
+          collected.push(...batch);
+          readBatch();
+        }
+      }, () => resolve());
+      readBatch();
+    } else {
+      resolve();
+    }
+  });
+}
+
+function setupUpload() {
+  const dz = $('dropzone');
+  const fileInput = $('upload-file');
+  const folderInput = $('upload-folder');
+
+  dz.onclick = () => fileInput.click();
+  $('pick-folder').onclick = e => { e.stopPropagation(); folderInput.click(); };
+  $('clear-files').onclick = clearFiles;
+
+  fileInput.onchange = () => { addFiles(Array.from(fileInput.files)); fileInput.value = ''; };
+  folderInput.onchange = () => { addFiles(Array.from(folderInput.files)); folderInput.value = ''; };
+
+  ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, e => {
     e.preventDefault();
-    const r = await uiPrompt({
-      title: '新規シリーズ', okText: '作成',
-      fields: [{ name: 'name', label: 'シリーズ名' }],
-    });
-    if (!r || !r.name.trim()) return;
-    try {
-      await json('/api/series', { method: 'POST', body: { name: r.name.trim() } });
-      uiToast('シリーズを作成しました', 'success');
-      await refresh();
-    } catch (err) { uiToast('作成に失敗しました: ' + err.message, 'error'); }
-  };
-  add.appendChild(addLink);
-  el.appendChild(add);
+    dz.classList.add('border-primary', 'bg-base-200/40');
+  }));
+  ['dragleave', 'dragend'].forEach(ev => dz.addEventListener(ev, e => {
+    e.preventDefault();
+    dz.classList.remove('border-primary', 'bg-base-200/40');
+  }));
+  dz.addEventListener('drop', async e => {
+    e.preventDefault();
+    dz.classList.remove('border-primary', 'bg-base-200/40');
+    const files = await filesFromDataTransfer(e.dataTransfer);
+    if (files.length) addFiles(files);
+  });
 }
 
 async function doUpload() {
-  const fileInput = $('upload-file');
-  let name = $('upload-name').value.trim();
-  let body;
-  if (fileInput.files.length > 0) {
-    const f = fileInput.files[0];
-    if (!name) name = f.name;
-    body = await f.arrayBuffer();
-  } else {
-    if (!name) { uiToast('ファイル名またはアップロードファイルを指定してください', 'warning'); return; }
-    body = new TextEncoder().encode($('upload-content').value || '').buffer;
+  if (selectedFiles.length === 0) { uiToast('アップロードするファイルを選択してください', 'warning'); return; }
+
+  const asSeries = $('as-series').checked;
+  let seriesName = null;
+  if (asSeries) {
+    const r = await uiPrompt({
+      title: 'シリーズとして登録', okText: '作成',
+      fields: [{ name: 'name', label: 'シリーズ名', value: guessSeriesName() }],
+    });
+    if (!r || !r.name.trim()) return; // キャンセル時は中断
+    seriesName = r.name.trim();
   }
-  const r = await api('/api/files?name=' + encodeURIComponent(name), {
-    method: 'POST',
-    body,
-    headers: { 'content-type': 'application/octet-stream' },
-  });
-  if (!r.ok) { uiToast('登録に失敗しました: ' + await r.text(), 'error'); return; }
-  const meta = await r.json();
-  $('upload-name').value = '';
-  $('upload-content').value = '';
-  fileInput.value = '';
-  $('upload-result').innerHTML =
-    `登録しました: <a class="link link-primary" href="/ui/files/${meta.id}">${escapeHtml(meta.display_name)}</a>`;
-  uiToast('ファイルを登録しました', 'success');
-  await refresh();
+
+  const btn = $('upload-btn');
+  const resultEl = $('upload-result');
+  btn.disabled = true;
+  btn.classList.add('btn-disabled');
+  const total = selectedFiles.length;
+  const created = [];
+  let failed = 0;
+  let tagged = false;
+
+  // タグ名 → tag_id のキャッシュ（同じフォルダ名で重複生成しない）。
+  const tagCache = new Map();
+  async function ensureTag(name) {
+    if (tagCache.has(name)) return tagCache.get(name);
+    try {
+      const t = await json('/api/tags', { method: 'POST', body: { name } });
+      tagCache.set(name, t.id);
+      return t.id;
+    } catch (_) { return null; }
+  }
+
+  for (let i = 0; i < total; i++) {
+    const f = selectedFiles[i];
+    resultEl.textContent = `アップロード中… ${i + 1} / ${total}`;
+    try {
+      const buf = await f.arrayBuffer();
+      // フォルダ部分を除いたファイル名のみで登録する。
+      const res = await api('/api/files?name=' + encodeURIComponent(baseNameOf(f)), {
+        method: 'POST', body: buf, headers: { 'content-type': 'application/octet-stream' },
+      });
+      if (!res.ok) { failed++; continue; }
+      const meta = await res.json();
+      created.push(meta);
+      // フォルダ名をタグとして付与（ネスト時は各階層）。
+      for (const dir of folderTagsOf(f)) {
+        const tagId = await ensureTag(dir);
+        if (!tagId) continue;
+        try {
+          await json(`/api/files/${meta.id}/tags`, { method: 'POST', body: { tag_id: tagId } });
+          tagged = true;
+        } catch (_) { /* タグ付け失敗は致命ではないので継続 */ }
+      }
+    } catch (_) { failed++; }
+  }
+
+  if (asSeries && created.length >= 1) {
+    try {
+      const series = await json('/api/series', { method: 'POST', body: { name: seriesName } });
+      for (let i = 0; i < created.length; i++) {
+        await json(`/api/series/${series.id}/members`, {
+          method: 'POST', body: { file_id: created[i].id, order_index: (i + 1) * 10 },
+        });
+      }
+    } catch (_) {
+      uiToast('シリーズへの登録に一部失敗しました', 'error');
+    }
+  }
+
+  btn.disabled = false;
+  btn.classList.remove('btn-disabled');
+
+  if (created.length === 0) {
+    resultEl.textContent = '';
+    uiToast('アップロードに失敗しました', 'error');
+    return;
+  }
+
+  clearFiles();
+  $('as-series').checked = false;
+  const seriesNote = asSeries ? `（シリーズ「${escapeHtml(seriesName)}」に登録）` : '';
+  const tagNote = tagged ? '（フォルダ名をタグとして付与）' : '';
+  const failNote = failed > 0 ? ` / ${failed} 件失敗` : '';
+  resultEl.innerHTML = `${created.length} 件アップロードしました${failNote} ${seriesNote}${tagNote} ` +
+    `<a class="link link-primary" href="/ui/files">ファイル一覧へ →</a>`;
+  uiToast(`${created.length} 件アップロードしました`, failed > 0 ? 'warning' : 'success');
 }
 
+setupUpload();
 init();
 </script>
 {% endblock %}

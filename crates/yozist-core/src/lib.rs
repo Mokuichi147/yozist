@@ -165,7 +165,7 @@ pub enum MatchMode {
     Any,
 }
 
-/// スマートフォルダ風の 1 条件。`field` / `op` / `value`（+ 日付の `unit`）の
+/// フィルターの 1 条件。`field` / `op` / `value`（+ 日付の `unit`）の
 /// フラットな文字列表現にして、フロントエンドとの相互運用と将来の属性追加を
 /// 容易にしている。解決は [`yozist_db::resolve_filter`] が行う。
 ///
