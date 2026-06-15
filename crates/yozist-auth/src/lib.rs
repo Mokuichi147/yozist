@@ -150,22 +150,6 @@ pub trait SmbCredentialSink: Send + Sync {
     async fn remove(&self, username: &str);
 }
 
-/// 保存クエリ（条件付き仮想ビュー）を、稼働中の SMB サーバへ「任意名のトップレベル
-/// share」として動的に公開・撤去するためのフック。
-///
-/// `smb://host/<任意の名前>/` で各クエリ結果へ直接アクセスできるよう、REST から
-/// クエリを作成・改名・削除したタイミングで本トレイト経由で稼働中 share を増減する。
-/// 実装は `yozist-smb` 側にある。SMB 無効時は API では `None`。失敗は内部でログに
-/// 記録し、REST 操作（DB 側の正）は中断しない。
-#[async_trait]
-pub trait SmbShareController: Send + Sync {
-    /// 保存クエリを top-level share として公開する。同名 share が既にあれば
-    /// 置き換える（条件のみ変更した更新でも安全に呼べる）。
-    async fn register(&self, query: &yozist_core::SavedQuery);
-    /// 指定名の保存クエリ share を撤去する。存在しなければ無視する。
-    async fn unregister(&self, name: &str);
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("invalid token")]

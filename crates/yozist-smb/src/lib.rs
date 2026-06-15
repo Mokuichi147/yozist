@@ -6,15 +6,17 @@
 //! - すべての操作は `yozist-versioning` / `yozist-db` の公開 API 経由
 //!
 //! # Share 一覧
-//! | share | 内容 |
-//! |-------|------|
-//! | `yozist` | 全仮想ビューへの単一エントリ（ハブ）。`HubBackend` |
-//! | `<任意の名前>` | 保存クエリ（条件付きパス）を任意名で公開する動的 share。`QueryShareBackend` + [`QueryShareRegistry`] |
-//! | `all` | 全ファイルをフラット |
-//! | `tags` | 階層パス = タグの AND 条件 |
-//! | `series` | 配下に `NNNN__name` 形式で順序付きメンバー |
-//! | `queries` | 全保存クエリを `queries\<名前>\` 配下にまとめて公開 |
-//! | `recent` | 直近 N 件（読取専用） (v2 TODO) |
+//! 公開 share は全仮想ビューへの単一エントリ `yozist`（[`HubBackend`]）のみ。
+//! 組込みビューと条件付きパスはすべてその配下に現れる:
+//!
+//! | パス | 内容 |
+//! |------|------|
+//! | `yozist\` | ルート。組込みビューと各条件付きパス（任意名）が並ぶ |
+//! | `yozist\all\` | 全ファイルをフラット |
+//! | `yozist\tags\…` | 階層パス = タグの AND 条件 |
+//! | `yozist\series\…` | 配下に `NNNN__name` 形式で順序付きメンバー |
+//! | `yozist\queries\<名前>\` | 全保存クエリをまとめて公開 |
+//! | `yozist\<任意の名前>\` | 条件付きパス（保存クエリ）の結果へ直接アクセス |
 //!
 //! # TODO
 //! - [ ] RecentBackend の本実装
@@ -35,13 +37,10 @@ use yozist_versioning::VersioningEngine;
 pub mod backends;
 pub mod credentials;
 pub mod handle;
-pub mod query_shares;
 pub use backends::{
-    AllBackend, HubBackend, QueriesBackend, QueryShareBackend, RecentBackend, SeriesBackend,
-    TagsBackend,
+    AllBackend, HubBackend, QueriesBackend, RecentBackend, SeriesBackend, TagsBackend,
 };
 pub use credentials::{SmbCredentialStore, SmbCredentialSync};
-pub use query_shares::QueryShareRegistry;
 
 /// 各 share 実装が共有する依存。
 #[derive(Clone)]
@@ -158,26 +157,20 @@ pub struct SmbConfig {
 }
 
 /// 公開する固定 share 名の一覧（すべて `AuthenticatedOnly`）。
-/// `yozist` は全仮想ビューを 1 つで辿れるハブ share。保存クエリは別途、任意名の
-/// トップレベル share として動的に追加される（[`QueryShareRegistry`]）。
-const SHARE_NAMES: [&str; 5] = ["yozist", "all", "tags", "series", "queries"];
+/// 公開 share は全仮想ビューへの単一エントリ `yozist` のみ。組込みビューと条件付き
+/// パスはすべて `yozist\<...>\`（例: `yozist\all\`、`yozist\<任意の名前>\`）に現れる。
+const SHARE_NAMES: [&str; 1] = ["yozist"];
 
-/// ビルド済み（未起動）の SMB サーバーと、REST 経路へ渡すハンドル群。
+/// ビルド済み（未起動）の SMB サーバーと、REST 認証経路へ渡す資格情報シンク。
 pub struct BuiltSmb {
     server: SmbServer,
     sync: Arc<SmbCredentialSync>,
-    shares: Arc<QueryShareRegistry>,
 }
 
 impl BuiltSmb {
     /// REST 認証ハンドラ（register / login / change_password）が利用する資格情報シンク。
     pub fn credential_sink(&self) -> Arc<dyn yozist_auth::SmbCredentialSink> {
         self.sync.clone()
-    }
-
-    /// REST のクエリ CRUD が利用する動的 share コントローラ。
-    pub fn share_controller(&self) -> Arc<dyn yozist_auth::SmbShareController> {
-        self.shares.clone()
     }
 
     /// listen アドレスへ bind し、シャットダウンまでサーブする。
@@ -204,39 +197,23 @@ impl BuiltSmb {
 /// 構築時に永続化済みの資格情報を稼働中テーブルへ復元するため、再起動後も
 /// 既存ユーザーはログイン無しで接続できる。
 pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<BuiltSmb, SmbError> {
+    // 公開する share は `yozist` ハブのみ。組込みビュー（all / tags / series /
+    // queries）と各条件付きパス（任意名）はすべて `yozist\<...>\` の配下に現れる。
     let server = SmbServer::builder()
         .listen(cfg.listen)
         .share(Share::new("yozist", HubBackend::new(deps.clone())))
-        .share(Share::new("all", AllBackend::new(deps.clone())))
-        .share(Share::new("tags", TagsBackend::new(deps.clone())))
-        .share(Share::new("series", SeriesBackend::new(deps.clone())))
-        .share(Share::new("queries", QueriesBackend::new(deps.clone())))
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 
-    // 動的なクエリ share を先に復元しておく。これにより後続の `sync.restore()` が
-    // `config.share_names()` を引いた際、復元ユーザーへクエリ share のアクセスも
-    // 併せて付与される。
-    let shares = Arc::new(QueryShareRegistry::new(
-        server.config_handle(),
-        deps.clone(),
-        SmbCredentialStore::new(pool.clone()),
-    ));
-    shares.restore().await;
-
-    let static_shares = SHARE_NAMES.iter().map(|s| s.to_string()).collect();
+    let shares = SHARE_NAMES.iter().map(|s| s.to_string()).collect();
     let sync = Arc::new(SmbCredentialSync::new(
         SmbCredentialStore::new(pool),
         server.config_handle(),
-        static_shares,
+        shares,
     ));
     sync.restore().await;
 
-    Ok(BuiltSmb {
-        server,
-        sync,
-        shares,
-    })
+    Ok(BuiltSmb { server, sync })
 }
 
 #[derive(Debug, thiserror::Error)]

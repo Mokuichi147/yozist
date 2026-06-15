@@ -299,19 +299,6 @@ impl ConfigHandle {
         Ok(())
     }
 
-    /// Names of all currently-registered shares (excludes the synthetic
-    /// `IPC$`). Lets callers grant a user access to every live share without
-    /// tracking a static list, which matters for dynamically added shares.
-    pub async fn share_names(&self) -> Vec<String> {
-        self.state
-            .shares
-            .all()
-            .await
-            .into_iter()
-            .map(|s| s.name.clone())
-            .collect()
-    }
-
     pub async fn add_share(&self, share: Share) -> Result<(), ConfigError> {
         validate_share_name(&share.name)?;
         let is_public = matches!(share.mode, ShareMode::Public | ShareMode::PublicReadOnly);

@@ -57,9 +57,6 @@ pub struct ApiState {
     /// SMB(NTLM) 資格情報の同期先。SMB 無効時は `None`。
     /// register / login / change_password 成功時に平文パスワードを渡して反映する。
     pub smb_creds: Option<Arc<dyn yozist_auth::SmbCredentialSink>>,
-    /// 保存クエリを任意名のトップレベル SMB share として動的に増減させる制御口。
-    /// SMB 無効時は `None`。クエリの作成 / 改名 / 削除に追従させる。
-    pub smb_shares: Option<Arc<dyn yozist_auth::SmbShareController>>,
     /// 展開済み content の小さなキャッシュ。blob はファイル全体が 1 つの zstd
     /// として保存されるため、Range リクエストのたびに全体を展開すると巨大ファイルの
     /// 仮想スクロールが破綻する。直近に読んだ 1 ファイル分を保持し、同一コミットへの
@@ -1767,10 +1764,7 @@ async fn create_saved_query(
     };
     let id = s.meta.upsert_saved_query(&q).await.map_err(ApiError::from_db)?;
     let saved = SavedQuery { id, ..q };
-    // SMB の任意名 share を発行する（smb://host/<name>/）。
-    if let Some(ctrl) = &s.smb_shares {
-        ctrl.register(&saved).await;
-    }
+    // SMB ハブ share（yozist\<name>\）には DB を即時反映するため追加処理は不要。
     audit_event(
         &s,
         &ctx,
@@ -1837,13 +1831,8 @@ async fn update_saved_query(
         .await
         .map_err(ApiError::from_db)?;
 
-    // SMB share を追従させる。改名時は旧 share を撤去してから再発行。
-    if let Some(ctrl) = &s.smb_shares {
-        if !new_name.eq_ignore_ascii_case(&old_name) {
-            ctrl.unregister(&old_name).await;
-        }
-        ctrl.register(&updated).await;
-    }
+    // SMB ハブ share（yozist\<name>\）は DB を都度引くため、改名・条件変更は
+    // 次回アクセス時に自動で反映される（再登録などの追加処理は不要）。
     audit_event(
         &s,
         &ctx,
@@ -1894,10 +1883,7 @@ async fn delete_saved_query(
         .delete_saved_query(&qid)
         .await
         .map_err(ApiError::from_db);
-    // DB 削除に成功したら SMB の任意名 share も撤去する。
-    if let (true, Some(ctrl)) = (res.is_ok(), &s.smb_shares) {
-        ctrl.unregister(&existing.name).await;
-    }
+    // SMB ハブ share（yozist\<name>\）からは DB 削除と同時に消える。
     audit_event(
         &s,
         &ctx,
@@ -2954,7 +2940,6 @@ mod tests {
                 audit,
                 share_admin,
                 smb_creds: None,
-                smb_shares: None,
                 content_cache: Arc::new(ContentCache::default()),
             },
             dir,

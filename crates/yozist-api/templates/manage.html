@@ -21,10 +21,11 @@
         <button class="btn btn-xs" onclick="createQuery()">+ 新規</button>
       </div>
       <p class="text-xs opacity-60 mb-2 leading-relaxed">
-        タグの AND / NOT 条件にマッチするファイル群へ、任意の名前を付けて
-        <span class="font-mono">smb://&lt;サーバ&gt;/&lt;名前&gt;/</span> で直接アクセスできます。
-        名前と条件は作成したユーザーがいつでも変更できます。1 つの入口から全ビューを辿るなら
-        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/</span> に接続してください。
+        タグの AND / NOT 条件にマッチするファイル群へ任意の名前を付けて、
+        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/&lt;名前&gt;/</span> で直接アクセスできます。
+        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/</span> に接続すれば、全ての条件付きパスと
+        組込みビュー (all / tags / series / queries) を 1 か所から辿れます。
+        名前と条件は作成したユーザーがいつでも変更できます。
       </p>
       <div id="query-list" class="text-sm space-y-1">…</div>
     </div>
@@ -194,7 +195,7 @@ async function loadQueries() {
       const cond = [];
       if (q.query.tags_and && q.query.tags_and.length) cond.push('AND: ' + q.query.tags_and.join(', '));
       if (q.query.tags_not && q.query.tags_not.length) cond.push('NOT: ' + q.query.tags_not.join(', '));
-      const path = `smb://&lt;サーバ&gt;/${escapeHtml(q.name)}/`;
+      const path = `smb://&lt;サーバ&gt;/yozist/${escapeHtml(q.name)}/`;
       const mine = canEditQuery(q);
       const editBtns = mine ? `
           <button class="btn btn-xs" onclick="editQuery('${q.id}')">編集</button>

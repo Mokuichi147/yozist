@@ -1768,61 +1768,6 @@ fn strip_first(path: &SmbPath) -> SmbResult<SmbPath> {
     Ok(out)
 }
 
-/// `SmbPath` の先頭へコンポーネントを 1 つ足した絶対パスを作る（share 化した
-/// クエリ名を `QueriesBackend` の先頭要素に補う）。
-fn prepend(first: &str, path: &SmbPath) -> SmbResult<SmbPath> {
-    let mut out = SmbPath::root().join(first)?;
-    for c in path.components() {
-        out = out.join(c)?;
-    }
-    Ok(out)
-}
-
-/// 単一の保存クエリを「任意名のトップレベル share」として公開する読取専用ビュー。
-///
-/// `smb://host/<クエリ名>/` で直接そのクエリ結果のファイル一覧へアクセスでき、
-/// `smb://host/<クエリ名>/<file>` でファイルを開ける。条件解決は `QueriesBackend`
-/// に委譲し、内部でパス先頭にクエリ名を補って再利用する。クエリ名（= share 名）と
-/// 条件は REST 側で随時更新でき、本バックエンドは開く度に DB を引くため常に最新。
-pub struct QueryShareBackend {
-    inner: QueriesBackend,
-    query_name: String,
-}
-
-impl QueryShareBackend {
-    pub fn new(deps: ShareDeps, query_name: impl Into<String>) -> Self {
-        Self {
-            inner: QueriesBackend::new(deps),
-            query_name: query_name.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl ShareBackend for QueryShareBackend {
-    async fn open(
-        &self,
-        identity: &Identity,
-        path: &SmbPath,
-        opts: OpenOptions,
-    ) -> SmbResult<Box<dyn Handle>> {
-        let inner_path = prepend(&self.query_name, path)?;
-        self.inner.open(identity, &inner_path, opts).await
-    }
-    async fn unlink(&self, _id: &Identity, _p: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::AccessDenied)
-    }
-    async fn rename(&self, _id: &Identity, _f: &SmbPath, _t: &SmbPath) -> SmbResult<()> {
-        Err(SmbError::AccessDenied)
-    }
-    fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            is_read_only: true,
-            case_sensitive: false,
-        }
-    }
-}
-
 /// 全仮想ビューへの単一エントリ share（既定名 `yozist`）。
 ///
 /// `smb://host/yozist/` のルートに、組込みビュー（`all` / `tags` / `series` /
@@ -2774,7 +2719,7 @@ mod all_backend_tests {
         assert_eq!(live_pics, 1, "pic.jpg が複数生成されている（新規作成の量産）");
     }
 
-    // ---- HubBackend / QueryShareBackend -------------------------------------
+    // ---- HubBackend ---------------------------------------------------------
 
     /// 保存クエリを 1 件作るヘルパ（条件なし = 全件）。
     async fn seed_query(deps: &ShareDeps, name: &str) -> yozist_core::SavedQueryId {
@@ -2831,10 +2776,9 @@ mod all_backend_tests {
         assert_eq!(names.iter().filter(|n| n.as_str() == "all").count(), 1);
     }
 
-    /// hub から保存クエリ名で辿るとそのクエリ結果のファイルが見える。
-    /// 同じ並びが QueryShareBackend（任意名 share）のルートにも出る。
+    /// hub から `yozist\<クエリ名>\` を辿るとそのクエリ結果のファイルが見える。
     #[tokio::test]
-    async fn hub_and_query_share_resolve_query_files() {
+    async fn hub_resolves_query_files() {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
@@ -2855,15 +2799,6 @@ mod all_backend_tests {
         let dir = hub.open(&id, &p("mydocs"), OpenOptions::default()).await.unwrap();
         let names = names_of(&dir.list_dir(None).await.unwrap());
         assert!(names.iter().any(|n| n == &canonical), "hub: {names:?}");
-
-        // 任意名 share: \ (ルート) に同じ結果が出る。
-        let share = QueryShareBackend::new(deps.clone(), "mydocs");
-        let sroot = share
-            .open(&id, &SmbPath::root(), OpenOptions::default())
-            .await
-            .unwrap();
-        let snames = names_of(&sroot.list_dir(None).await.unwrap());
-        assert!(snames.iter().any(|n| n == &canonical), "share: {snames:?}");
     }
 
     /// hub の \all\ は AllBackend へ委譲し全ファイルがフラットに出る。
@@ -2883,15 +2818,16 @@ mod all_backend_tests {
         assert!(names.iter().any(|n| n == &canonical), "{names:?}");
     }
 
-    /// 任意名 share は読取専用（書込み系は AccessDenied）。
+    /// hub 配下のクエリ（読取専用ビュー）への書込み系は拒否される。
     #[tokio::test]
-    async fn query_share_is_read_only() {
+    async fn hub_query_is_read_only() {
         let (deps, _dir) = test_deps().await;
         let id = user_identity("anon");
-        let share = QueryShareBackend::new(deps.clone(), "q");
-        assert!(share.capabilities().is_read_only);
+        seed_query(&deps, "ro").await;
+        let hub = HubBackend::new(deps.clone());
+        // クエリ配下のファイル削除は AccessDenied（QueriesBackend が拒否）。
         assert!(matches!(
-            share.unlink(&id, &p("x")).await,
+            hub.unlink(&id, &p("ro/whatever")).await,
             Err(SmbError::AccessDenied)
         ));
     }
