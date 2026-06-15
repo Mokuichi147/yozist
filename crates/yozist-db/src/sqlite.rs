@@ -643,7 +643,8 @@ impl MetaStore for SqliteMetaStore {
             r#"INSERT INTO saved_queries
                (id, name, query_json, description, created_by, created_at, expires_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET
+               ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
                  query_json = excluded.query_json,
                  description = excluded.description,
                  expires_at = excluded.expires_at"#,
@@ -992,5 +993,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.0, 0);
+    }
+
+    /// upsert_saved_query は同一 id での更新（改名・条件変更）を許す。
+    /// （ON CONFLICT(id) になっていないと id の PK 衝突で失敗する回帰）
+    #[tokio::test]
+    async fn upsert_saved_query_updates_in_place_and_renames() {
+        let s = store().await;
+        let q = SavedQuery {
+            id: SavedQueryId::new(),
+            name: "仕事メモ".into(),
+            query: QueryDef {
+                tags_and: vec!["仕事".into()],
+                tags_not: vec!["下書き".into()],
+            },
+            description: Some("初版".into()),
+            created_by: None,
+            created_at: OffsetDateTime::now_utc(),
+            expires_at: None,
+        };
+        s.upsert_saved_query(&q).await.unwrap();
+
+        // 同一 id で改名 + 条件変更 + 説明クリア。
+        let updated = SavedQuery {
+            name: "重要メモ".into(),
+            query: QueryDef {
+                tags_and: vec!["仕事".into()],
+                tags_not: vec![],
+            },
+            description: None,
+            ..q.clone()
+        };
+        s.upsert_saved_query(&updated).await.unwrap();
+
+        // 行は増えず（1 件）、内容が更新されている。
+        let all = s.list_saved_queries().await.unwrap();
+        assert_eq!(all.len(), 1, "更新で行が増えた");
+        let got = s.get_saved_query(&q.id).await.unwrap().unwrap();
+        assert_eq!(got.name, "重要メモ");
+        assert_eq!(got.query.tags_and, vec!["仕事".to_string()]);
+        assert!(got.query.tags_not.is_empty());
+        assert_eq!(got.description, None);
+        // 旧名では引けない。
+        assert!(s.get_saved_query_by_name("仕事メモ").await.unwrap().is_none());
     }
 }
