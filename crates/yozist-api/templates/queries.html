@@ -57,7 +57,11 @@
   <form method="dialog" class="modal-backdrop"><button>close</button></form>
 </dialog>
 
-<datalist id="tag-options"></datalist>
+<!-- タグ候補は種別ごとに分ける（手動タグなら手動タグのみを補完） -->
+<datalist id="tag-options-manual"></datalist>
+<datalist id="tag-options-system"></datalist>
+<datalist id="tag-options-ai"></datalist>
+<datalist id="tag-options-all"></datalist>
 <datalist id="series-options"></datalist>
 {% endblock %}
 
@@ -164,10 +168,23 @@ async function loadQueries() {
   } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
+// 属性（タグ種別）→ 参照するタグ候補 datalist の対応。
+const TAG_DATALIST = {
+  manual_tag: 'tag-options-manual',
+  system_tag: 'tag-options-system',
+  ai_tag: 'tag-options-ai',
+  tag: 'tag-options-all',
+};
+
 async function loadTagOptions() {
   try {
     const tags = await json('/api/tags');
-    $('tag-options').innerHTML = tags.map(t => `<option value="${escapeHtml(t.name)}"></option>`).join('');
+    const opt = ts => ts.map(t => `<option value="${escapeHtml(t.name)}"></option>`).join('');
+    // 種別ごとに候補を振り分け、種別不問用には全件を入れる。
+    $('tag-options-manual').innerHTML = opt(tags.filter(t => t.kind === 'manual'));
+    $('tag-options-system').innerHTML = opt(tags.filter(t => t.kind === 'system'));
+    $('tag-options-ai').innerHTML = opt(tags.filter(t => t.kind === 'ai'));
+    $('tag-options-all').innerHTML = opt(tags);
   } catch (e) { /* 候補なしでも手入力できる */ }
 }
 async function loadSeriesOptions() {
@@ -190,11 +207,12 @@ function opOptions(type, op) {
   return opts.map(([v, l]) => `<option value="${v}"${v === op ? ' selected' : ''}>${l}</option>`).join('');
 }
 
-function renderControls(type, op, value, unit) {
+function renderControls(type, op, value, unit, field) {
   const opSel = `<select class="q-op select select-bordered select-sm">${opOptions(type, op)}</select>`;
   const v = escapeHtml(value || '');
   if (type === 'tag') {
-    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="tag-options" placeholder="タグ名" value="${v}" />`;
+    const list = TAG_DATALIST[field] || 'tag-options-all';
+    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="${list}" placeholder="タグ名" value="${v}" />`;
   }
   if (type === 'series') {
     return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />`;
@@ -225,11 +243,11 @@ function makeRow(c) {
     <button type="button" class="btn btn-sm btn-square q-add" title="条件を追加">＋</button>`;
   const fieldSel = row.querySelector('.q-field');
   fieldSel.value = c.field;
-  row.querySelector('.q-controls').innerHTML = renderControls(type, c.op, c.value, c.unit);
-  // 属性変更時は演算子・値コントロールを作り直す。
+  row.querySelector('.q-controls').innerHTML = renderControls(type, c.op, c.value, c.unit, c.field);
+  // 属性変更時は演算子・値コントロール（タグ候補の参照先含む）を作り直す。
   fieldSel.onchange = () => {
     const t = FIELD_TYPE[fieldSel.value] || 'tag';
-    row.querySelector('.q-controls').innerHTML = renderControls(t, null, '', null);
+    row.querySelector('.q-controls').innerHTML = renderControls(t, null, '', null, fieldSel.value);
   };
   row.querySelector('.q-add').onclick = () => { $('q-rows').appendChild(makeRow()); };
   row.querySelector('.q-del').onclick = () => {
