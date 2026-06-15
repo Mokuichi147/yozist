@@ -57,6 +57,9 @@ pub struct ApiState {
     /// SMB(NTLM) 資格情報の同期先。SMB 無効時は `None`。
     /// register / login / change_password 成功時に平文パスワードを渡して反映する。
     pub smb_creds: Option<Arc<dyn yozist_auth::SmbCredentialSink>>,
+    /// 保存クエリを任意名のトップレベル SMB share として動的に増減させる制御口。
+    /// SMB 無効時は `None`。クエリの作成 / 改名 / 削除に追従させる。
+    pub smb_shares: Option<Arc<dyn yozist_auth::SmbShareController>>,
     /// 展開済み content の小さなキャッシュ。blob はファイル全体が 1 つの zstd
     /// として保存されるため、Range リクエストのたびに全体を展開すると巨大ファイルの
     /// 仮想スクロールが破綻する。直近に読んだ 1 ファイル分を保持し、同一コミットへの
@@ -137,7 +140,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/queries", get(list_saved_queries).post(create_saved_query))
         .route(
             "/api/queries/:id",
-            get(get_saved_query).delete(delete_saved_query),
+            get(get_saved_query)
+                .patch(update_saved_query)
+                .delete(delete_saved_query),
         )
         .route("/api/queries/:id/files", get(query_files))
         .route("/api/files/:id/share", post(issue_file_share))
@@ -1653,6 +1658,70 @@ struct CreateQueryInput {
     expires_in_secs: Option<i64>,
 }
 
+/// クエリ更新入力。指定したフィールドのみ差し替える（`None` は据え置き）。
+/// `name` を変えると SMB の任意名 share も改名される。
+#[derive(Deserialize)]
+struct UpdateQueryInput {
+    name: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    description: Option<Option<String>>,
+    tags_and: Option<Vec<String>>,
+    tags_not: Option<Vec<String>>,
+}
+
+/// `Option<Option<T>>` を JSON の「キー欠落=据え置き / null=クリア」に対応させる。
+fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(de)?))
+}
+
+/// 文字列を JSON 文字列リテラル（前後のダブルクォート込み）へエスケープする。
+/// 監査ログの metadata_json 組み立て用。
+fn json_str(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// SMB の任意名 share / hub のルーティングに使えない名前を弾く。
+/// - 空 / 前後空白のみ
+/// - hub の組込みビュー名（all / tags / series / queries）と hub 名（yozist）
+/// - SMB share / パスで問題になる文字（`\\ / : * ? " < > |` と制御文字）
+fn validate_query_name(name: &str) -> Result<String, ApiError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::BadRequest("クエリ名を入力してください".into()));
+    }
+    if trimmed.len() > 80 {
+        return Err(ApiError::BadRequest("クエリ名が長すぎます（80文字以内）".into()));
+    }
+    const RESERVED: [&str; 6] = ["all", "tags", "series", "queries", "yozist", "ipc$"];
+    if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(trimmed)) {
+        return Err(ApiError::BadRequest(format!(
+            "「{trimmed}」は予約名のため使用できません"
+        )));
+    }
+    if trimmed.chars().any(|c| {
+        matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
+    }) {
+        return Err(ApiError::BadRequest(
+            r#"クエリ名に使えない文字が含まれています（\ / : * ? " < > | や制御文字）"#.into(),
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 編集・削除はクエリ作成者のみに許可する（作成者不明の旧データは認証ユーザーへ開放）。
+fn require_query_owner(ctx: &AuthContext, q: &SavedQuery) -> Result<(), ApiError> {
+    match (&q.created_by, ctx) {
+        (Some(owner), AuthContext::User { user, .. }) if *owner == user.id => Ok(()),
+        (None, AuthContext::User { .. }) => Ok(()),
+        (_, AuthContext::System) => Ok(()),
+        _ => Err(ApiError::Forbidden),
+    }
+}
+
 async fn list_saved_queries(
     State(s): State<ApiState>,
 ) -> Result<Json<Vec<SavedQuery>>, ApiError> {
@@ -1666,6 +1735,16 @@ async fn create_saved_query(
     Json(input): Json<CreateQueryInput>,
 ) -> Result<(StatusCode, Json<SavedQuery>), ApiError> {
     require_authenticated(&ctx).await?;
+    let name = validate_query_name(&input.name)?;
+    // 同名の既存クエリは share 名が衝突するため拒否する。
+    if s.meta
+        .get_saved_query_by_name(&name)
+        .await
+        .map_err(ApiError::from_db)?
+        .is_some()
+    {
+        return Err(ApiError::Conflict);
+    }
     let now = time::OffsetDateTime::now_utc();
     let created_by = match &ctx {
         AuthContext::User { user, .. } => Some(user.id),
@@ -1676,7 +1755,7 @@ async fn create_saved_query(
         .map(|s| now + time::Duration::seconds(s));
     let q = SavedQuery {
         id: SavedQueryId::new(),
-        name: input.name,
+        name,
         query: QueryDef {
             tags_and: input.tags_and,
             tags_not: input.tags_not,
@@ -1688,7 +1767,94 @@ async fn create_saved_query(
     };
     let id = s.meta.upsert_saved_query(&q).await.map_err(ApiError::from_db)?;
     let saved = SavedQuery { id, ..q };
+    // SMB の任意名 share を発行する（smb://host/<name>/）。
+    if let Some(ctrl) = &s.smb_shares {
+        ctrl.register(&saved).await;
+    }
+    audit_event(
+        &s,
+        &ctx,
+        "create_saved_query",
+        Some("query"),
+        Some(&saved.id.to_string()),
+        Some(&format!("{{\"name\":{}}}", json_str(&saved.name))),
+        &Ok::<(), String>(()),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(saved)))
+}
+
+async fn update_saved_query(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateQueryInput>,
+) -> Result<Json<SavedQuery>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let qid = uuid::Uuid::parse_str(&id)
+        .map(SavedQueryId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+    let existing = s
+        .meta
+        .get_saved_query(&qid)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    require_query_owner(&ctx, &existing)?;
+
+    let old_name = existing.name.clone();
+    let new_name = match &input.name {
+        Some(n) => validate_query_name(n)?,
+        None => old_name.clone(),
+    };
+    // 改名先が他のクエリと衝突しないこと（share 名の一意性）。
+    if !new_name.eq_ignore_ascii_case(&old_name) {
+        let clash = s
+            .meta
+            .get_saved_query_by_name(&new_name)
+            .await
+            .map_err(ApiError::from_db)?
+            .is_some_and(|other| other.id != existing.id);
+        if clash {
+            return Err(ApiError::Conflict);
+        }
+    }
+
+    let updated = SavedQuery {
+        id: existing.id,
+        name: new_name.clone(),
+        query: QueryDef {
+            tags_and: input.tags_and.unwrap_or(existing.query.tags_and),
+            tags_not: input.tags_not.unwrap_or(existing.query.tags_not),
+        },
+        description: input.description.unwrap_or(existing.description),
+        created_by: existing.created_by,
+        created_at: existing.created_at,
+        expires_at: existing.expires_at,
+    };
+    s.meta
+        .upsert_saved_query(&updated)
+        .await
+        .map_err(ApiError::from_db)?;
+
+    // SMB share を追従させる。改名時は旧 share を撤去してから再発行。
+    if let Some(ctrl) = &s.smb_shares {
+        if !new_name.eq_ignore_ascii_case(&old_name) {
+            ctrl.unregister(&old_name).await;
+        }
+        ctrl.register(&updated).await;
+    }
+    audit_event(
+        &s,
+        &ctx,
+        "update_saved_query",
+        Some("query"),
+        Some(&id),
+        Some(&format!("{{\"name\":{}}}", json_str(&new_name))),
+        &Ok::<(), String>(()),
+    )
+    .await;
+    Ok(Json(updated))
 }
 
 async fn get_saved_query(
@@ -1716,11 +1882,22 @@ async fn delete_saved_query(
     let qid = uuid::Uuid::parse_str(&id)
         .map(SavedQueryId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+    let existing = s
+        .meta
+        .get_saved_query(&qid)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    require_query_owner(&ctx, &existing)?;
     let res = s
         .meta
         .delete_saved_query(&qid)
         .await
         .map_err(ApiError::from_db);
+    // DB 削除に成功したら SMB の任意名 share も撤去する。
+    if let (true, Some(ctrl)) = (res.is_ok(), &s.smb_shares) {
+        ctrl.unregister(&existing.name).await;
+    }
     audit_event(
         &s,
         &ctx,
@@ -2777,6 +2954,7 @@ mod tests {
                 audit,
                 share_admin,
                 smb_creds: None,
+                smb_shares: None,
                 content_cache: Arc::new(ContentCache::default()),
             },
             dir,

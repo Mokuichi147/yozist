@@ -8,16 +8,20 @@
 //! # Share 一覧
 //! | share | 内容 |
 //! |-------|------|
-//! | `all` | 全ファイルをフラット (v1) |
-//! | `tags` | 階層パス = タグの AND 条件 (v2 TODO) |
-//! | `series` | 配下に `NNNN__name` 形式で順序付きメンバー (v2 TODO) |
+//! | `yozist` | 全仮想ビューへの単一エントリ（ハブ）。`HubBackend` |
+//! | `<任意の名前>` | 保存クエリ（条件付きパス）を任意名で公開する動的 share。`QueryShareBackend` + [`QueryShareRegistry`] |
+//! | `all` | 全ファイルをフラット |
+//! | `tags` | 階層パス = タグの AND 条件 |
+//! | `series` | 配下に `NNNN__name` 形式で順序付きメンバー |
+//! | `queries` | 全保存クエリを `queries\<名前>\` 配下にまとめて公開 |
 //! | `recent` | 直近 N 件（読取専用） (v2 TODO) |
 //!
 //! # TODO
-//! - [ ] TagsBackend / SeriesBackend / RecentBackend の本実装
-//! - [ ] `AuthContext` を SMB セッションから抽出するアダプタ
+//! - [ ] RecentBackend の本実装
 //! - [ ] SMB Change Notify による他クライアントへの即時反映
 //! - [ ] truncate / set_times の完全対応
+//! - [ ] `smb://host`（share 名なし）での share 列挙（srvsvc NetrShareEnum）。
+//!       現状は `yozist` ハブ share へ接続して全ビューを辿る運用で代替している。
 
 use smb_server::{Share, SmbServer};
 use sqlx::SqlitePool;
@@ -31,8 +35,13 @@ use yozist_versioning::VersioningEngine;
 pub mod backends;
 pub mod credentials;
 pub mod handle;
-pub use backends::{AllBackend, QueriesBackend, RecentBackend, SeriesBackend, TagsBackend};
+pub mod query_shares;
+pub use backends::{
+    AllBackend, HubBackend, QueriesBackend, QueryShareBackend, RecentBackend, SeriesBackend,
+    TagsBackend,
+};
 pub use credentials::{SmbCredentialStore, SmbCredentialSync};
+pub use query_shares::QueryShareRegistry;
 
 /// 各 share 実装が共有する依存。
 #[derive(Clone)]
@@ -148,19 +157,27 @@ pub struct SmbConfig {
     pub listen: std::net::SocketAddr,
 }
 
-/// 公開する share 名の一覧（すべて `AuthenticatedOnly`）。
-const SHARE_NAMES: [&str; 4] = ["all", "tags", "series", "queries"];
+/// 公開する固定 share 名の一覧（すべて `AuthenticatedOnly`）。
+/// `yozist` は全仮想ビューを 1 つで辿れるハブ share。保存クエリは別途、任意名の
+/// トップレベル share として動的に追加される（[`QueryShareRegistry`]）。
+const SHARE_NAMES: [&str; 5] = ["yozist", "all", "tags", "series", "queries"];
 
-/// ビルド済み（未起動）の SMB サーバーと、REST 認証経路へ渡す資格情報シンク。
+/// ビルド済み（未起動）の SMB サーバーと、REST 経路へ渡すハンドル群。
 pub struct BuiltSmb {
     server: SmbServer,
     sync: Arc<SmbCredentialSync>,
+    shares: Arc<QueryShareRegistry>,
 }
 
 impl BuiltSmb {
     /// REST 認証ハンドラ（register / login / change_password）が利用する資格情報シンク。
     pub fn credential_sink(&self) -> Arc<dyn yozist_auth::SmbCredentialSink> {
         self.sync.clone()
+    }
+
+    /// REST のクエリ CRUD が利用する動的 share コントローラ。
+    pub fn share_controller(&self) -> Arc<dyn yozist_auth::SmbShareController> {
+        self.shares.clone()
     }
 
     /// listen アドレスへ bind し、シャットダウンまでサーブする。
@@ -189,6 +206,7 @@ impl BuiltSmb {
 pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<BuiltSmb, SmbError> {
     let server = SmbServer::builder()
         .listen(cfg.listen)
+        .share(Share::new("yozist", HubBackend::new(deps.clone())))
         .share(Share::new("all", AllBackend::new(deps.clone())))
         .share(Share::new("tags", TagsBackend::new(deps.clone())))
         .share(Share::new("series", SeriesBackend::new(deps.clone())))
@@ -196,15 +214,29 @@ pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 
-    let shares = SHARE_NAMES.iter().map(|s| s.to_string()).collect();
+    // 動的なクエリ share を先に復元しておく。これにより後続の `sync.restore()` が
+    // `config.share_names()` を引いた際、復元ユーザーへクエリ share のアクセスも
+    // 併せて付与される。
+    let shares = Arc::new(QueryShareRegistry::new(
+        server.config_handle(),
+        deps.clone(),
+        SmbCredentialStore::new(pool.clone()),
+    ));
+    shares.restore().await;
+
+    let static_shares = SHARE_NAMES.iter().map(|s| s.to_string()).collect();
     let sync = Arc::new(SmbCredentialSync::new(
         SmbCredentialStore::new(pool),
         server.config_handle(),
-        shares,
+        static_shares,
     ));
     sync.restore().await;
 
-    Ok(BuiltSmb { server, sync })
+    Ok(BuiltSmb {
+        server,
+        sync,
+        shares,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]

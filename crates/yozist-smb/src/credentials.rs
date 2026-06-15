@@ -88,12 +88,22 @@ impl SmbCredentialSync {
     }
 
     /// 稼働中のユーザーテーブルへ creds を登録し、全 share に ReadWrite を付与する。
+    ///
+    /// 付与先は「稼働中の全 share」（静的 share に加え、保存クエリから動的に追加
+    /// された任意名 share も含む）。`config.share_names()` を都度引くことで、後から
+    /// 増えたクエリ share へも新規/復元ユーザーが自動的にアクセスできる。
     async fn apply_to_running(&self, username: &str, creds: UserCreds) {
         if let Err(e) = self.config.add_user_creds(username, creds).await {
             tracing::warn!(user = %username, error = %e, "registering SMB user failed");
             return;
         }
-        for share in &self.shares {
+        let mut shares = self.config.share_names().await;
+        for s in &self.shares {
+            if !shares.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+                shares.push(s.clone());
+            }
+        }
+        for share in &shares {
             if let Err(e) = self
                 .config
                 .grant_share_user(share, username, Access::ReadWrite)

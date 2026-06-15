@@ -146,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(yozist_smb::build(SmbConfig { listen: smb_addr }, deps, pool.clone()).await?)
             };
             let smb_creds = smb_built.as_ref().map(|b| b.credential_sink());
+            let smb_shares = smb_built.as_ref().map(|b| b.share_controller());
 
             let state = ApiState {
                 meta: meta.clone(),
@@ -156,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
                 audit: audit.clone(),
                 share_admin,
                 smb_creds,
+                smb_shares,
                 content_cache: std::sync::Arc::new(yozist_api::ContentCache::default()),
             };
             let app = yozist_api::router(state);
