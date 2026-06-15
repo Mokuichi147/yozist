@@ -44,6 +44,7 @@
           <span class="opacity-70">の条件に一致するファイル</span>
         </div>
         <div id="q-rows" class="space-y-2"></div>
+        <button type="button" id="q-add-row" class="btn btn-xs btn-ghost mt-2">＋ 条件を追加</button>
       </div>
     </div>
 
@@ -204,39 +205,38 @@ function opOptions(type, op) {
 }
 
 function renderControls(type, op, value, unit, field) {
-  const opSel = `<select class="q-op select select-bordered select-sm">${opOptions(type, op)}</select>`;
   const v = escapeHtml(value || '');
+  const opSel = w => `<select class="q-op select select-bordered select-sm ${w} shrink-0">${opOptions(type, op)}</select>`;
   if (type === 'tag') {
     const list = TAG_DATALIST[field] || 'tag-options-all';
-    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="${list}" placeholder="タグ名" value="${v}" />`;
+    return `${opSel('w-32')}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="${list}" placeholder="タグ名" value="${v}" />`;
   }
   if (type === 'series') {
-    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />`;
+    return `${opSel('w-32')}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />`;
   }
   if (type === 'mime') {
     const opts = MIME_PRESETS.map(([val, lbl]) => `<option value="${val}"${val === value ? ' selected' : ''}>${lbl}</option>`).join('');
-    return `${opSel}<select class="q-val select select-bordered select-sm flex-1 min-w-0">${opts}</select>`;
+    return `${opSel('w-32')}<select class="q-val select select-bordered select-sm flex-1 min-w-0">${opts}</select>`;
   }
   if (type === 'text') {
-    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" placeholder="文字列" value="${v}" />`;
+    return `${opSel('w-32')}<input class="q-val input input-bordered input-sm flex-1 min-w-0" placeholder="文字列" value="${v}" />`;
   }
   // date: [数値][単位][演算子]
   const units = [['day', '日'], ['month', 'か月'], ['year', '年']]
     .map(([val, lbl]) => `<option value="${val}"${val === (unit || 'day') ? ' selected' : ''}>${lbl}</option>`).join('');
-  return `<input type="number" min="0" class="q-val input input-bordered input-sm w-20" value="${v || '1'}" />
-    <select class="q-unit select select-bordered select-sm">${units}</select>${opSel}`;
+  return `<input type="number" min="0" class="q-val input input-bordered input-sm w-20 shrink-0" value="${v || '1'}" />
+    <select class="q-unit select select-bordered select-sm w-24 shrink-0">${units}</select>${opSel('w-28')}`;
 }
 
 function makeRow(c) {
   c = c || { field: 'manual_tag', op: 'include', value: '', unit: null };
   const type = FIELD_TYPE[c.field] || 'tag';
   const row = document.createElement('div');
-  row.className = 'q-row flex flex-wrap items-center gap-2';
+  row.className = 'q-row flex items-center gap-2';
   row.innerHTML = `
-    <select class="q-field select select-bordered select-sm">${FIELD_OPTIONS}</select>
-    <span class="q-controls flex flex-wrap items-center gap-2 flex-1 min-w-0"></span>
-    <button type="button" class="btn btn-sm btn-square q-del" title="この条件を削除">−</button>
-    <button type="button" class="btn btn-sm btn-square q-add" title="条件を追加">＋</button>`;
+    <select class="q-field select select-bordered select-sm w-48 shrink-0">${FIELD_OPTIONS}</select>
+    <span class="q-controls flex items-center gap-2 flex-1 min-w-0"></span>
+    <button type="button" class="btn btn-sm btn-square btn-ghost q-del shrink-0" title="この条件を削除">−</button>`;
   const fieldSel = row.querySelector('.q-field');
   fieldSel.value = c.field;
   row.querySelector('.q-controls').innerHTML = renderControls(type, c.op, c.value, c.unit, c.field);
@@ -245,7 +245,6 @@ function makeRow(c) {
     const t = FIELD_TYPE[fieldSel.value] || 'tag';
     row.querySelector('.q-controls').innerHTML = renderControls(t, null, '', null, fieldSel.value);
   };
-  row.querySelector('.q-add').onclick = () => { $('q-rows').appendChild(makeRow()); };
   row.querySelector('.q-del').onclick = () => {
     const rows = $('q-rows');
     if (rows.children.length > 1) row.remove();
@@ -351,6 +350,7 @@ async function shareQuery(id, name) {
   } catch (e) { uiToast('共有URL発行に失敗しました: ' + e.message, 'error'); }
 }
 
+$('q-add-row').onclick = () => $('q-rows').appendChild(makeRow());
 $('q-cancel').onclick = () => $('q-modal').close();
 $('q-save').onclick = saveQuery;
 init();
