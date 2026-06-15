@@ -1566,11 +1566,11 @@ impl ShareBackend for SeriesBackend {
     }
 }
 
-/// フィルタ（条件付き仮想ビュー）を SMB に公開する読取専用バックエンド。
+/// フィルター（条件付き仮想ビュー）を SMB に公開する読取専用バックエンド。
 ///
 /// パス例:
 /// - `\` → 全 filter を subdir として表示
-/// - `\<filter-name>\` → そのフィルタで絞り込まれたファイル一覧
+/// - `\<filter-name>\` → そのフィルターで絞り込まれたファイル一覧
 pub struct FiltersBackend {
     deps: ShareDeps,
 }
@@ -1724,7 +1724,7 @@ fn strip_first(path: &SmbPath) -> SmbResult<SmbPath> {
 /// だけで全ビューを辿れるようにするためのハブ。
 ///
 /// ルーティング: 先頭要素が組込みビュー名なら各バックエンドへ先頭要素を剥がして
-/// 委譲する。それ以外は存在しない（`PathNotFound`）。フィルタは
+/// 委譲する。それ以外は存在しない（`PathNotFound`）。フィルターは
 /// `filters\<任意の名前>\` 配下からアクセスする。
 pub struct HubBackend {
     all: AllBackend,
@@ -1733,7 +1733,7 @@ pub struct HubBackend {
     queries: FiltersBackend,
 }
 
-/// hub のルートに常設する組込みビュー名。`filters` 配下に各フィルタが
+/// hub のルートに常設する組込みビュー名。`filters` 配下に各フィルターが
 /// 並ぶ。
 pub const HUB_BUILTINS: [&str; 4] = ["all", "tags", "series", "filters"];
 
@@ -2657,7 +2657,7 @@ mod all_backend_tests {
 
     // ---- HubBackend ---------------------------------------------------------
 
-    /// フィルタを 1 件作るヘルパ（条件なし = 全件）。
+    /// フィルターを 1 件作るヘルパ（条件なし = 全件）。
     async fn seed_query(deps: &ShareDeps, name: &str) -> yozist_core::FilterId {
         let q = yozist_core::Filter {
             id: yozist_core::FilterId::new(),
@@ -2694,7 +2694,7 @@ mod all_backend_tests {
         // 条件付きパスは hub ルート直下には出ない。
         assert!(
             !names.iter().any(|n| n == "仕事メモ"),
-            "フィルタ名が hub ルートに出ている: {names:?}"
+            "フィルター名が hub ルートに出ている: {names:?}"
         );
         assert_eq!(names.len(), HUB_BUILTINS.len(), "組込み以外が混ざっている: {names:?}");
     }
@@ -2713,7 +2713,7 @@ mod all_backend_tests {
         ));
     }
 
-    /// hub から `filters\<フィルタ名>\` を辿るとそのフィルタ結果のファイルが見える。
+    /// hub から `filters\<フィルター名>\` を辿るとそのフィルター結果のファイルが見える。
     #[tokio::test]
     async fn hub_resolves_filter_files_under_filters() {
         let (deps, _dir) = test_deps().await;
@@ -2731,7 +2731,7 @@ mod all_backend_tests {
         let canonical = format!("{}{}{}", f.id, ID_SEP, "doc.txt");
         seed_query(&deps, "mydocs").await;
 
-        // hub: \filters\mydocs\ にフィルタ結果が出る。
+        // hub: \filters\mydocs\ にフィルター結果が出る。
         let hub = HubBackend::new(deps.clone());
         let dir = hub
             .open(&id, &p("filters/mydocs"), OpenOptions::default())
@@ -2758,7 +2758,7 @@ mod all_backend_tests {
         assert!(names.iter().any(|n| n == &canonical), "{names:?}");
     }
 
-    /// hub 配下のフィルタ（読取専用ビュー）への書込み系は拒否される。
+    /// hub 配下のフィルター（読取専用ビュー）への書込み系は拒否される。
     #[tokio::test]
     async fn hub_query_is_read_only() {
         let (deps, _dir) = test_deps().await;

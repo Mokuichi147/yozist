@@ -1,4 +1,4 @@
-//! フィルタ（条件付き仮想ビュー）の解決ロジック。
+//! フィルター（条件付き仮想ビュー）の解決ロジック。
 //!
 //! REST（WebUI の一覧）と SMB（`yozist\filters\<名前>\`）の双方が本関数を共有し、
 //! 条件評価のセマンティクスを一致させる。スマートフォルダ風に、タグ（システム /
@@ -19,7 +19,7 @@ use crate::{DbError, MetaStore};
 /// 評価対象として取得するファイル数の上限。
 const QUERY_FILE_LIMIT: u32 = 1000;
 
-/// フィルタ定義を解決し、条件にマッチする `FileMeta` 一覧を返す。
+/// フィルター定義を解決し、条件にマッチする `FileMeta` 一覧を返す。
 pub async fn resolve_filter(
     meta: &dyn MetaStore,
     q: &FilterDef,
@@ -86,7 +86,7 @@ fn is_tag_field(field: &str) -> bool {
     matches!(field, "tag" | "manual_tag" | "system_tag" | "ai_tag")
 }
 
-/// 1 ファイルがフィルタにマッチするか。
+/// 1 ファイルがフィルターにマッチするか。
 fn eval_file(
     f: &FileMeta,
     q: &FilterDef,

@@ -53,7 +53,7 @@ id_newtype!(/// シリーズ。
 SeriesId);
 id_newtype!(/// アクター（編集操作の主体）。CRDT の `actor_id` に対応。
 ActorId);
-id_newtype!(/// フィルタ（Shareable Path）。
+id_newtype!(/// フィルター（Shareable Path）。
 FilterId);
 
 // ユーザー / グループの ID は upstream `user-permission` の `i64` を直接使う。
@@ -186,7 +186,7 @@ pub struct FilterCondition {
     pub unit: Option<String>,
 }
 
-/// フィルタ条件。`tags_and` / `tags_not` は後方互換のためのレガシー表現で、
+/// フィルター条件。`tags_and` / `tags_not` は後方互換のためのレガシー表現で、
 /// 解決時には `conditions`（タグ include/exclude）と同等に評価される。
 /// 新 UI は `match_mode` + `conditions` を使う。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

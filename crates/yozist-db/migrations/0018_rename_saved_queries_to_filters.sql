@@ -1,4 +1,4 @@
--- 「保存クエリ」を「フィルタ」に改称（負の遺産を残さないため概念ごと統一）。
+-- 「保存クエリ」を「フィルター」に改称（負の遺産を残さないため概念ごと統一）。
 -- テーブル saved_queries → filters、列 query_json → definition_json、索引も改称する。
 -- SMB 上は `\\host\yozist\filters\<name>\` でアクセスする。
 

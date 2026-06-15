@@ -15,8 +15,8 @@
 //! | `yozist\all\` | 全ファイルをフラット |
 //! | `yozist\tags\…` | 階層パス = タグの AND 条件 |
 //! | `yozist\series\…` | 配下に `NNNN__name` 形式で順序付きメンバー |
-//! | `yozist\filters\` | 全フィルタ（任意名）が並ぶ |
-//! | `yozist\filters\<任意の名前>\` | フィルタの結果へアクセス |
+//! | `yozist\filters\` | 全フィルター（任意名）が並ぶ |
+//! | `yozist\filters\<任意の名前>\` | フィルターの結果へアクセス |
 //!
 //! # TODO
 //! - [ ] RecentBackend の本実装
@@ -198,7 +198,7 @@ impl BuiltSmb {
 /// 既存ユーザーはログイン無しで接続できる。
 pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<BuiltSmb, SmbError> {
     // 公開する share は `yozist` ハブのみ。組込みビュー（all / tags / series /
-    // filters）と各フィルタ（任意名）はすべて `yozist\<...>\` の配下に現れる。
+    // filters）と各フィルター（任意名）はすべて `yozist\<...>\` の配下に現れる。
     let server = SmbServer::builder()
         .listen(cfg.listen)
         .share(Share::new("yozist", HubBackend::new(deps.clone())))

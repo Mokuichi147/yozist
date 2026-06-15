@@ -1660,7 +1660,7 @@ struct CreateFilterInput {
     expires_in_secs: Option<i64>,
 }
 
-/// フィルタ更新入力。指定したフィールドのみ差し替える（`None` は据え置き）。
+/// フィルター更新入力。指定したフィールドのみ差し替える（`None` は据え置き）。
 /// `name` を変えると SMB の `filters\<名前>\` パスも改名される。
 #[derive(Deserialize)]
 struct UpdateFilterInput {
@@ -1688,29 +1688,29 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// フィルタ名のバリデーション。`yozist\filters\<名前>\` の 1 コンポーネントと
+/// フィルター名のバリデーション。`yozist\filters\<名前>\` の 1 コンポーネントと
 /// して使うため、SMB パスで問題になる文字のみ弾く（名前自体は任意）。
 /// - 空 / 前後空白のみ
 /// - SMB パスで使えない文字（`\\ / : * ? " < > |` と制御文字）
 fn validate_filter_name(name: &str) -> Result<String, ApiError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(ApiError::BadRequest("フィルタ名を入力してください".into()));
+        return Err(ApiError::BadRequest("フィルター名を入力してください".into()));
     }
     if trimmed.len() > 80 {
-        return Err(ApiError::BadRequest("フィルタ名が長すぎます（80文字以内）".into()));
+        return Err(ApiError::BadRequest("フィルター名が長すぎます（80文字以内）".into()));
     }
     if trimmed.chars().any(|c| {
         matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
     }) {
         return Err(ApiError::BadRequest(
-            r#"フィルタ名に使えない文字が含まれています（\ / : * ? " < > | や制御文字）"#.into(),
+            r#"フィルター名に使えない文字が含まれています（\ / : * ? " < > | や制御文字）"#.into(),
         ));
     }
     Ok(trimmed.to_string())
 }
 
-/// 編集・削除はフィルタ作成者のみに許可する（作成者不明の旧データは認証ユーザーへ開放）。
+/// 編集・削除はフィルター作成者のみに許可する（作成者不明の旧データは認証ユーザーへ開放）。
 fn require_filter_owner(ctx: &AuthContext, q: &Filter) -> Result<(), ApiError> {
     match (&q.created_by, ctx) {
         (Some(owner), AuthContext::User { user, .. }) if *owner == user.id => Ok(()),
@@ -1734,7 +1734,7 @@ async fn create_filter(
 ) -> Result<(StatusCode, Json<Filter>), ApiError> {
     require_authenticated(&ctx).await?;
     let name = validate_filter_name(&input.name)?;
-    // 同名の既存フィルタは share 名が衝突するため拒否する。
+    // 同名の既存フィルターは share 名が衝突するため拒否する。
     if s.meta
         .get_filter_by_name(&name)
         .await
@@ -1804,7 +1804,7 @@ async fn update_filter(
         Some(n) => validate_filter_name(n)?,
         None => old_name.clone(),
     };
-    // 改名先が他のフィルタと衝突しないこと（share 名の一意性）。
+    // 改名先が他のフィルターと衝突しないこと（share 名の一意性）。
     if !new_name.eq_ignore_ascii_case(&old_name) {
         let clash = s
             .meta
@@ -2216,7 +2216,7 @@ async fn revoke_share_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// フィルタ共有トークンでマッチするファイル一覧を返す。
+/// フィルター共有トークンでマッチするファイル一覧を返す。
 async fn list_shared_files(
     State(s): State<ApiState>,
     Path(token): Path<String>,
