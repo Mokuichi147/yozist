@@ -145,7 +145,6 @@ async function loadQueries() {
     const list = await json('/api/queries');
     if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-sm py-2">条件付きパスはまだありません。「+ 新規作成」から追加してください。</div>'; return; }
     el.innerHTML = list.map(q => {
-      const path = `smb://&lt;サーバ&gt;/yozist/queries/${escapeHtml(q.name)}/`;
       const mine = canEditQuery(q);
       const editBtns = mine ? `
           <button class="btn btn-xs" onclick="openQueryModal('edit','${q.id}')">編集</button>
@@ -154,7 +153,6 @@ async function loadQueries() {
         <div class="min-w-0">
           <div><span class="font-semibold break-all">${escapeHtml(q.name)}</span></div>
           <div class="text-xs opacity-60 break-all">${escapeHtml(queryText(q))}</div>
-          <div class="text-xs font-mono opacity-50 break-all">${path}</div>
           ${q.description ? `<div class="text-xs opacity-60 break-all">${escapeHtml(q.description)}</div>` : ''}
         </div>
         <div class="flex gap-1 shrink-0">
