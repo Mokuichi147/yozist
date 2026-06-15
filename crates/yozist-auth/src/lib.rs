@@ -84,9 +84,9 @@ pub struct AuthToken(pub String);
 /// 期限付き共有 URL のトークンに含めるクレーム。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareClaims {
-    /// "file" | "query" など、任意の文字列。
+    /// "file" | "filter" など、任意の文字列。
     pub kind: String,
-    /// 対象 ID（FileId / SavedQueryId 等を文字列化したもの）。
+    /// 対象 ID（FileId / FilterId 等を文字列化したもの）。
     pub target_id: String,
     pub exp: i64,
     pub iat: i64,

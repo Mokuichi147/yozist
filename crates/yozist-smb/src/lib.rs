@@ -11,12 +11,12 @@
 //!
 //! | パス | 内容 |
 //! |------|------|
-//! | `yozist\` | ルート。組込みビュー (all / tags / series / queries) が並ぶ |
+//! | `yozist\` | ルート。組込みビュー (all / tags / series / filters) が並ぶ |
 //! | `yozist\all\` | 全ファイルをフラット |
 //! | `yozist\tags\…` | 階層パス = タグの AND 条件 |
 //! | `yozist\series\…` | 配下に `NNNN__name` 形式で順序付きメンバー |
-//! | `yozist\queries\` | 全条件付きパス（任意名）が並ぶ |
-//! | `yozist\queries\<任意の名前>\` | 条件付きパス（保存クエリ）の結果へアクセス |
+//! | `yozist\filters\` | 全フィルタ（任意名）が並ぶ |
+//! | `yozist\filters\<任意の名前>\` | フィルタの結果へアクセス |
 //!
 //! # TODO
 //! - [ ] RecentBackend の本実装
@@ -38,7 +38,7 @@ pub mod backends;
 pub mod credentials;
 pub mod handle;
 pub use backends::{
-    AllBackend, HubBackend, QueriesBackend, RecentBackend, SeriesBackend, TagsBackend,
+    AllBackend, HubBackend, FiltersBackend, RecentBackend, SeriesBackend, TagsBackend,
 };
 pub use credentials::{SmbCredentialStore, SmbCredentialSync};
 
@@ -198,7 +198,7 @@ impl BuiltSmb {
 /// 既存ユーザーはログイン無しで接続できる。
 pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<BuiltSmb, SmbError> {
     // 公開する share は `yozist` ハブのみ。組込みビュー（all / tags / series /
-    // queries）と各条件付きパス（任意名）はすべて `yozist\<...>\` の配下に現れる。
+    // filters）と各フィルタ（任意名）はすべて `yozist\<...>\` の配下に現れる。
     let server = SmbServer::builder()
         .listen(cfg.listen)
         .share(Share::new("yozist", HubBackend::new(deps.clone())))

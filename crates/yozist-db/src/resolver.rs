@@ -1,6 +1,6 @@
-//! 保存クエリ（条件付き仮想ビュー）の解決ロジック。
+//! フィルタ（条件付き仮想ビュー）の解決ロジック。
 //!
-//! REST（WebUI の一覧）と SMB（`yozist\queries\<名前>\`）の双方が本関数を共有し、
+//! REST（WebUI の一覧）と SMB（`yozist\filters\<名前>\`）の双方が本関数を共有し、
 //! 条件評価のセマンティクスを一致させる。スマートフォルダ風に、タグ（システム /
 //! 手動 / AI / 種別不問）・シリーズ・種類(MIME)・名前・日付（作成 / 更新）の条件を
 //! `MatchMode`（すべて / いずれか）で組み合わせて絞り込む。
@@ -12,17 +12,17 @@
 use std::collections::{HashMap, HashSet};
 
 use time::{Duration, OffsetDateTime};
-use yozist_core::{FileId, FileMeta, MatchMode, QueryCondition, QueryDef, Tag, TagKind};
+use yozist_core::{FileId, FileMeta, MatchMode, FilterCondition, FilterDef, Tag, TagKind};
 
 use crate::{DbError, MetaStore};
 
 /// 評価対象として取得するファイル数の上限。
 const QUERY_FILE_LIMIT: u32 = 1000;
 
-/// 保存クエリ定義を解決し、条件にマッチする `FileMeta` 一覧を返す。
-pub async fn resolve_query(
+/// フィルタ定義を解決し、条件にマッチする `FileMeta` 一覧を返す。
+pub async fn resolve_filter(
     meta: &dyn MetaStore,
-    q: &QueryDef,
+    q: &FilterDef,
 ) -> Result<Vec<FileMeta>, DbError> {
     let candidates = meta.list_files(QUERY_FILE_LIMIT, 0).await?;
 
@@ -86,10 +86,10 @@ fn is_tag_field(field: &str) -> bool {
     matches!(field, "tag" | "manual_tag" | "system_tag" | "ai_tag")
 }
 
-/// 1 ファイルが保存クエリにマッチするか。
+/// 1 ファイルがフィルタにマッチするか。
 fn eval_file(
     f: &FileMeta,
-    q: &QueryDef,
+    q: &FilterDef,
     tags: Option<&Vec<Tag>>,
     series_members: &HashMap<String, HashSet<FileId>>,
     now: OffsetDateTime,
@@ -120,7 +120,7 @@ fn eval_file(
 
 fn eval_condition(
     f: &FileMeta,
-    c: &QueryCondition,
+    c: &FilterCondition,
     tags: &[Tag],
     series_members: &HashMap<String, HashSet<FileId>>,
     now: OffsetDateTime,
@@ -250,8 +250,8 @@ mod tests {
         s.attach_tag(file, &id).await.unwrap();
     }
 
-    fn cond(field: &str, op: &str, value: &str) -> QueryCondition {
-        QueryCondition {
+    fn cond(field: &str, op: &str, value: &str) -> FilterCondition {
+        FilterCondition {
             field: field.into(),
             op: op.into(),
             value: value.into(),
@@ -271,7 +271,7 @@ mod tests {
         tag(&s, &png.id, "画像", TagKind::System).await;
 
         // 手動タグ「重要」を含む かつ 種類 pdf → pdf のみ。
-        let q = QueryDef {
+        let q = FilterDef {
             match_mode: MatchMode::All,
             conditions: vec![
                 cond("manual_tag", "include", "重要"),
@@ -279,23 +279,23 @@ mod tests {
             ],
             ..Default::default()
         };
-        let got = resolve_query(&s, &q).await.unwrap();
+        let got = resolve_filter(&s, &q).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].display_name, "報告書.pdf");
 
         // システムタグとして「重要」を探しても、それは手動タグなのでヒットしない。
-        let q = QueryDef {
+        let q = FilterDef {
             conditions: vec![cond("system_tag", "include", "重要")],
             ..Default::default()
         };
-        assert_eq!(resolve_query(&s, &q).await.unwrap().len(), 0);
+        assert_eq!(resolve_filter(&s, &q).await.unwrap().len(), 0);
 
         // システムタグ「画像」を含む → png のみ。
-        let q = QueryDef {
+        let q = FilterDef {
             conditions: vec![cond("system_tag", "include", "画像")],
             ..Default::default()
         };
-        let got = resolve_query(&s, &q).await.unwrap();
+        let got = resolve_filter(&s, &q).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].display_name, "写真.png");
     }
@@ -309,7 +309,7 @@ mod tests {
         s.insert_file(&b).await.unwrap();
 
         // いずれか: 名前に "draft" を含む or 種類 pdf → 両方。
-        let q = QueryDef {
+        let q = FilterDef {
             match_mode: MatchMode::Any,
             conditions: vec![
                 cond("name", "contains", "draft"),
@@ -317,10 +317,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(resolve_query(&s, &q).await.unwrap().len(), 2);
+        assert_eq!(resolve_filter(&s, &q).await.unwrap().len(), 2);
 
         // すべて: 種類 pdf を含まない かつ 名前 "memo" を含む → a のみ。
-        let q = QueryDef {
+        let q = FilterDef {
             match_mode: MatchMode::All,
             conditions: vec![
                 cond("mime", "exclude", "pdf"),
@@ -328,7 +328,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let got = resolve_query(&s, &q).await.unwrap();
+        let got = resolve_filter(&s, &q).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].display_name, "draft-memo.txt");
     }
@@ -354,11 +354,11 @@ mod tests {
         .await
         .unwrap();
 
-        let q = QueryDef {
+        let q = FilterDef {
             conditions: vec![cond("series", "include", "連載")],
             ..Default::default()
         };
-        let got = resolve_query(&s, &q).await.unwrap();
+        let got = resolve_filter(&s, &q).await.unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, inside.id);
     }
@@ -371,16 +371,16 @@ mod tests {
         tag(&s, &f.id, "仕事", TagKind::Manual).await;
         let _ = ActorId::new();
 
-        let q = QueryDef {
+        let q = FilterDef {
             tags_and: vec!["仕事".into()],
             ..Default::default()
         };
-        assert_eq!(resolve_query(&s, &q).await.unwrap().len(), 1);
+        assert_eq!(resolve_filter(&s, &q).await.unwrap().len(), 1);
 
-        let q = QueryDef {
+        let q = FilterDef {
             tags_not: vec!["仕事".into()],
             ..Default::default()
         };
-        assert_eq!(resolve_query(&s, &q).await.unwrap().len(), 0);
+        assert_eq!(resolve_filter(&s, &q).await.unwrap().len(), 0);
     }
 }

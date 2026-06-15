@@ -36,7 +36,7 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, CommitId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId, Series, SeriesId,
+    ActorId, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId, Series, SeriesId,
     SeriesMember, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -134,16 +134,16 @@ pub fn router(state: ApiState) -> Router {
             "/api/series/:id/members/:file_id",
             axum::routing::delete(remove_series_member),
         )
-        .route("/api/queries", get(list_saved_queries).post(create_saved_query))
+        .route("/api/filters", get(list_filters).post(create_filter))
         .route(
-            "/api/queries/:id",
-            get(get_saved_query)
-                .patch(update_saved_query)
-                .delete(delete_saved_query),
+            "/api/filters/:id",
+            get(get_filter)
+                .patch(update_filter)
+                .delete(delete_filter),
         )
-        .route("/api/queries/:id/files", get(query_files))
+        .route("/api/filters/:id/files", get(filter_files))
         .route("/api/files/:id/share", post(issue_file_share))
-        .route("/api/queries/:id/share", post(issue_query_share))
+        .route("/api/filters/:id/share", post(issue_filter_share))
         .route("/api/shared/:token", get(get_shared))
         .route("/api/shared/:token/files", get(list_shared_files))
         .route("/api/shares", get(list_share_tokens))
@@ -1644,7 +1644,7 @@ async fn remove_series_member(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct CreateQueryInput {
+struct CreateFilterInput {
     name: String,
     description: Option<String>,
     #[serde(default)]
@@ -1655,22 +1655,22 @@ struct CreateQueryInput {
     #[serde(default)]
     match_mode: yozist_core::MatchMode,
     #[serde(default)]
-    conditions: Vec<yozist_core::QueryCondition>,
+    conditions: Vec<yozist_core::FilterCondition>,
     /// 期限秒数（now + N 秒）。
     expires_in_secs: Option<i64>,
 }
 
-/// クエリ更新入力。指定したフィールドのみ差し替える（`None` は据え置き）。
-/// `name` を変えると SMB の `queries\<名前>\` パスも改名される。
+/// フィルタ更新入力。指定したフィールドのみ差し替える（`None` は据え置き）。
+/// `name` を変えると SMB の `filters\<名前>\` パスも改名される。
 #[derive(Deserialize)]
-struct UpdateQueryInput {
+struct UpdateFilterInput {
     name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     description: Option<Option<String>>,
     tags_and: Option<Vec<String>>,
     tags_not: Option<Vec<String>>,
     match_mode: Option<yozist_core::MatchMode>,
-    conditions: Option<Vec<yozist_core::QueryCondition>>,
+    conditions: Option<Vec<yozist_core::FilterCondition>>,
 }
 
 /// `Option<Option<T>>` を JSON の「キー欠落=据え置き / null=クリア」に対応させる。
@@ -1688,30 +1688,30 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// 条件付きパス名のバリデーション。`yozist\queries\<名前>\` の 1 コンポーネントと
+/// フィルタ名のバリデーション。`yozist\filters\<名前>\` の 1 コンポーネントと
 /// して使うため、SMB パスで問題になる文字のみ弾く（名前自体は任意）。
 /// - 空 / 前後空白のみ
 /// - SMB パスで使えない文字（`\\ / : * ? " < > |` と制御文字）
-fn validate_query_name(name: &str) -> Result<String, ApiError> {
+fn validate_filter_name(name: &str) -> Result<String, ApiError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        return Err(ApiError::BadRequest("クエリ名を入力してください".into()));
+        return Err(ApiError::BadRequest("フィルタ名を入力してください".into()));
     }
     if trimmed.len() > 80 {
-        return Err(ApiError::BadRequest("クエリ名が長すぎます（80文字以内）".into()));
+        return Err(ApiError::BadRequest("フィルタ名が長すぎます（80文字以内）".into()));
     }
     if trimmed.chars().any(|c| {
         matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
     }) {
         return Err(ApiError::BadRequest(
-            r#"クエリ名に使えない文字が含まれています（\ / : * ? " < > | や制御文字）"#.into(),
+            r#"フィルタ名に使えない文字が含まれています（\ / : * ? " < > | や制御文字）"#.into(),
         ));
     }
     Ok(trimmed.to_string())
 }
 
-/// 編集・削除はクエリ作成者のみに許可する（作成者不明の旧データは認証ユーザーへ開放）。
-fn require_query_owner(ctx: &AuthContext, q: &SavedQuery) -> Result<(), ApiError> {
+/// 編集・削除はフィルタ作成者のみに許可する（作成者不明の旧データは認証ユーザーへ開放）。
+fn require_filter_owner(ctx: &AuthContext, q: &Filter) -> Result<(), ApiError> {
     match (&q.created_by, ctx) {
         (Some(owner), AuthContext::User { user, .. }) if *owner == user.id => Ok(()),
         (None, AuthContext::User { .. }) => Ok(()),
@@ -1720,23 +1720,23 @@ fn require_query_owner(ctx: &AuthContext, q: &SavedQuery) -> Result<(), ApiError
     }
 }
 
-async fn list_saved_queries(
+async fn list_filters(
     State(s): State<ApiState>,
-) -> Result<Json<Vec<SavedQuery>>, ApiError> {
-    let list = s.meta.list_saved_queries().await.map_err(ApiError::from_db)?;
+) -> Result<Json<Vec<Filter>>, ApiError> {
+    let list = s.meta.list_filters().await.map_err(ApiError::from_db)?;
     Ok(Json(list))
 }
 
-async fn create_saved_query(
+async fn create_filter(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
-    Json(input): Json<CreateQueryInput>,
-) -> Result<(StatusCode, Json<SavedQuery>), ApiError> {
+    Json(input): Json<CreateFilterInput>,
+) -> Result<(StatusCode, Json<Filter>), ApiError> {
     require_authenticated(&ctx).await?;
-    let name = validate_query_name(&input.name)?;
-    // 同名の既存クエリは share 名が衝突するため拒否する。
+    let name = validate_filter_name(&input.name)?;
+    // 同名の既存フィルタは share 名が衝突するため拒否する。
     if s.meta
-        .get_saved_query_by_name(&name)
+        .get_filter_by_name(&name)
         .await
         .map_err(ApiError::from_db)?
         .is_some()
@@ -1751,10 +1751,10 @@ async fn create_saved_query(
     let expires_at = input
         .expires_in_secs
         .map(|s| now + time::Duration::seconds(s));
-    let q = SavedQuery {
-        id: SavedQueryId::new(),
+    let q = Filter {
+        id: FilterId::new(),
         name,
-        query: QueryDef {
+        definition: FilterDef {
             tags_and: input.tags_and,
             tags_not: input.tags_not,
             match_mode: input.match_mode,
@@ -1765,14 +1765,14 @@ async fn create_saved_query(
         created_at: now,
         expires_at,
     };
-    let id = s.meta.upsert_saved_query(&q).await.map_err(ApiError::from_db)?;
-    let saved = SavedQuery { id, ..q };
+    let id = s.meta.upsert_filter(&q).await.map_err(ApiError::from_db)?;
+    let saved = Filter { id, ..q };
     // SMB ハブ share（yozist\<name>\）には DB を即時反映するため追加処理は不要。
     audit_event(
         &s,
         &ctx,
-        "create_saved_query",
-        Some("query"),
+        "create_filter",
+        Some("filter"),
         Some(&saved.id.to_string()),
         Some(&format!("{{\"name\":{}}}", json_str(&saved.name))),
         &Ok::<(), String>(()),
@@ -1781,34 +1781,34 @@ async fn create_saved_query(
     Ok((StatusCode::CREATED, Json(saved)))
 }
 
-async fn update_saved_query(
+async fn update_filter(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
-    Json(input): Json<UpdateQueryInput>,
-) -> Result<Json<SavedQuery>, ApiError> {
+    Json(input): Json<UpdateFilterInput>,
+) -> Result<Json<Filter>, ApiError> {
     require_authenticated(&ctx).await?;
     let qid = uuid::Uuid::parse_str(&id)
-        .map(SavedQueryId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+        .map(FilterId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("filter id: {e}")))?;
     let existing = s
         .meta
-        .get_saved_query(&qid)
+        .get_filter(&qid)
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    require_query_owner(&ctx, &existing)?;
+    require_filter_owner(&ctx, &existing)?;
 
     let old_name = existing.name.clone();
     let new_name = match &input.name {
-        Some(n) => validate_query_name(n)?,
+        Some(n) => validate_filter_name(n)?,
         None => old_name.clone(),
     };
-    // 改名先が他のクエリと衝突しないこと（share 名の一意性）。
+    // 改名先が他のフィルタと衝突しないこと（share 名の一意性）。
     if !new_name.eq_ignore_ascii_case(&old_name) {
         let clash = s
             .meta
-            .get_saved_query_by_name(&new_name)
+            .get_filter_by_name(&new_name)
             .await
             .map_err(ApiError::from_db)?
             .is_some_and(|other| other.id != existing.id);
@@ -1817,14 +1817,14 @@ async fn update_saved_query(
         }
     }
 
-    let updated = SavedQuery {
+    let updated = Filter {
         id: existing.id,
         name: new_name.clone(),
-        query: QueryDef {
-            tags_and: input.tags_and.unwrap_or(existing.query.tags_and),
-            tags_not: input.tags_not.unwrap_or(existing.query.tags_not),
-            match_mode: input.match_mode.unwrap_or(existing.query.match_mode),
-            conditions: input.conditions.unwrap_or(existing.query.conditions),
+        definition: FilterDef {
+            tags_and: input.tags_and.unwrap_or(existing.definition.tags_and),
+            tags_not: input.tags_not.unwrap_or(existing.definition.tags_not),
+            match_mode: input.match_mode.unwrap_or(existing.definition.match_mode),
+            conditions: input.conditions.unwrap_or(existing.definition.conditions),
         },
         description: input.description.unwrap_or(existing.description),
         created_by: existing.created_by,
@@ -1832,7 +1832,7 @@ async fn update_saved_query(
         expires_at: existing.expires_at,
     };
     s.meta
-        .upsert_saved_query(&updated)
+        .upsert_filter(&updated)
         .await
         .map_err(ApiError::from_db)?;
 
@@ -1841,8 +1841,8 @@ async fn update_saved_query(
     audit_event(
         &s,
         &ctx,
-        "update_saved_query",
-        Some("query"),
+        "update_filter",
+        Some("filter"),
         Some(&id),
         Some(&format!("{{\"name\":{}}}", json_str(&new_name))),
         &Ok::<(), String>(()),
@@ -1851,49 +1851,49 @@ async fn update_saved_query(
     Ok(Json(updated))
 }
 
-async fn get_saved_query(
+async fn get_filter(
     State(s): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<SavedQuery>, ApiError> {
+) -> Result<Json<Filter>, ApiError> {
     let id = uuid::Uuid::parse_str(&id)
-        .map(SavedQueryId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+        .map(FilterId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("filter id: {e}")))?;
     let q = s
         .meta
-        .get_saved_query(&id)
+        .get_filter(&id)
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(q))
 }
 
-async fn delete_saved_query(
+async fn delete_filter(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     require_authenticated(&ctx).await?;
     let qid = uuid::Uuid::parse_str(&id)
-        .map(SavedQueryId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+        .map(FilterId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("filter id: {e}")))?;
     let existing = s
         .meta
-        .get_saved_query(&qid)
+        .get_filter(&qid)
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    require_query_owner(&ctx, &existing)?;
+    require_filter_owner(&ctx, &existing)?;
     let res = s
         .meta
-        .delete_saved_query(&qid)
+        .delete_filter(&qid)
         .await
         .map_err(ApiError::from_db);
     // SMB ハブ share（yozist\<name>\）からは DB 削除と同時に消える。
     audit_event(
         &s,
         &ctx,
-        "delete_saved_query",
-        Some("query"),
+        "delete_filter",
+        Some("filter"),
         Some(&id),
         None,
         &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
@@ -1903,30 +1903,30 @@ async fn delete_saved_query(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn query_files(
+async fn filter_files(
     State(s): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<FileMeta>>, ApiError> {
     let id = uuid::Uuid::parse_str(&id)
-        .map(SavedQueryId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+        .map(FilterId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("filter id: {e}")))?;
     let q = s
         .meta
-        .get_saved_query(&id)
+        .get_filter(&id)
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    let files = resolve_query(&*s.meta, &q.query).await?;
+    let files = resolve_filter(&*s.meta, &q.definition).await?;
     Ok(Json(files))
 }
 
-/// 共通ヘルパ: SavedQuery の定義を解決して FileMeta 一覧を返す。
-pub async fn resolve_query(
+/// 共通ヘルパ: Filter の定義を解決して FileMeta 一覧を返す。
+pub async fn resolve_filter(
     meta: &dyn yozist_db::MetaStore,
-    q: &QueryDef,
+    q: &FilterDef,
 ) -> Result<Vec<FileMeta>, ApiError> {
-    // 条件評価は REST / SMB 共通の yozist-db::resolve_query に委譲する。
-    yozist_db::resolve_query(meta, q)
+    // 条件評価は REST / SMB 共通の yozist-db::resolve_filter に委譲する。
+    yozist_db::resolve_filter(meta, q)
         .await
         .map_err(ApiError::from_db)
 }
@@ -2087,7 +2087,7 @@ async fn issue_file_share(
     }))
 }
 
-async fn issue_query_share(
+async fn issue_filter_share(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
@@ -2100,15 +2100,15 @@ async fn issue_query_share(
     };
     let res = s
         .share_admin
-        .issue_share_token("query", &id, input.ttl_secs, issuer)
+        .issue_share_token("filter", &id, input.ttl_secs, issuer)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
     let meta = format!("{{\"ttl_secs\":{}}}", input.ttl_secs);
     audit_event(
         &s,
         &ctx,
-        "issue_query_share",
-        Some("query"),
+        "issue_filter_share",
+        Some("filter"),
         Some(&id),
         Some(&meta),
         &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
@@ -2216,22 +2216,22 @@ async fn revoke_share_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// クエリ共有トークンでマッチするファイル一覧を返す。
+/// フィルタ共有トークンでマッチするファイル一覧を返す。
 async fn list_shared_files(
     State(s): State<ApiState>,
     Path(token): Path<String>,
 ) -> Result<Json<Vec<FileMeta>>, ApiError> {
-    let target_id = verify_share(&s, &token, "query").await?;
+    let target_id = verify_share(&s, &token, "filter").await?;
     let query_id = uuid::Uuid::parse_str(&target_id)
-        .map(SavedQueryId::from_uuid)
-        .map_err(|e| ApiError::BadRequest(format!("query id: {e}")))?;
+        .map(FilterId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("filter id: {e}")))?;
     let q = s
         .meta
-        .get_saved_query(&query_id)
+        .get_filter(&query_id)
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    let files = resolve_query(&*s.meta, &q.query).await?;
+    let files = resolve_filter(&*s.meta, &q.definition).await?;
     Ok(Json(files))
 }
 

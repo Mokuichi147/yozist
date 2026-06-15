@@ -1566,16 +1566,16 @@ impl ShareBackend for SeriesBackend {
     }
 }
 
-/// 保存クエリを SMB share として公開する読取専用ビュー。
+/// フィルタ（条件付き仮想ビュー）を SMB に公開する読取専用バックエンド。
 ///
 /// パス例:
-/// - `\` → 全 saved_query を subdir として表示
-/// - `\<query-name>\` → そのクエリで絞り込まれたファイル一覧
-pub struct QueriesBackend {
+/// - `\` → 全 filter を subdir として表示
+/// - `\<filter-name>\` → そのフィルタで絞り込まれたファイル一覧
+pub struct FiltersBackend {
     deps: ShareDeps,
 }
 
-impl QueriesBackend {
+impl FiltersBackend {
     pub fn new(deps: ShareDeps) -> Self {
         Self { deps }
     }
@@ -1584,7 +1584,7 @@ impl QueriesBackend {
         let queries = self
             .deps
             .meta
-            .list_saved_queries()
+            .list_filters()
             .await
             .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
         let now = crate::handle::system_time_to_filetime(std::time::SystemTime::now());
@@ -1608,17 +1608,17 @@ impl QueriesBackend {
 
     async fn resolve(
         &self,
-        q: &yozist_core::QueryDef,
+        q: &yozist_core::FilterDef,
     ) -> SmbResult<Vec<yozist_core::FileMeta>> {
-        // 条件評価は REST / SMB 共通の yozist-db::resolve_query に委譲する。
-        yozist_db::resolve_query(&*self.deps.meta, q)
+        // 条件評価は REST / SMB 共通の yozist-db::resolve_filter に委譲する。
+        yozist_db::resolve_filter(&*self.deps.meta, q)
             .await
             .map_err(io_err)
     }
 }
 
 #[async_trait]
-impl ShareBackend for QueriesBackend {
+impl ShareBackend for FiltersBackend {
     async fn open(
         &self,
         identity: &Identity,
@@ -1631,12 +1631,12 @@ impl ShareBackend for QueriesBackend {
                 return Err(SmbError::IsDirectory);
             }
             let entries = self.list_root().await?;
-            return Ok(Box::new(YozistDirHandle::new("queries", entries)));
+            return Ok(Box::new(YozistDirHandle::new("filters", entries)));
         }
         let query = self
             .deps
             .meta
-            .get_saved_query_by_name(&comps[0])
+            .get_filter_by_name(&comps[0])
             .await
             .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
             .ok_or(SmbError::PathNotFound)?;
@@ -1646,7 +1646,7 @@ impl ShareBackend for QueriesBackend {
                 if opts.non_directory {
                     return Err(SmbError::IsDirectory);
                 }
-                let files = self.resolve(&query.query).await?;
+                let files = self.resolve(&query.definition).await?;
                 let mut entries = Vec::with_capacity(files.len());
                 for meta in files {
                     let name = format!("{}{}{}", meta.id, ID_SEP, meta.display_name);
@@ -1720,21 +1720,22 @@ fn strip_first(path: &SmbPath) -> SmbResult<SmbPath> {
 /// 全仮想ビューへの単一エントリ share（既定名 `yozist`）。
 ///
 /// `smb://host/yozist/` のルートに組込みビュー（`all` / `tags` / `series` /
-/// `queries`）を仮想フォルダとして並べる。share 名を都度指定しなくても 1 つ繋ぐ
+/// `filters`）を仮想フォルダとして並べる。share 名を都度指定しなくても 1 つ繋ぐ
 /// だけで全ビューを辿れるようにするためのハブ。
 ///
 /// ルーティング: 先頭要素が組込みビュー名なら各バックエンドへ先頭要素を剥がして
-/// 委譲する。それ以外は存在しない（`PathNotFound`）。条件付きパス（保存クエリ）は
-/// `queries\<任意の名前>\` 配下からアクセスする。
+/// 委譲する。それ以外は存在しない（`PathNotFound`）。フィルタは
+/// `filters\<任意の名前>\` 配下からアクセスする。
 pub struct HubBackend {
     all: AllBackend,
     tags: TagsBackend,
     series: SeriesBackend,
-    queries: QueriesBackend,
+    queries: FiltersBackend,
 }
 
-/// hub のルートに常設する組込みビュー名。
-pub const HUB_BUILTINS: [&str; 4] = ["all", "tags", "series", "queries"];
+/// hub のルートに常設する組込みビュー名。`filters` 配下に各フィルタが
+/// 並ぶ。
+pub const HUB_BUILTINS: [&str; 4] = ["all", "tags", "series", "filters"];
 
 impl HubBackend {
     pub fn new(deps: ShareDeps) -> Self {
@@ -1742,7 +1743,7 @@ impl HubBackend {
             all: AllBackend::new(deps.clone()),
             tags: TagsBackend::new(deps.clone()),
             series: SeriesBackend::new(deps.clone()),
-            queries: QueriesBackend::new(deps),
+            queries: FiltersBackend::new(deps),
         }
     }
 
@@ -1775,7 +1776,7 @@ impl HubBackend {
             "all" => Some((&self.all, strip_first(path))),
             "tags" => Some((&self.tags, strip_first(path))),
             "series" => Some((&self.series, strip_first(path))),
-            "queries" => Some((&self.queries, strip_first(path))),
+            "filters" => Some((&self.queries, strip_first(path))),
             _ => None,
         }
     }
@@ -2656,18 +2657,18 @@ mod all_backend_tests {
 
     // ---- HubBackend ---------------------------------------------------------
 
-    /// 保存クエリを 1 件作るヘルパ（条件なし = 全件）。
-    async fn seed_query(deps: &ShareDeps, name: &str) -> yozist_core::SavedQueryId {
-        let q = yozist_core::SavedQuery {
-            id: yozist_core::SavedQueryId::new(),
+    /// フィルタを 1 件作るヘルパ（条件なし = 全件）。
+    async fn seed_query(deps: &ShareDeps, name: &str) -> yozist_core::FilterId {
+        let q = yozist_core::Filter {
+            id: yozist_core::FilterId::new(),
             name: name.to_string(),
-            query: yozist_core::QueryDef::default(),
+            definition: yozist_core::FilterDef::default(),
             description: None,
             created_by: None,
             created_at: time::OffsetDateTime::now_utc(),
             expires_at: None,
         };
-        deps.meta.upsert_saved_query(&q).await.unwrap()
+        deps.meta.upsert_filter(&q).await.unwrap()
     }
 
     fn names_of(entries: &[DirEntry]) -> Vec<String> {
@@ -2693,7 +2694,7 @@ mod all_backend_tests {
         // 条件付きパスは hub ルート直下には出ない。
         assert!(
             !names.iter().any(|n| n == "仕事メモ"),
-            "クエリ名が hub ルートに出ている: {names:?}"
+            "フィルタ名が hub ルートに出ている: {names:?}"
         );
         assert_eq!(names.len(), HUB_BUILTINS.len(), "組込み以外が混ざっている: {names:?}");
     }
@@ -2712,9 +2713,9 @@ mod all_backend_tests {
         ));
     }
 
-    /// hub から `queries\<クエリ名>\` を辿るとそのクエリ結果のファイルが見える。
+    /// hub から `filters\<フィルタ名>\` を辿るとそのフィルタ結果のファイルが見える。
     #[tokio::test]
-    async fn hub_resolves_query_files_under_queries() {
+    async fn hub_resolves_filter_files_under_filters() {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
@@ -2730,10 +2731,10 @@ mod all_backend_tests {
         let canonical = format!("{}{}{}", f.id, ID_SEP, "doc.txt");
         seed_query(&deps, "mydocs").await;
 
-        // hub: \queries\mydocs\ にクエリ結果が出る。
+        // hub: \filters\mydocs\ にフィルタ結果が出る。
         let hub = HubBackend::new(deps.clone());
         let dir = hub
-            .open(&id, &p("queries/mydocs"), OpenOptions::default())
+            .open(&id, &p("filters/mydocs"), OpenOptions::default())
             .await
             .unwrap();
         let names = names_of(&dir.list_dir(None).await.unwrap());
@@ -2757,16 +2758,16 @@ mod all_backend_tests {
         assert!(names.iter().any(|n| n == &canonical), "{names:?}");
     }
 
-    /// hub 配下のクエリ（読取専用ビュー）への書込み系は拒否される。
+    /// hub 配下のフィルタ（読取専用ビュー）への書込み系は拒否される。
     #[tokio::test]
     async fn hub_query_is_read_only() {
         let (deps, _dir) = test_deps().await;
         let id = user_identity("anon");
         seed_query(&deps, "ro").await;
         let hub = HubBackend::new(deps.clone());
-        // queries 配下のファイル削除は AccessDenied（QueriesBackend が拒否）。
+        // filters 配下のファイル削除は AccessDenied（FiltersBackend が拒否）。
         assert!(matches!(
-            hub.unlink(&id, &p("queries/ro/whatever")).await,
+            hub.unlink(&id, &p("filters/ro/whatever")).await,
             Err(SmbError::AccessDenied)
         ));
     }

@@ -53,8 +53,8 @@ id_newtype!(/// シリーズ。
 SeriesId);
 id_newtype!(/// アクター（編集操作の主体）。CRDT の `actor_id` に対応。
 ActorId);
-id_newtype!(/// 保存クエリ（Shareable Path）。
-SavedQueryId);
+id_newtype!(/// フィルタ（Shareable Path）。
+FilterId);
 
 // ユーザー / グループの ID は upstream `user-permission` の `i64` を直接使う。
 // 型エイリアスで意図を表現するが、実体は `i64`。
@@ -167,7 +167,7 @@ pub enum MatchMode {
 
 /// スマートフォルダ風の 1 条件。`field` / `op` / `value`（+ 日付の `unit`）の
 /// フラットな文字列表現にして、フロントエンドとの相互運用と将来の属性追加を
-/// 容易にしている。解決は [`yozist_db::resolve_query`] が行う。
+/// 容易にしている。解決は [`yozist_db::resolve_filter`] が行う。
 ///
 /// 対応する `field` と `op`:
 /// - `tag` / `manual_tag` / `system_tag` / `ai_tag` … op: `include` | `exclude`、value = タグ名
@@ -177,7 +177,7 @@ pub enum MatchMode {
 /// - `created` / `updated`（作成日 / 更新日）… op: `within` | `before` | `after`、
 ///   value = 数値、unit = `day` | `month` | `year`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueryCondition {
+pub struct FilterCondition {
     pub field: String,
     pub op: String,
     #[serde(default)]
@@ -186,11 +186,11 @@ pub struct QueryCondition {
     pub unit: Option<String>,
 }
 
-/// クエリ条件。`tags_and` / `tags_not` は後方互換のためのレガシー表現で、
+/// フィルタ条件。`tags_and` / `tags_not` は後方互換のためのレガシー表現で、
 /// 解決時には `conditions`（タグ include/exclude）と同等に評価される。
 /// 新 UI は `match_mode` + `conditions` を使う。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QueryDef {
+pub struct FilterDef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags_and: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -198,14 +198,14 @@ pub struct QueryDef {
     #[serde(default)]
     pub match_mode: MatchMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<QueryCondition>,
+    pub conditions: Vec<FilterCondition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SavedQuery {
-    pub id: SavedQueryId,
+pub struct Filter {
+    pub id: FilterId,
     pub name: String,
-    pub query: QueryDef,
+    pub definition: FilterDef,
     pub description: Option<String>,
     pub created_by: Option<UserId>,
     pub created_at: time::OffsetDateTime,
