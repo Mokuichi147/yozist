@@ -1770,23 +1770,21 @@ fn strip_first(path: &SmbPath) -> SmbResult<SmbPath> {
 
 /// 全仮想ビューへの単一エントリ share（既定名 `yozist`）。
 ///
-/// `smb://host/yozist/` のルートに、組込みビュー（`all` / `tags` / `series` /
-/// `queries`）と各保存クエリ（任意名）を仮想フォルダとして並べる。share 名を
-/// 都度指定しなくても 1 つ繋ぐだけで全ビューを辿れるようにするためのハブ。
+/// `smb://host/yozist/` のルートに組込みビュー（`all` / `tags` / `series` /
+/// `queries`）を仮想フォルダとして並べる。share 名を都度指定しなくても 1 つ繋ぐ
+/// だけで全ビューを辿れるようにするためのハブ。
 ///
-/// ルーティング:
-/// - `all` / `tags` / `series` / `queries` → 各バックエンドへ先頭要素を剥がして委譲
-/// - それ以外の先頭要素 → 保存クエリ名とみなし `QueriesBackend` へそのまま委譲
+/// ルーティング: 先頭要素が組込みビュー名なら各バックエンドへ先頭要素を剥がして
+/// 委譲する。それ以外は存在しない（`PathNotFound`）。条件付きパス（保存クエリ）は
+/// `queries\<任意の名前>\` 配下からアクセスする。
 pub struct HubBackend {
     all: AllBackend,
     tags: TagsBackend,
     series: SeriesBackend,
     queries: QueriesBackend,
-    deps: ShareDeps,
 }
 
-/// hub のルートに常設する組込みビュー名。保存クエリ名はこれらと衝突しないよう
-/// REST 側で予約名として作成を拒否する。
+/// hub のルートに常設する組込みビュー名。
 pub const HUB_BUILTINS: [&str; 4] = ["all", "tags", "series", "queries"];
 
 impl HubBackend {
@@ -1795,42 +1793,33 @@ impl HubBackend {
             all: AllBackend::new(deps.clone()),
             tags: TagsBackend::new(deps.clone()),
             series: SeriesBackend::new(deps.clone()),
-            queries: QueriesBackend::new(deps.clone()),
-            deps,
+            queries: QueriesBackend::new(deps),
         }
     }
 
-    async fn list_root(&self) -> SmbResult<Vec<DirEntry>> {
+    /// ルート列挙 = 組込みビューのみ。
+    fn root_entries(&self) -> Vec<DirEntry> {
         let now = crate::handle::system_time_to_filetime(std::time::SystemTime::now());
-        let dir = |name: String| DirEntry {
-            info: FileInfo {
-                name,
-                end_of_file: 0,
-                allocation_size: 0,
-                creation_time: now,
-                last_access_time: now,
-                last_write_time: now,
-                change_time: now,
-                is_directory: true,
-                file_index: 0,
-            },
-        };
-        let mut entries: Vec<DirEntry> =
-            HUB_BUILTINS.iter().map(|n| dir(n.to_string())).collect();
-        let queries = self.deps.meta.list_saved_queries().await.map_err(io_err)?;
-        for q in queries {
-            // 組込み名と衝突するクエリ名は組込みを優先して隠す（作成時に拒否
-            // しているはずだが、既存データ保護のため列挙側でも守る）。
-            if HUB_BUILTINS.iter().any(|b| b.eq_ignore_ascii_case(&q.name)) {
-                continue;
-            }
-            entries.push(dir(q.name));
-        }
-        Ok(entries)
+        HUB_BUILTINS
+            .iter()
+            .map(|name| DirEntry {
+                info: FileInfo {
+                    name: name.to_string(),
+                    end_of_file: 0,
+                    allocation_size: 0,
+                    creation_time: now,
+                    last_access_time: now,
+                    last_write_time: now,
+                    change_time: now,
+                    is_directory: true,
+                    file_index: 0,
+                },
+            })
+            .collect()
     }
 
-    /// 先頭要素から委譲先バックエンドと、そのバックエンドへ渡すパスを決める。
-    /// 組込みビューは先頭要素を剥がし、保存クエリ名はそのまま渡す。
+    /// 先頭要素から委譲先バックエンドと、そのバックエンドへ渡すパス（先頭要素を
+    /// 剥がしたもの）を決める。組込みビュー以外は `None`。
     fn route(&self, path: &SmbPath) -> Option<(&dyn ShareBackend, SmbResult<SmbPath>)> {
         let first = path.components().first()?;
         match first.to_ascii_lowercase().as_str() {
@@ -1838,9 +1827,7 @@ impl HubBackend {
             "tags" => Some((&self.tags, strip_first(path))),
             "series" => Some((&self.series, strip_first(path))),
             "queries" => Some((&self.queries, strip_first(path))),
-            // 保存クエリ名: QueriesBackend は先頭要素をクエリ名として扱うため
-            // パスはそのまま渡す。
-            _ => Some((&self.queries, Ok(path.clone()))),
+            _ => None,
         }
     }
 }
@@ -1857,8 +1844,7 @@ impl ShareBackend for HubBackend {
             if opts.non_directory {
                 return Err(SmbError::IsDirectory);
             }
-            let entries = self.list_root().await?;
-            return Ok(Box::new(YozistDirHandle::new("yozist", entries)));
+            return Ok(Box::new(YozistDirHandle::new("yozist", self.root_entries())));
         }
         let (backend, sub) = self.route(path).ok_or(SmbError::PathNotFound)?;
         backend.open(identity, &sub?, opts).await
@@ -2739,9 +2725,9 @@ mod all_backend_tests {
         entries.iter().map(|e| e.info.name.clone()).collect()
     }
 
-    /// hub のルートに組込みビューと保存クエリ（任意名）が仮想フォルダとして並ぶ。
+    /// hub のルートには組込みビューのみが並ぶ（条件付きパスは queries 配下）。
     #[tokio::test]
-    async fn hub_root_lists_builtins_and_queries() {
+    async fn hub_root_lists_builtins_only() {
         let (deps, _dir) = test_deps().await;
         let id = user_identity("anon");
         seed_query(&deps, "仕事メモ").await;
@@ -2755,30 +2741,31 @@ mod all_backend_tests {
         for b in HUB_BUILTINS {
             assert!(names.iter().any(|n| n == b), "組込み {b} が無い: {names:?}");
         }
+        // 条件付きパスは hub ルート直下には出ない。
         assert!(
-            names.iter().any(|n| n == "仕事メモ"),
-            "クエリ名が hub ルートに無い: {names:?}"
+            !names.iter().any(|n| n == "仕事メモ"),
+            "クエリ名が hub ルートに出ている: {names:?}"
         );
+        assert_eq!(names.len(), HUB_BUILTINS.len(), "組込み以外が混ざっている: {names:?}");
     }
 
-    /// 組込み名と衝突するクエリ名は hub ルートに重複して出さない（組込み優先）。
+    /// ハブ直下の存在しない（組込みでない）名前は PathNotFound。
     #[tokio::test]
-    async fn hub_root_hides_query_colliding_with_builtin() {
+    async fn hub_unknown_top_level_is_not_found() {
         let (deps, _dir) = test_deps().await;
         let id = user_identity("anon");
-        seed_query(&deps, "all").await;
+        seed_query(&deps, "mydocs").await;
         let hub = HubBackend::new(deps.clone());
-        let root = hub
-            .open(&id, &SmbPath::root(), OpenOptions::default())
-            .await
-            .unwrap();
-        let names = names_of(&root.list_dir(None).await.unwrap());
-        assert_eq!(names.iter().filter(|n| n.as_str() == "all").count(), 1);
+        // 旧仕様の \mydocs\（直下）は廃止 → PathNotFound。
+        assert!(matches!(
+            hub.open(&id, &p("mydocs"), OpenOptions::default()).await,
+            Err(SmbError::PathNotFound)
+        ));
     }
 
-    /// hub から `yozist\<クエリ名>\` を辿るとそのクエリ結果のファイルが見える。
+    /// hub から `queries\<クエリ名>\` を辿るとそのクエリ結果のファイルが見える。
     #[tokio::test]
-    async fn hub_resolves_query_files() {
+    async fn hub_resolves_query_files_under_queries() {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
@@ -2794,9 +2781,12 @@ mod all_backend_tests {
         let canonical = format!("{}{}{}", f.id, ID_SEP, "doc.txt");
         seed_query(&deps, "mydocs").await;
 
-        // hub: \mydocs\ にクエリ結果が出る。
+        // hub: \queries\mydocs\ にクエリ結果が出る。
         let hub = HubBackend::new(deps.clone());
-        let dir = hub.open(&id, &p("mydocs"), OpenOptions::default()).await.unwrap();
+        let dir = hub
+            .open(&id, &p("queries/mydocs"), OpenOptions::default())
+            .await
+            .unwrap();
         let names = names_of(&dir.list_dir(None).await.unwrap());
         assert!(names.iter().any(|n| n == &canonical), "hub: {names:?}");
     }
@@ -2825,9 +2815,9 @@ mod all_backend_tests {
         let id = user_identity("anon");
         seed_query(&deps, "ro").await;
         let hub = HubBackend::new(deps.clone());
-        // クエリ配下のファイル削除は AccessDenied（QueriesBackend が拒否）。
+        // queries 配下のファイル削除は AccessDenied（QueriesBackend が拒否）。
         assert!(matches!(
-            hub.unlink(&id, &p("ro/whatever")).await,
+            hub.unlink(&id, &p("queries/ro/whatever")).await,
             Err(SmbError::AccessDenied)
         ));
     }

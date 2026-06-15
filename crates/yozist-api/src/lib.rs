@@ -1681,10 +1681,10 @@ fn json_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// SMB の任意名 share / hub のルーティングに使えない名前を弾く。
+/// 条件付きパス名のバリデーション。`yozist\queries\<名前>\` の 1 コンポーネントと
+/// して使うため、SMB パスで問題になる文字のみ弾く（名前自体は任意）。
 /// - 空 / 前後空白のみ
-/// - hub の組込みビュー名（all / tags / series / queries）と hub 名（yozist）
-/// - SMB share / パスで問題になる文字（`\\ / : * ? " < > |` と制御文字）
+/// - SMB パスで使えない文字（`\\ / : * ? " < > |` と制御文字）
 fn validate_query_name(name: &str) -> Result<String, ApiError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -1692,12 +1692,6 @@ fn validate_query_name(name: &str) -> Result<String, ApiError> {
     }
     if trimmed.len() > 80 {
         return Err(ApiError::BadRequest("クエリ名が長すぎます（80文字以内）".into()));
-    }
-    const RESERVED: [&str; 6] = ["all", "tags", "series", "queries", "yozist", "ipc$"];
-    if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(trimmed)) {
-        return Err(ApiError::BadRequest(format!(
-            "「{trimmed}」は予約名のため使用できません"
-        )));
     }
     if trimmed.chars().any(|c| {
         matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()
