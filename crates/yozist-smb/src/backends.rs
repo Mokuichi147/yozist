@@ -1610,61 +1610,10 @@ impl QueriesBackend {
         &self,
         q: &yozist_core::QueryDef,
     ) -> SmbResult<Vec<yozist_core::FileMeta>> {
-        // タグ名→ID解決 + AND/NOT
-        let mut and_ids = Vec::new();
-        for name in &q.tags_and {
-            let t = self
-                .deps
-                .meta
-                .get_tag_by_name(name)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-            match t {
-                Some(t) => and_ids.push(t.id),
-                None => return Ok(vec![]),
-            }
-        }
-        let mut not_ids = Vec::new();
-        for name in &q.tags_not {
-            if let Some(t) = self
-                .deps
-                .meta
-                .get_tag_by_name(name)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
-            {
-                not_ids.push(t.id);
-            }
-        }
-        let candidates = if and_ids.is_empty() {
-            self.deps
-                .meta
-                .list_files(1000, 0)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
-        } else {
-            self.deps
-                .meta
-                .list_files_by_tags(&and_ids)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?
-        };
-        if not_ids.is_empty() {
-            return Ok(candidates);
-        }
-        let mut out = Vec::new();
-        for f in candidates {
-            let tags = self
-                .deps
-                .meta
-                .list_tags_of(&f.id)
-                .await
-                .map_err(|e| SmbError::Io(std::io::Error::other(e.to_string())))?;
-            if !tags.iter().any(|t| not_ids.contains(&t.id)) {
-                out.push(f);
-            }
-        }
-        Ok(out)
+        // 条件評価は REST / SMB 共通の yozist-db::resolve_query に委譲する。
+        yozist_db::resolve_query(&*self.deps.meta, q)
+            .await
+            .map_err(io_err)
     }
 }
 

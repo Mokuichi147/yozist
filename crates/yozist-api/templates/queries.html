@@ -11,11 +11,9 @@
         <button class="btn btn-sm btn-primary" onclick="openQueryModal('create')">+ 新規作成</button>
       </div>
       <p class="text-xs opacity-60 mb-3 leading-relaxed">
-        タグの条件にマッチするファイル群へ任意の名前を付けて、
-        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/queries/&lt;名前&gt;/</span> でアクセスできます。
-        <span class="font-mono">smb://&lt;サーバ&gt;/yozist/</span> に接続すれば、組込みビュー
-        (all / tags / series / queries) を 1 か所から辿れます。
-        名前と条件は作成したユーザーがいつでも変更できます。
+        タグ（手動 / システム / AI）・シリーズ・種類・名前・日付の条件にマッチするファイル群へ
+        任意の名前を付けて、<span class="font-mono">smb://&lt;サーバ&gt;/yozist/queries/&lt;名前&gt;/</span>
+        でアクセスできます。名前と条件は作成したユーザーがいつでも変更できます。
       </p>
       <div id="query-list" class="text-sm space-y-1">…</div>
     </div>
@@ -25,7 +23,7 @@
 
 <!-- 条件付きパス 作成/編集モーダル（macOS スマートフォルダ風の条件ビルダー） -->
 <dialog id="q-modal" class="modal">
-  <div class="modal-box max-w-2xl">
+  <div class="modal-box max-w-3xl">
     <h3 id="q-title" class="font-bold text-lg mb-3">条件付きパスの作成</h3>
 
     <div class="space-y-3">
@@ -41,8 +39,9 @@
       <div>
         <div class="flex items-center gap-2 text-sm mb-2">
           <span class="opacity-70">次の</span>
-          <select id="q-match" class="select select-bordered select-xs" title="現在 AND（すべて）のみ対応">
+          <select id="q-match" class="select select-bordered select-xs">
             <option value="all">すべて</option>
+            <option value="any">いずれか</option>
           </select>
           <span class="opacity-70">の条件に一致するファイル</span>
         </div>
@@ -59,39 +58,91 @@
 </dialog>
 
 <datalist id="tag-options"></datalist>
+<datalist id="series-options"></datalist>
 {% endblock %}
 
 {% block script %}
 <script>
 // 作成者本人のみ編集・削除を許可（サーバ側でも検証）。
 let myUserId = null;
-// 編集中のクエリ ID（作成時は null）。
 let editingId = null;
+
+// フィールド定義（属性ドロップダウン）と、それぞれの「型」。
+const FIELD_TYPE = {
+  manual_tag: 'tag', system_tag: 'tag', ai_tag: 'tag', tag: 'tag',
+  series: 'series', mime: 'mime', name: 'text', created: 'date', updated: 'date',
+};
+const FIELD_OPTIONS = `
+  <optgroup label="タグ">
+    <option value="manual_tag">手動タグ</option>
+    <option value="system_tag">システムタグ</option>
+    <option value="ai_tag">AIタグ</option>
+    <option value="tag">タグ（種別不問）</option>
+  </optgroup>
+  <optgroup label="属性">
+    <option value="series">シリーズ</option>
+    <option value="mime">種類</option>
+    <option value="name">名前</option>
+    <option value="created">作成日</option>
+    <option value="updated">更新日</option>
+  </optgroup>`;
+const MIME_PRESETS = [
+  ['pdf', 'PDF'], ['image/', '画像'], ['text/', 'テキスト'], ['video/', '動画'],
+  ['audio/', '音声'], ['word', 'Word'], ['sheet', 'Excel'],
+  ['presentation', 'PowerPoint'], ['zip', 'ZIP/圧縮'],
+];
 
 async function init() {
   const me = await requireAuth();
   if (!me) return;
   myUserId = me.user && me.user.id;
   $('main').classList.remove('hidden');
-  await Promise.all([loadQueries(), loadTagOptions()]);
+  await Promise.all([loadQueries(), loadTagOptions(), loadSeriesOptions()]);
 }
 
 function canEditQuery(q) {
-  // created_by 未設定の旧データはログイン済みなら誰でも、それ以外は作成者のみ。
   return q.created_by == null || q.created_by === myUserId;
 }
 
-// ---- 一覧 ----
+// ---- 一覧（条件を人間可読に整形） ----
+const FIELD_LABEL = {
+  manual_tag: '手動タグ', system_tag: 'システムタグ', ai_tag: 'AIタグ', tag: 'タグ',
+  series: 'シリーズ', mime: '種類', name: '名前', created: '作成日', updated: '更新日',
+};
+const OP_LABEL = {
+  include: 'を含む', exclude: 'を含まない', contains: 'を含む', not_contains: 'を含まない',
+  is: 'と一致', is_not: 'と不一致', starts_with: 'で始まる', ends_with: 'で終わる',
+  within: '以内', before: 'より前', after: 'より後',
+};
+const UNIT_LABEL = { day: '日', month: 'か月', year: '年' };
+
+function condText(c) {
+  const f = FIELD_LABEL[c.field] || c.field;
+  if (c.field === 'created' || c.field === 'updated') {
+    return `${f}が ${c.value}${UNIT_LABEL[c.unit] || ''} ${OP_LABEL[c.op] || c.op}`;
+  }
+  const mimeLabel = c.field === 'mime'
+    ? (MIME_PRESETS.find(p => p[0] === c.value) || [c.value, c.value])[1]
+    : c.value;
+  return `${f}「${mimeLabel}」${OP_LABEL[c.op] || c.op}`;
+}
+
+function queryText(q) {
+  const parts = [];
+  (q.query.tags_and || []).forEach(t => parts.push(`タグ「${t}」を含む`));
+  (q.query.tags_not || []).forEach(t => parts.push(`タグ「${t}」を含まない`));
+  (q.query.conditions || []).forEach(c => parts.push(condText(c)));
+  if (parts.length === 0) return '全件';
+  const join = (q.query.match_mode === 'any') ? ' または ' : ' かつ ';
+  return parts.join(join);
+}
+
 async function loadQueries() {
   const el = $('query-list');
   try {
     const list = await json('/api/queries');
     if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-sm py-2">条件付きパスはまだありません。「+ 新規作成」から追加してください。</div>'; return; }
     el.innerHTML = list.map(q => {
-      const parts = [];
-      (q.query.tags_and || []).forEach(t => parts.push(`タグ「${escapeHtml(t)}」を含む`));
-      (q.query.tags_not || []).forEach(t => parts.push(`タグ「${escapeHtml(t)}」を含まない`));
-      const cond = parts.length ? parts.join(' かつ ') : '全件';
       const path = `smb://&lt;サーバ&gt;/yozist/queries/${escapeHtml(q.name)}/`;
       const mine = canEditQuery(q);
       const editBtns = mine ? `
@@ -100,7 +151,7 @@ async function loadQueries() {
       return `<div class="flex items-start justify-between row-compact gap-2 border-b border-base-200 last:border-0 py-2">
         <div class="min-w-0">
           <div><span class="font-semibold break-all">${escapeHtml(q.name)}</span></div>
-          <div class="text-xs opacity-60 break-all">${cond}</div>
+          <div class="text-xs opacity-60 break-all">${escapeHtml(queryText(q))}</div>
           <div class="text-xs font-mono opacity-50 break-all">${path}</div>
           ${q.description ? `<div class="text-xs opacity-60 break-all">${escapeHtml(q.description)}</div>` : ''}
         </div>
@@ -113,58 +164,106 @@ async function loadQueries() {
   } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
-// 既存タグ名をオートコンプリート候補として読み込む。
 async function loadTagOptions() {
   try {
     const tags = await json('/api/tags');
     $('tag-options').innerHTML = tags.map(t => `<option value="${escapeHtml(t.name)}"></option>`).join('');
   } catch (e) { /* 候補なしでも手入力できる */ }
 }
+async function loadSeriesOptions() {
+  try {
+    const series = await json('/api/series');
+    $('series-options').innerHTML = series.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+  } catch (e) { /* 同上 */ }
+}
 
-// ---- 条件ビルダー（行の追加・削除） ----
-function makeRow(op = 'include', value = '') {
+// ---- 条件ビルダー ----
+function opOptions(type, op) {
+  let opts;
+  if (type === 'tag' || type === 'series' || type === 'mime') {
+    opts = [['include', type === 'mime' ? 'を含む' : 'を含む'], ['exclude', 'を含まない']];
+  } else if (type === 'text') {
+    opts = [['contains', 'を含む'], ['is', 'と一致'], ['starts_with', 'で始まる'], ['ends_with', 'で終わる'], ['not_contains', 'を含まない']];
+  } else { // date
+    opts = [['within', '以内'], ['before', 'より前'], ['after', 'より後']];
+  }
+  return opts.map(([v, l]) => `<option value="${v}"${v === op ? ' selected' : ''}>${l}</option>`).join('');
+}
+
+function renderControls(type, op, value, unit) {
+  const opSel = `<select class="q-op select select-bordered select-sm">${opOptions(type, op)}</select>`;
+  const v = escapeHtml(value || '');
+  if (type === 'tag') {
+    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="tag-options" placeholder="タグ名" value="${v}" />`;
+  }
+  if (type === 'series') {
+    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />`;
+  }
+  if (type === 'mime') {
+    const opts = MIME_PRESETS.map(([val, lbl]) => `<option value="${val}"${val === value ? ' selected' : ''}>${lbl}</option>`).join('');
+    return `${opSel}<select class="q-val select select-bordered select-sm flex-1 min-w-0">${opts}</select>`;
+  }
+  if (type === 'text') {
+    return `${opSel}<input class="q-val input input-bordered input-sm flex-1 min-w-0" placeholder="文字列" value="${v}" />`;
+  }
+  // date: [数値][単位][演算子]
+  const units = [['day', '日'], ['month', 'か月'], ['year', '年']]
+    .map(([val, lbl]) => `<option value="${val}"${val === (unit || 'day') ? ' selected' : ''}>${lbl}</option>`).join('');
+  return `<input type="number" min="0" class="q-val input input-bordered input-sm w-20" value="${v || '1'}" />
+    <select class="q-unit select select-bordered select-sm">${units}</select>${opSel}`;
+}
+
+function makeRow(c) {
+  c = c || { field: 'manual_tag', op: 'include', value: '', unit: null };
+  const type = FIELD_TYPE[c.field] || 'tag';
   const row = document.createElement('div');
-  row.className = 'q-row flex items-center gap-2';
+  row.className = 'q-row flex flex-wrap items-center gap-2';
   row.innerHTML = `
-    <select class="q-attr select select-bordered select-sm" disabled title="現在はタグ条件のみ対応">
-      <option value="tag" selected>タグ</option>
-    </select>
-    <select class="q-op select select-bordered select-sm">
-      <option value="include">を含む</option>
-      <option value="exclude">を含まない</option>
-    </select>
-    <input class="q-val input input-bordered input-sm flex-1 min-w-0" list="tag-options" placeholder="タグ名" />
+    <select class="q-field select select-bordered select-sm">${FIELD_OPTIONS}</select>
+    <span class="q-controls flex flex-wrap items-center gap-2 flex-1 min-w-0"></span>
     <button type="button" class="btn btn-sm btn-square q-del" title="この条件を削除">−</button>
-    <button type="button" class="btn btn-sm btn-square q-add" title="条件を追加">＋</button>
-  `;
-  row.querySelector('.q-op').value = op;
-  row.querySelector('.q-val').value = value;
+    <button type="button" class="btn btn-sm btn-square q-add" title="条件を追加">＋</button>`;
+  const fieldSel = row.querySelector('.q-field');
+  fieldSel.value = c.field;
+  row.querySelector('.q-controls').innerHTML = renderControls(type, c.op, c.value, c.unit);
+  // 属性変更時は演算子・値コントロールを作り直す。
+  fieldSel.onchange = () => {
+    const t = FIELD_TYPE[fieldSel.value] || 'tag';
+    row.querySelector('.q-controls').innerHTML = renderControls(t, null, '', null);
+  };
   row.querySelector('.q-add').onclick = () => { $('q-rows').appendChild(makeRow()); };
   row.querySelector('.q-del').onclick = () => {
     const rows = $('q-rows');
     if (rows.children.length > 1) row.remove();
-    else { row.querySelector('.q-val').value = ''; } // 最後の 1 行は消さず空にする
+    else row.replaceWith(makeRow()); // 最後の1行は空にリセット
   };
   return row;
 }
 
-function setRows(tagsAnd, tagsNot) {
+function setRows(q) {
   const cont = $('q-rows');
   cont.innerHTML = '';
-  (tagsAnd || []).forEach(t => cont.appendChild(makeRow('include', t)));
-  (tagsNot || []).forEach(t => cont.appendChild(makeRow('exclude', t)));
+  // レガシー tags_and/tags_not を「タグ」条件へ変換して表示。
+  (q.tags_and || []).forEach(t => cont.appendChild(makeRow({ field: 'tag', op: 'include', value: t })));
+  (q.tags_not || []).forEach(t => cont.appendChild(makeRow({ field: 'tag', op: 'exclude', value: t })));
+  (q.conditions || []).forEach(c => cont.appendChild(makeRow(c)));
   if (cont.children.length === 0) cont.appendChild(makeRow());
 }
 
-function collectRows() {
-  const tags_and = [], tags_not = [];
+function collectConditions() {
+  const conditions = [];
   $('q-rows').querySelectorAll('.q-row').forEach(row => {
-    const v = row.querySelector('.q-val').value.trim();
-    if (!v) return;
-    if (row.querySelector('.q-op').value === 'exclude') tags_not.push(v);
-    else tags_and.push(v);
+    const field = row.querySelector('.q-field').value;
+    const type = FIELD_TYPE[field] || 'tag';
+    const op = row.querySelector('.q-op').value;
+    const valEl = row.querySelector('.q-val');
+    const value = (valEl.value || '').trim();
+    if (!value) return; // 値が空の行は無視
+    const c = { field, op, value };
+    if (type === 'date') c.unit = row.querySelector('.q-unit').value;
+    conditions.push(c);
   });
-  return { tags_and, tags_not };
+  return conditions;
 }
 
 // ---- モーダル制御 ----
@@ -177,11 +276,13 @@ async function openQueryModal(mode, id) {
     catch (e) { uiToast('取得に失敗しました', 'error'); return; }
     $('q-name').value = q.name;
     $('q-desc').value = q.description || '';
-    setRows(q.query.tags_and, q.query.tags_not);
+    $('q-match').value = q.query.match_mode || 'all';
+    setRows(q.query);
   } else {
     $('q-name').value = '';
     $('q-desc').value = '';
-    setRows([], []);
+    $('q-match').value = 'all';
+    setRows({});
   }
   $('q-modal').showModal();
   $('q-name').focus();
@@ -190,9 +291,16 @@ async function openQueryModal(mode, id) {
 async function saveQuery() {
   const name = $('q-name').value.trim();
   if (!name) { uiToast('パス名を入力してください', 'warning'); return; }
-  const { tags_and, tags_not } = collectRows();
   const desc = $('q-desc').value.trim();
-  const body = { name, tags_and, tags_not, description: desc || null };
+  // すべて conditions で表現し、レガシー tags_* はクリアする。
+  const body = {
+    name,
+    description: desc || null,
+    match_mode: $('q-match').value,
+    conditions: collectConditions(),
+    tags_and: [],
+    tags_not: [],
+  };
   try {
     if (editingId) {
       await json(`/api/queries/${editingId}`, { method: 'PATCH', body });

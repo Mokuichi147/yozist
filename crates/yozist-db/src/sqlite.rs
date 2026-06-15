@@ -1006,6 +1006,7 @@ mod tests {
             query: QueryDef {
                 tags_and: vec!["仕事".into()],
                 tags_not: vec!["下書き".into()],
+                ..Default::default()
             },
             description: Some("初版".into()),
             created_by: None,
@@ -1020,6 +1021,7 @@ mod tests {
             query: QueryDef {
                 tags_and: vec!["仕事".into()],
                 tags_not: vec![],
+                ..Default::default()
             },
             description: None,
             ..q.clone()

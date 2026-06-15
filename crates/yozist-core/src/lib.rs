@@ -156,13 +156,49 @@ pub struct Series {
     pub description: Option<String>,
 }
 
-/// クエリ条件。v1 では AND/NOT のタグフィルタのみ。
+/// 条件のマッチ方法。`All` = すべて(AND)、`Any` = いずれか(OR)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    #[default]
+    All,
+    Any,
+}
+
+/// スマートフォルダ風の 1 条件。`field` / `op` / `value`（+ 日付の `unit`）の
+/// フラットな文字列表現にして、フロントエンドとの相互運用と将来の属性追加を
+/// 容易にしている。解決は [`yozist_db::resolve_query`] が行う。
+///
+/// 対応する `field` と `op`:
+/// - `tag` / `manual_tag` / `system_tag` / `ai_tag` … op: `include` | `exclude`、value = タグ名
+/// - `series` … op: `include` | `exclude`、value = シリーズ名
+/// - `mime`（種類）… op: `include` | `exclude`、value = MIME 部分文字列（例: `pdf`, `image/`）
+/// - `name`（名前）… op: `contains` | `not_contains` | `is` | `starts_with` | `ends_with`
+/// - `created` / `updated`（作成日 / 更新日）… op: `within` | `before` | `after`、
+///   value = 数値、unit = `day` | `month` | `year`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryCondition {
+    pub field: String,
+    pub op: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+/// クエリ条件。`tags_and` / `tags_not` は後方互換のためのレガシー表現で、
+/// 解決時には `conditions`（タグ include/exclude）と同等に評価される。
+/// 新 UI は `match_mode` + `conditions` を使う。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryDef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags_and: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags_not: Vec<String>,
+    #[serde(default)]
+    pub match_mode: MatchMode,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<QueryCondition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

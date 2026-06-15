@@ -1651,12 +1651,17 @@ struct CreateQueryInput {
     tags_and: Vec<String>,
     #[serde(default)]
     tags_not: Vec<String>,
+    /// スマートフォルダ風の条件群（タグ種別 / シリーズ / 種類 / 名前 / 日付）。
+    #[serde(default)]
+    match_mode: yozist_core::MatchMode,
+    #[serde(default)]
+    conditions: Vec<yozist_core::QueryCondition>,
     /// 期限秒数（now + N 秒）。
     expires_in_secs: Option<i64>,
 }
 
 /// クエリ更新入力。指定したフィールドのみ差し替える（`None` は据え置き）。
-/// `name` を変えると SMB の任意名 share も改名される。
+/// `name` を変えると SMB の `queries\<名前>\` パスも改名される。
 #[derive(Deserialize)]
 struct UpdateQueryInput {
     name: Option<String>,
@@ -1664,6 +1669,8 @@ struct UpdateQueryInput {
     description: Option<Option<String>>,
     tags_and: Option<Vec<String>>,
     tags_not: Option<Vec<String>>,
+    match_mode: Option<yozist_core::MatchMode>,
+    conditions: Option<Vec<yozist_core::QueryCondition>>,
 }
 
 /// `Option<Option<T>>` を JSON の「キー欠落=据え置き / null=クリア」に対応させる。
@@ -1750,6 +1757,8 @@ async fn create_saved_query(
         query: QueryDef {
             tags_and: input.tags_and,
             tags_not: input.tags_not,
+            match_mode: input.match_mode,
+            conditions: input.conditions,
         },
         description: input.description,
         created_by,
@@ -1814,6 +1823,8 @@ async fn update_saved_query(
         query: QueryDef {
             tags_and: input.tags_and.unwrap_or(existing.query.tags_and),
             tags_not: input.tags_not.unwrap_or(existing.query.tags_not),
+            match_mode: input.match_mode.unwrap_or(existing.query.match_mode),
+            conditions: input.conditions.unwrap_or(existing.query.conditions),
         },
         description: input.description.unwrap_or(existing.description),
         created_by: existing.created_by,
@@ -1914,43 +1925,10 @@ pub async fn resolve_query(
     meta: &dyn yozist_db::MetaStore,
     q: &QueryDef,
 ) -> Result<Vec<FileMeta>, ApiError> {
-    // タグ名 → TagId 解決
-    let mut and_ids = Vec::with_capacity(q.tags_and.len());
-    for name in &q.tags_and {
-        let tag = meta.get_tag_by_name(name).await.map_err(ApiError::from_db)?;
-        match tag {
-            Some(t) => and_ids.push(t.id),
-            None => return Ok(vec![]), // 存在しないタグ → 空
-        }
-    }
-    let mut not_ids = Vec::with_capacity(q.tags_not.len());
-    for name in &q.tags_not {
-        if let Some(t) = meta.get_tag_by_name(name).await.map_err(ApiError::from_db)? {
-            not_ids.push(t.id);
-        }
-    }
-
-    let candidates = if and_ids.is_empty() {
-        meta.list_files(1000, 0).await.map_err(ApiError::from_db)?
-    } else {
-        meta.list_files_by_tags(&and_ids)
-            .await
-            .map_err(ApiError::from_db)?
-    };
-
-    // tags_not で除外
-    if not_ids.is_empty() {
-        return Ok(candidates);
-    }
-    let mut out = Vec::new();
-    for f in candidates {
-        let tags = meta.list_tags_of(&f.id).await.map_err(ApiError::from_db)?;
-        let has_excluded = tags.iter().any(|t| not_ids.contains(&t.id));
-        if !has_excluded {
-            out.push(f);
-        }
-    }
-    Ok(out)
+    // 条件評価は REST / SMB 共通の yozist-db::resolve_query に委譲する。
+    yozist_db::resolve_query(meta, q)
+        .await
+        .map_err(ApiError::from_db)
 }
 
 // ---------------------------------------------------------------------------

@@ -20,8 +20,10 @@ use yozist_core::{
 };
 
 pub mod audit;
+pub mod resolver;
 pub mod sqlite;
 pub use audit::{AuditEntry, AuditLog, AuditRecord, SharedAuditLog};
+pub use resolver::resolve_query;
 pub use sqlite::SqliteMetaStore;
 
 /// ファイル一覧のソートキー。`list_files_sorted` で使用する。
