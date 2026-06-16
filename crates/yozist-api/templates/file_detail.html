@@ -92,9 +92,10 @@
         <div class="card-body p-4">
           <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">シリーズ</h3>
           <div class="join w-full">
-            <select id="fd-add-series" class="select select-bordered select-sm join-item w-full">
-              <option value="">シリーズ選択…</option>
-            </select>
+            <input id="fd-add-series" class="input input-bordered input-sm join-item w-full"
+                   list="fd-series-options" placeholder="シリーズ名を入力して追加"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();addToSeries();}">
+            <datalist id="fd-series-options"></datalist>
             <button class="btn btn-sm join-item" onclick="addToSeries()">+</button>
           </div>
           <div id="fd-series-list" class="space-y-2 mt-1"></div>
@@ -152,6 +153,7 @@ let contentObjectUrl = null;  // メディアプレビュー用の object URL
 let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
+let seriesOptions = [];         // 候補シリーズ（自分が閲覧可能なもの。名前→ID 解決に使う）
 
 // --- テキスト表示の状態 ---
 // 小さいファイル（TEXT_FULL_LOAD_MAX 以下）は全文を取得し読み取り専用 textarea で描画
@@ -248,10 +250,10 @@ async function init() {
 
 async function loadSeriesOptions() {
   try {
-    const list = await json('/api/series');
-    $('fd-add-series').innerHTML = '<option value="">シリーズ選択…</option>' +
-      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
-  } catch (e) {}
+    seriesOptions = await json('/api/series');
+    $('fd-series-options').innerHTML =
+      seriesOptions.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+  } catch (e) { seriesOptions = []; }
 }
 
 async function loadDetail() {
@@ -1103,13 +1105,19 @@ async function detachTag(tagId) {
 }
 
 async function addToSeries() {
-  const sid = $('fd-add-series').value;
-  if (!sid) { uiToast('シリーズを選択してください', 'warning'); return; }
+  const name = $('fd-add-series').value.trim();
+  if (!name) { uiToast('シリーズ名を入力してください', 'warning'); return; }
   try {
+    // 入力名が既存（自分の）シリーズなら再利用し、なければ新規作成する。
+    let sid = (seriesOptions.find(s => s.name === name) || {}).id;
+    if (!sid) {
+      const created = await json('/api/series', { method: 'POST', body: { name } });
+      sid = created.id;
+    }
     await json(`/api/series/${sid}/members`, { method: 'POST', body: { file_id: fileId } });
     uiToast('シリーズに追加しました', 'success');
     $('fd-add-series').value = '';
-    await loadFileSeries();
+    await Promise.all([loadSeriesOptions(), loadFileSeries()]);
   } catch (e) {
     uiToast('シリーズ追加に失敗しました: ' + e.message, 'error');
   }
