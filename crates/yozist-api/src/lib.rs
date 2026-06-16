@@ -1404,9 +1404,37 @@ struct CreateSeriesInput {
     description: Option<String>,
 }
 
-async fn list_series(State(s): State<ApiState>) -> Result<Json<Vec<Series>>, ApiError> {
-    let list = s.meta.list_series().await.map_err(ApiError::from_db)?;
-    Ok(Json(list))
+/// シリーズ候補の一覧。ファイル一覧と同じく、閲覧者が VIEW できるメンバーを
+/// 1 件以上含むシリーズのみ返す（他人だけのシリーズは候補に出さない）。
+/// 候補ピッカー（一覧フィルター・シリーズ追加・条件ビルダー）が共通で使う。
+async fn list_series(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<Vec<Series>>, ApiError> {
+    let all = s.meta.list_series().await.map_err(ApiError::from_db)?;
+    let mut out = Vec::with_capacity(all.len());
+    for sr in all {
+        let members = s
+            .meta
+            .list_series_members(&sr.id)
+            .await
+            .map_err(ApiError::from_db)?;
+        let mut visible = false;
+        for m in &members {
+            if s.authz
+                .check(&ctx, &Target::file(m.file_id), PermissionMask::VIEW)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                visible = true;
+                break;
+            }
+        }
+        if visible {
+            out.push(sr);
+        }
+    }
+    Ok(Json(out))
 }
 
 async fn create_series(
