@@ -15,13 +15,15 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use yozist_core::{
-    Commit, FileId, FileMeta, SavedQuery, SavedQueryId, Series, SeriesId, SeriesMember, Tag,
+    Commit, FileId, FileMeta, Filter, FilterId, Series, SeriesId, SeriesMember, Tag,
     TagId,
 };
 
 pub mod audit;
+pub mod resolver;
 pub mod sqlite;
 pub use audit::{AuditEntry, AuditLog, AuditRecord, SharedAuditLog};
+pub use resolver::resolve_filter;
 pub use sqlite::SqliteMetaStore;
 
 /// ファイル一覧のソートキー。`list_files_sorted` で使用する。
@@ -111,18 +113,18 @@ pub trait MetaStore: Send + Sync {
     /// MATCH クエリで一致する `FileId` を新しい順で返す。
     async fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<FileId>, DbError>;
 
-    // ---- saved queries ----
-    async fn upsert_saved_query(&self, query: &SavedQuery) -> Result<SavedQueryId, DbError>;
-    async fn get_saved_query(
+    // ---- filters ----
+    async fn upsert_filter(&self, query: &Filter) -> Result<FilterId, DbError>;
+    async fn get_filter(
         &self,
-        id: &SavedQueryId,
-    ) -> Result<Option<SavedQuery>, DbError>;
-    async fn get_saved_query_by_name(
+        id: &FilterId,
+    ) -> Result<Option<Filter>, DbError>;
+    async fn get_filter_by_name(
         &self,
         name: &str,
-    ) -> Result<Option<SavedQuery>, DbError>;
-    async fn list_saved_queries(&self) -> Result<Vec<SavedQuery>, DbError>;
-    async fn delete_saved_query(&self, id: &SavedQueryId) -> Result<(), DbError>;
+    ) -> Result<Option<Filter>, DbError>;
+    async fn list_filters(&self) -> Result<Vec<Filter>, DbError>;
+    async fn delete_filter(&self, id: &FilterId) -> Result<(), DbError>;
 }
 
 pub type SharedMetaStore = Arc<dyn MetaStore>;

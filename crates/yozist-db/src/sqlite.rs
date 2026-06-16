@@ -16,7 +16,7 @@ use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
 use yozist_core::{
-    ActorId, BlobId, Commit, CommitId, FileId, FileMeta, QueryDef, SavedQuery, SavedQueryId,
+    ActorId, BlobId, Commit, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId,
     Series, SeriesId, SeriesMember, Tag, TagId, TagKind,
 };
 
@@ -155,21 +155,21 @@ fn row_to_series(row: SqliteRow) -> Result<Series, DbError> {
     })
 }
 
-fn row_to_saved_query(row: SqliteRow) -> Result<SavedQuery, DbError> {
+fn row_to_filter(row: SqliteRow) -> Result<Filter, DbError> {
     let id: String = row.try_get("id")?;
     let name: String = row.try_get("name")?;
-    let query_json: String = row.try_get("query_json")?;
+    let definition_json: String = row.try_get("definition_json")?;
     let description: Option<String> = row.try_get("description")?;
     let created_by: Option<i64> = row.try_get("created_by")?;
     let created_at: String = row.try_get("created_at")?;
     let expires_at: Option<String> = row.try_get("expires_at")?;
 
-    let query: QueryDef = serde_json::from_str(&query_json)
-        .map_err(|e| DbError::Invalid(format!("query json: {e}")))?;
-    Ok(SavedQuery {
-        id: SavedQueryId::from_uuid(parse_uuid(&id)?),
+    let definition: FilterDef = serde_json::from_str(&definition_json)
+        .map_err(|e| DbError::Invalid(format!("filter definition json: {e}")))?;
+    Ok(Filter {
+        id: FilterId::from_uuid(parse_uuid(&id)?),
         name,
-        query,
+        definition,
         description,
         created_by,
         created_at: parse_dt(&created_at)?,
@@ -633,18 +633,19 @@ impl MetaStore for SqliteMetaStore {
         Ok(())
     }
 
-    async fn upsert_saved_query(
+    async fn upsert_filter(
         &self,
-        q: &SavedQuery,
-    ) -> Result<SavedQueryId, DbError> {
-        let body = serde_json::to_string(&q.query)
-            .map_err(|e| DbError::Invalid(format!("query json: {e}")))?;
+        q: &Filter,
+    ) -> Result<FilterId, DbError> {
+        let body = serde_json::to_string(&q.definition)
+            .map_err(|e| DbError::Invalid(format!("filter definition json: {e}")))?;
         sqlx::query(
-            r#"INSERT INTO saved_queries
-               (id, name, query_json, description, created_by, created_at, expires_at)
+            r#"INSERT INTO filters
+               (id, name, definition_json, description, created_by, created_at, expires_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(name) DO UPDATE SET
-                 query_json = excluded.query_json,
+               ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 definition_json = excluded.definition_json,
                  description = excluded.description,
                  expires_at = excluded.expires_at"#,
         )
@@ -660,48 +661,48 @@ impl MetaStore for SqliteMetaStore {
         Ok(q.id)
     }
 
-    async fn get_saved_query(
+    async fn get_filter(
         &self,
-        id: &SavedQueryId,
-    ) -> Result<Option<SavedQuery>, DbError> {
+        id: &FilterId,
+    ) -> Result<Option<Filter>, DbError> {
         let row = sqlx::query(
-            "SELECT id, name, query_json, description, created_by, created_at, expires_at
-             FROM saved_queries WHERE id = ?",
+            "SELECT id, name, definition_json, description, created_by, created_at, expires_at
+             FROM filters WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await?;
-        row.map(row_to_saved_query).transpose()
+        row.map(row_to_filter).transpose()
     }
 
-    async fn get_saved_query_by_name(
+    async fn get_filter_by_name(
         &self,
         name: &str,
-    ) -> Result<Option<SavedQuery>, DbError> {
+    ) -> Result<Option<Filter>, DbError> {
         let row = sqlx::query(
-            "SELECT id, name, query_json, description, created_by, created_at, expires_at
-             FROM saved_queries WHERE name = ?",
+            "SELECT id, name, definition_json, description, created_by, created_at, expires_at
+             FROM filters WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(row_to_saved_query).transpose()
+        row.map(row_to_filter).transpose()
     }
 
-    async fn list_saved_queries(&self) -> Result<Vec<SavedQuery>, DbError> {
+    async fn list_filters(&self) -> Result<Vec<Filter>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, name, query_json, description, created_by, created_at, expires_at
-             FROM saved_queries
+            "SELECT id, name, definition_json, description, created_by, created_at, expires_at
+             FROM filters
              WHERE expires_at IS NULL OR expires_at > datetime('now')
              ORDER BY name ASC",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(row_to_saved_query).collect()
+        rows.into_iter().map(row_to_filter).collect()
     }
 
-    async fn delete_saved_query(&self, id: &SavedQueryId) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM saved_queries WHERE id = ?")
+    async fn delete_filter(&self, id: &FilterId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM filters WHERE id = ?")
             .bind(id.to_string())
             .execute(&self.pool)
             .await?;
@@ -992,5 +993,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.0, 0);
+    }
+
+    /// upsert_filter は同一 id での更新（改名・条件変更）を許す。
+    /// （ON CONFLICT(id) になっていないと id の PK 衝突で失敗する回帰）
+    #[tokio::test]
+    async fn upsert_filter_updates_in_place_and_renames() {
+        let s = store().await;
+        let q = Filter {
+            id: FilterId::new(),
+            name: "仕事メモ".into(),
+            definition: FilterDef {
+                tags_and: vec!["仕事".into()],
+                tags_not: vec!["下書き".into()],
+                ..Default::default()
+            },
+            description: Some("初版".into()),
+            created_by: None,
+            created_at: OffsetDateTime::now_utc(),
+            expires_at: None,
+        };
+        s.upsert_filter(&q).await.unwrap();
+
+        // 同一 id で改名 + 条件変更 + 説明クリア。
+        let updated = Filter {
+            name: "重要メモ".into(),
+            definition: FilterDef {
+                tags_and: vec!["仕事".into()],
+                tags_not: vec![],
+                ..Default::default()
+            },
+            description: None,
+            ..q.clone()
+        };
+        s.upsert_filter(&updated).await.unwrap();
+
+        // 行は増えず（1 件）、内容が更新されている。
+        let all = s.list_filters().await.unwrap();
+        assert_eq!(all.len(), 1, "更新で行が増えた");
+        let got = s.get_filter(&q.id).await.unwrap().unwrap();
+        assert_eq!(got.name, "重要メモ");
+        assert_eq!(got.definition.tags_and, vec!["仕事".to_string()]);
+        assert!(got.definition.tags_not.is_empty());
+        assert_eq!(got.description, None);
+        // 旧名では引けない。
+        assert!(s.get_filter_by_name("仕事メモ").await.unwrap().is_none());
     }
 }

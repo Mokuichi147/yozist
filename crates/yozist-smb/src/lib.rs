@@ -6,18 +6,24 @@
 //! - すべての操作は `yozist-versioning` / `yozist-db` の公開 API 経由
 //!
 //! # Share 一覧
-//! | share | 内容 |
-//! |-------|------|
-//! | `all` | 全ファイルをフラット (v1) |
-//! | `tags` | 階層パス = タグの AND 条件 (v2 TODO) |
-//! | `series` | 配下に `NNNN__name` 形式で順序付きメンバー (v2 TODO) |
-//! | `recent` | 直近 N 件（読取専用） (v2 TODO) |
+//! 公開 share は全仮想ビューへの単一エントリ `yozist`（[`HubBackend`]）のみ。
+//! 組込みビューと条件付きパスはすべてその配下に現れる:
+//!
+//! | パス | 内容 |
+//! |------|------|
+//! | `yozist\` | ルート。組込みビュー (all / tags / series / filters) が並ぶ |
+//! | `yozist\all\` | 全ファイルをフラット |
+//! | `yozist\tags\…` | 階層パス = タグの AND 条件 |
+//! | `yozist\series\…` | 配下に `NNNN__name` 形式で順序付きメンバー |
+//! | `yozist\filters\` | 全フィルター（任意名）が並ぶ |
+//! | `yozist\filters\<任意の名前>\` | フィルターの結果へアクセス |
 //!
 //! # TODO
-//! - [ ] TagsBackend / SeriesBackend / RecentBackend の本実装
-//! - [ ] `AuthContext` を SMB セッションから抽出するアダプタ
+//! - [ ] RecentBackend の本実装
 //! - [ ] SMB Change Notify による他クライアントへの即時反映
 //! - [ ] truncate / set_times の完全対応
+//! - [ ] `smb://host`（share 名なし）での share 列挙（srvsvc NetrShareEnum）。
+//!       現状は `yozist` ハブ share へ接続して全ビューを辿る運用で代替している。
 
 use smb_server::{Share, SmbServer};
 use sqlx::SqlitePool;
@@ -31,7 +37,9 @@ use yozist_versioning::VersioningEngine;
 pub mod backends;
 pub mod credentials;
 pub mod handle;
-pub use backends::{AllBackend, QueriesBackend, RecentBackend, SeriesBackend, TagsBackend};
+pub use backends::{
+    AllBackend, HubBackend, FiltersBackend, RecentBackend, SeriesBackend, TagsBackend,
+};
 pub use credentials::{SmbCredentialStore, SmbCredentialSync};
 
 /// 各 share 実装が共有する依存。
@@ -148,8 +156,10 @@ pub struct SmbConfig {
     pub listen: std::net::SocketAddr,
 }
 
-/// 公開する share 名の一覧（すべて `AuthenticatedOnly`）。
-const SHARE_NAMES: [&str; 4] = ["all", "tags", "series", "queries"];
+/// 公開する固定 share 名の一覧（すべて `AuthenticatedOnly`）。
+/// 公開 share は全仮想ビューへの単一エントリ `yozist` のみ。組込みビューと条件付き
+/// パスはすべて `yozist\<...>\`（例: `yozist\all\`、`yozist\<任意の名前>\`）に現れる。
+const SHARE_NAMES: [&str; 1] = ["yozist"];
 
 /// ビルド済み（未起動）の SMB サーバーと、REST 認証経路へ渡す資格情報シンク。
 pub struct BuiltSmb {
@@ -187,12 +197,11 @@ impl BuiltSmb {
 /// 構築時に永続化済みの資格情報を稼働中テーブルへ復元するため、再起動後も
 /// 既存ユーザーはログイン無しで接続できる。
 pub async fn build(cfg: SmbConfig, deps: ShareDeps, pool: SqlitePool) -> Result<BuiltSmb, SmbError> {
+    // 公開する share は `yozist` ハブのみ。組込みビュー（all / tags / series /
+    // filters）と各フィルター（任意名）はすべて `yozist\<...>\` の配下に現れる。
     let server = SmbServer::builder()
         .listen(cfg.listen)
-        .share(Share::new("all", AllBackend::new(deps.clone())))
-        .share(Share::new("tags", TagsBackend::new(deps.clone())))
-        .share(Share::new("series", SeriesBackend::new(deps.clone())))
-        .share(Share::new("queries", QueriesBackend::new(deps.clone())))
+        .share(Share::new("yozist", HubBackend::new(deps.clone())))
         .build()
         .map_err(|e| SmbError::Build(e.to_string()))?;
 

@@ -17,16 +17,6 @@
   <div class="card bg-base-100 shadow-sm">
     <div class="card-body p-4">
       <div class="flex items-center justify-between mb-2">
-        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">saved queries</h2>
-        <button class="btn btn-xs" onclick="createQuery()">+ 新規</button>
-      </div>
-      <div id="query-list" class="text-sm space-y-1">…</div>
-    </div>
-  </div>
-
-  <div class="card bg-base-100 shadow-sm">
-    <div class="card-body p-4">
-      <div class="flex items-center justify-between mb-2">
         <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">active shares</h2>
         <button class="btn btn-xs btn-ghost" onclick="loadShares()">refresh</button>
       </div>
@@ -79,7 +69,7 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadGroups(), loadQueries(), loadShares(), loadAudit()]);
+  await Promise.all([loadGroups(), loadShares(), loadAudit()]);
 }
 
 // ---- groups ----
@@ -163,76 +153,6 @@ async function removeMember(uid) {
     uiToast('除外しました', 'success');
     await renderGroupMembers();
   } catch (e) { uiToast('除外に失敗しました', 'error'); }
-}
-
-// ---- saved queries ----
-async function loadQueries() {
-  const el = $('query-list');
-  try {
-    const list = await json('/api/queries');
-    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">保存クエリなし</div>'; return; }
-    el.innerHTML = list.map(q => {
-      const cond = [];
-      if (q.query.tags_and && q.query.tags_and.length) cond.push('AND: ' + q.query.tags_and.join(','));
-      if (q.query.tags_not && q.query.tags_not.length) cond.push('NOT: ' + q.query.tags_not.join(','));
-      return `<div class="flex items-center justify-between row-compact">
-        <div>
-          <span class="font-semibold">${escapeHtml(q.name)}</span>
-          <span class="text-xs opacity-60 ml-1">${cond.join(' / ') || '全件'}</span>
-        </div>
-        <div class="flex gap-1">
-          <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
-          <button class="btn btn-xs btn-error btn-outline" onclick="deleteQuery('${q.id}')">削除</button>
-        </div>
-      </div>`;
-    }).join('');
-  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
-}
-
-async function createQuery() {
-  const r = await uiPrompt({
-    title: '保存クエリの作成', okText: '作成',
-    fields: [
-      { name: 'name', label: 'クエリ名', placeholder: '例: 仕事メモ' },
-      { name: 'and', label: 'ANDタグ (カンマ区切り、空可)', placeholder: '仕事, 2026' },
-      { name: 'not', label: 'NOTタグ (カンマ区切り、空可)' },
-    ],
-  });
-  if (!r || !r.name.trim()) return;
-  const body = {
-    name: r.name.trim(),
-    tags_and: r.and ? r.and.split(',').map(s => s.trim()).filter(Boolean) : [],
-    tags_not: r.not ? r.not.split(',').map(s => s.trim()).filter(Boolean) : [],
-  };
-  try {
-    await json('/api/queries', { method: 'POST', body });
-    uiToast('保存クエリを作成しました', 'success');
-    await loadQueries();
-  } catch (e) { uiToast('作成に失敗しました: ' + e.message, 'error'); }
-}
-
-async function deleteQuery(id) {
-  if (!await uiConfirm('この保存クエリを削除しますか？', { danger: true })) return;
-  try {
-    await api(`/api/queries/${id}`, { method: 'DELETE' });
-    uiToast('削除しました', 'success');
-    await loadQueries();
-  } catch (e) { uiToast('削除に失敗しました', 'error'); }
-}
-
-async function shareQuery(id, name) {
-  const r = await uiPrompt({
-    title: `「${name}」の共有URLを発行`, okText: '発行',
-    fields: [{ name: 'ttl', label: '有効期限 (秒)', type: 'number', value: '3600' }],
-  });
-  if (!r) return;
-  const ttl = parseInt(r.ttl, 10);
-  if (!ttl) { uiToast('有効期限を正しく入力してください', 'warning'); return; }
-  try {
-    const res = await json(`/api/queries/${id}/share`, { method: 'POST', body: { ttl_secs: ttl } });
-    await loadShares();
-    await uiCopyUrl(location.origin + res.url, 'クエリ共有URL');
-  } catch (e) { uiToast('共有URL発行に失敗しました: ' + e.message, 'error'); }
 }
 
 // ---- active shares ----
