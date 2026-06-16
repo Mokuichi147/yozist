@@ -36,6 +36,14 @@
           </div>
 
           <div>
+            <label class="text-xs opacity-70 block mb-1">保存済みフィルター</label>
+            <select id="f-filter" class="select select-bordered select-sm w-full" onchange="applyFilters()"
+                    title="フィルター一覧で作成した条件（SMB の filters/ と同じ）で絞り込みます">
+              <option value="">(指定なし)</option>
+            </select>
+          </div>
+
+          <div>
             <label class="text-xs opacity-70 block mb-1">タグ (AND)</label>
             <input id="f-tag-search" class="input input-bordered input-xs w-full mb-1"
                    placeholder="タグを絞り込み" oninput="renderTags()">
@@ -115,7 +123,7 @@ async function init() {
   const me = await requireAuth();
   if (!me) return;
   $('main').classList.remove('hidden');
-  await Promise.all([loadTags(), loadSeries()]);
+  await Promise.all([loadTags(), loadSeries(), loadFilters()]);
   restoreFiltersFromUrl();
   await applyFilters();
 }
@@ -171,6 +179,17 @@ async function loadSeries() {
   } catch (e) {}
 }
 
+// フィルター一覧ページで作成した条件（SMB の filters/<名前>/ と同じもの）を読み込む。
+// 選択するとその条件に一致するファイルへ絞り込める。
+async function loadFilters() {
+  try {
+    const list = await json('/api/filters');
+    const sel = $('f-filter');
+    sel.innerHTML = '<option value="">(指定なし)</option>' +
+      list.map(q => `<option value="${q.id}">${escapeHtml(q.name)}</option>`).join('');
+  } catch (e) {}
+}
+
 // ---- フィルタ状態 ----
 
 let debounceTimer = null;
@@ -183,6 +202,7 @@ function resetFilters() {
   $('f-search').value = '';
   $('f-name').value = '';
   $('f-series').value = '';
+  $('f-filter').value = '';
   selectedTags.clear();
   renderTags();
   applyFilters();
@@ -195,9 +215,11 @@ function saveFiltersToUrl() {
   const q = $('f-search').value.trim();
   const name = $('f-name').value.trim();
   const series = $('f-series').value;
+  const filter = $('f-filter').value;
   if (q) params.set('q', q);
   if (name) params.set('name', name);
   if (series) params.set('series', series);
+  if (filter) params.set('filter', filter);
   if (selectedTags.size) params.set('tags', [...selectedTags].join(','));
   if (sortVal() !== 'updated_desc') params.set('sort', sortVal());
   const qs = params.toString();
@@ -209,6 +231,7 @@ function restoreFiltersFromUrl() {
   if (p.get('q')) $('f-search').value = p.get('q');
   if (p.get('name')) $('f-name').value = p.get('name');
   if (p.get('series')) $('f-series').value = p.get('series');
+  if (p.get('filter')) $('f-filter').value = p.get('filter');
   if (p.get('tags')) p.get('tags').split(',').filter(Boolean).forEach(t => selectedTags.add(t));
   if (p.get('sort')) $('f-sort').value = p.get('sort');
   renderTags();
@@ -221,9 +244,10 @@ async function applyFilters() {
   const q = $('f-search').value.trim();
   const name = $('f-name').value.trim();
   const seriesId = $('f-series').value;
+  const filterId = $('f-filter').value;
   const tags = [...selectedTags];
 
-  browseMode = !q && tags.length === 0 && !seriesId && !name;
+  browseMode = !q && tags.length === 0 && !seriesId && !name && !filterId;
 
   if (browseMode) {
     browseOffset = 0;
@@ -239,6 +263,9 @@ async function applyFilters() {
       files = await json('/api/search?q=' + encodeURIComponent(q) + '&limit=500');
     } else if (tags.length > 0) {
       files = await json('/api/files/by-tags?tags=' + encodeURIComponent(tags.join(',')));
+    } else if (filterId) {
+      // 保存済みフィルター単独 → その条件に一致するファイルを基底集合にする
+      files = await json('/api/filters/' + filterId + '/files');
     } else {
       // 名前 / シリーズのみ → ベース集合をソート済みで広めに取得
       files = await json('/api/files?limit=1000&sort=' + sortParams().sort + '&order=' + sortParams().order);
@@ -251,6 +278,13 @@ async function applyFilters() {
   if (q && tags.length > 0) {
     const tagged = await json('/api/files/by-tags?tags=' + encodeURIComponent(tags.join(','))).catch(() => []);
     const allowed = new Set(tagged.map(f => f.id));
+    files = files.filter(f => allowed.has(f.id));
+  }
+
+  // 保存済みフィルターを基底集合に使っていない場合は交差（AND）で適用
+  if (filterId && (q || tags.length > 0)) {
+    const matched = await json('/api/filters/' + filterId + '/files').catch(() => []);
+    const allowed = new Set(matched.map(f => f.id));
     files = files.filter(f => allowed.has(f.id));
   }
 
@@ -390,11 +424,16 @@ function renderActiveFilters() {
   const q = $('f-search').value.trim();
   const name = $('f-name').value.trim();
   const sel = $('f-series');
+  const fil = $('f-filter');
   if (q) chips.push({ label: `検索: "${q}"`, clear: () => { $('f-search').value = ''; } });
   if (name) chips.push({ label: `名前: "${name}"`, clear: () => { $('f-name').value = ''; } });
   if (sel.value) chips.push({
     label: 'シリーズ: ' + sel.options[sel.selectedIndex].text,
     clear: () => { sel.value = ''; },
+  });
+  if (fil.value) chips.push({
+    label: 'フィルター: ' + fil.options[fil.selectedIndex].text,
+    clear: () => { fil.value = ''; },
   });
   selectedTags.forEach(t => chips.push({
     label: 'タグ: ' + t,
