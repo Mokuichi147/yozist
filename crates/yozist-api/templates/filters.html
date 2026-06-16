@@ -152,10 +152,13 @@ async function loadQueries() {
           <button class="btn btn-xs btn-error btn-outline" onclick="deleteQuery('${q.id}','${escapeHtml(q.name)}')">削除</button>` : '';
       return `<div class="flex items-start justify-between row-compact gap-2 border-b border-base-200 last:border-0 py-2">
         <div class="min-w-0">
-          <div><span class="font-semibold break-all">${escapeHtml(q.name)}</span></div>
+          <div><a href="/ui/files?filter=${q.id}" class="font-semibold break-all link link-hover"
+                  title="この条件でファイル一覧を開く">${escapeHtml(q.name)}</a></div>
           <div class="text-xs opacity-60 break-all">${escapeHtml(q.description || queryText(q))}</div>
         </div>
         <div class="flex gap-1 shrink-0">
+          <a href="/ui/files?filter=${q.id}" class="btn btn-xs btn-primary btn-outline"
+             title="この条件でファイル一覧を開く">開く</a>
           <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
           ${editBtns}
         </div>
