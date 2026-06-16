@@ -91,6 +91,7 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
           <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">シリーズ</h3>
+          <div id="fd-series-list" class="space-y-2 mt-1"></div>
           <div class="join w-full mt-1">
             <select id="fd-add-series" class="select select-bordered select-sm join-item w-full">
               <option value="">シリーズ選択…</option>
@@ -266,7 +267,7 @@ async function loadDetail() {
     ${metaRow('current_commit', escapeHtml(currentFile.current_commit), true)}
   </dl>`;
   $('fd-share').textContent = '';
-  await Promise.all([loadTags(), loadHistory(), renderContent()]);
+  await Promise.all([loadTags(), loadHistory(), loadFileSeries(), renderContent()]);
 }
 
 // 種別ごとのバッジ配色（files 一覧と統一。ダークでも視認できるよう塗りつぶし）
@@ -1107,9 +1108,77 @@ async function addToSeries() {
   try {
     await json(`/api/series/${sid}/members`, { method: 'POST', body: { file_id: fileId } });
     uiToast('シリーズに追加しました', 'success');
+    $('fd-add-series').value = '';
+    await loadFileSeries();
   } catch (e) {
     uiToast('シリーズ追加に失敗しました: ' + e.message, 'error');
   }
+}
+
+// このファイルが所属するシリーズと、各シリーズ内での前後ファイルへの遷移を描画する。
+async function loadFileSeries() {
+  let list = [];
+  try { list = await json(`/api/files/${fileId}/series`); }
+  catch (e) { list = []; }
+  renderFileSeries(list);
+}
+
+function gotoFile(id) { location.href = '/ui/files/' + id; }
+
+async function removeFromSeries(seriesId) {
+  const r = await api(`/api/series/${seriesId}/members/${fileId}`, { method: 'DELETE' });
+  if (!r.ok) { uiToast('シリーズからの取り外しに失敗しました', 'error'); return; }
+  uiToast('シリーズから外しました', 'success');
+  await loadFileSeries();
+}
+
+// 所属シリーズごとに「名前 + 位置」と『最初/前/次/最後』への遷移ボタンを描画する。
+// members はシリーズ内の順序どおり。端ではその方向のボタンを無効化する。
+function renderFileSeries(list) {
+  const box = $('fd-series-list');
+  if (!box) return;
+  if (!list || list.length === 0) { box.innerHTML = ''; return; }
+
+  box.innerHTML = list.map(s => {
+    const total = s.members.length;
+    const pos = s.position;            // 1 始まり。0 = 見つからない
+    const idx = pos - 1;
+    const atStart = pos <= 1;
+    const atEnd = pos <= 0 || pos >= total;
+    const first = total ? s.members[0] : null;
+    const prev  = idx > 0 ? s.members[idx - 1] : null;
+    const next  = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
+    const last  = total ? s.members[total - 1] : null;
+
+    const navBtn = (label, target, title, disabled) => {
+      if (disabled || !target) {
+        return `<button type="button" class="btn btn-xs join-item" disabled>${label}</button>`;
+      }
+      return `<button type="button" class="btn btn-xs join-item"
+                 title="${escapeHtml(title + ': ' + target.display_name)}"
+                 onclick="gotoFile('${target.file_id}')">${label}</button>`;
+    };
+
+    return `
+      <div class="rounded bg-base-200/60 px-2 py-1.5">
+        <div class="flex items-center justify-between gap-2">
+          <a href="/ui/files?series=${encodeURIComponent(s.id)}"
+             class="text-sm font-medium link link-hover truncate"
+             title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</a>
+          <span class="text-xs opacity-60 shrink-0 tabular-nums">${pos} / ${total}</span>
+        </div>
+        <div class="flex items-center gap-1 mt-1.5">
+          <div class="join">
+            ${navBtn('«', first, '最初へ', atStart)}
+            ${navBtn('&lt;', prev, '前へ', atStart)}
+            ${navBtn('&gt;', next, '次へ', atEnd)}
+            ${navBtn('»', last, '最後へ', atEnd)}
+          </div>
+          <button type="button" class="btn btn-xs btn-ghost ml-auto"
+                  title="このシリーズから外す" onclick="removeFromSeries('${s.id}')">×</button>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 async function issueShare() {

@@ -611,6 +611,43 @@ impl MetaStore for SqliteMetaStore {
             .collect()
     }
 
+    async fn list_series_of_file(&self, file: &FileId) -> Result<Vec<Series>, DbError> {
+        let rows = sqlx::query(
+            r#"SELECT s.id, s.name, s.description
+               FROM series s
+               JOIN series_members m ON m.series_id = s.id
+               WHERE m.file_id = ?
+               ORDER BY s.name COLLATE NOCASE ASC"#,
+        )
+        .bind(file.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_series).collect()
+    }
+
+    async fn list_series_members_named(
+        &self,
+        series: &SeriesId,
+    ) -> Result<Vec<(FileId, String)>, DbError> {
+        let rows = sqlx::query(
+            r#"SELECT m.file_id, f.display_name
+               FROM series_members m
+               JOIN files f ON f.id = m.file_id
+               WHERE m.series_id = ? AND f.deleted = 0
+               ORDER BY m.order_index ASC"#,
+        )
+        .bind(series.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let fid: String = row.try_get("file_id")?;
+                let name: String = row.try_get("display_name")?;
+                Ok((FileId::from_uuid(parse_uuid(&fid)?), name))
+            })
+            .collect()
+    }
+
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError> {
         sqlx::query(
             r#"INSERT INTO commits
@@ -938,6 +975,59 @@ mod tests {
         assert_eq!(members[0].file_id, files[0].id); // 10
         assert_eq!(members[1].file_id, files[2].id); // 20
         assert_eq!(members[2].file_id, files[1].id); // 30
+    }
+
+    #[tokio::test]
+    async fn series_of_file_and_named_members() {
+        let s = store().await;
+        let series = Series {
+            id: SeriesId::new(),
+            name: "saga".into(),
+            description: None,
+        };
+        s.upsert_series(&series).await.unwrap();
+
+        // 順序 30 → 10 → 20 で追加し、order_index 昇順に並ぶことを確認する。
+        let mut files = vec![];
+        for (i, idx) in [30.0_f64, 10.0, 20.0].iter().enumerate() {
+            let mut f = sample_file();
+            f.display_name = format!("part-{i}.md");
+            s.insert_file(&f).await.unwrap();
+            s.add_to_series(&SeriesMember {
+                series_id: series.id,
+                file_id: f.id,
+                order_index: *idx,
+            })
+            .await
+            .unwrap();
+            files.push(f);
+        }
+
+        // 所属シリーズの逆引き。
+        let of = s.list_series_of_file(&files[1].id).await.unwrap();
+        assert_eq!(of.len(), 1);
+        assert_eq!(of[0].id, series.id);
+
+        // 表示名付き・順序付きメンバー。
+        let named = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(named.len(), 3);
+        assert_eq!(named[0].0, files[1].id); // idx 10 → part-1
+        assert_eq!(named[0].1, "part-1.md");
+        assert_eq!(named[1].0, files[2].id); // idx 20 → part-2
+        assert_eq!(named[2].0, files[0].id); // idx 30 → part-0
+
+        // 削除済みファイルは除外される。
+        let mut gone = files[2].clone();
+        gone.deleted = true;
+        s.update_file(&gone).await.unwrap();
+        let named = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(named.len(), 2);
+        assert!(named.iter().all(|(fid, _)| *fid != gone.id));
+
+        // どのシリーズにも属さないファイルは空。
+        let lonely = sample_file();
+        s.insert_file(&lonely).await.unwrap();
+        assert!(s.list_series_of_file(&lonely.id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
