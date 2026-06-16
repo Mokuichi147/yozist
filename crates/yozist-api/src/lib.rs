@@ -1811,9 +1811,20 @@ fn require_filter_owner(ctx: &AuthContext, q: &Filter) -> Result<(), ApiError> {
 
 async fn list_filters(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
 ) -> Result<Json<Vec<Filter>>, ApiError> {
+    let viewer = match &ctx {
+        AuthContext::User { user, .. } => Some(user.id),
+        _ => None,
+    };
     let list = s.meta.list_filters().await.map_err(ApiError::from_db)?;
-    Ok(Json(list))
+    // 自分が作成したフィルターのみ返す（未ログインは作成者なしのみ）。
+    // 候補ドロップダウン・管理ページの双方で他人のフィルターを出さない。
+    let mine: Vec<Filter> = list
+        .into_iter()
+        .filter(|f| f.created_by == viewer)
+        .collect();
+    Ok(Json(mine))
 }
 
 async fn create_filter(
