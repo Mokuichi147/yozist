@@ -1905,6 +1905,7 @@ async fn delete_filter(
 
 async fn filter_files(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<FileMeta>>, ApiError> {
     let id = uuid::Uuid::parse_str(&id)
@@ -1917,7 +1918,10 @@ async fn filter_files(
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
     let files = resolve_filter(&*s.meta, &q.definition).await?;
-    Ok(Json(files))
+    // 他の一覧系 API（by-tags / search 等）と同様に VIEW 権限で絞り込む。
+    // これを欠くと WebUI のファイル一覧に開けないファイルが混ざってしまう。
+    let visible = filter_visible_files(&*s.authz, &ctx, files).await?;
+    Ok(Json(visible))
 }
 
 /// 共通ヘルパ: Filter の定義を解決して FileMeta 一覧を返す。
