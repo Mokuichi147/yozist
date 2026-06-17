@@ -2,6 +2,16 @@
 {% block title %}yozist - file{% endblock %}
 {% block subtabs %}<span class="opacity-40">›</span><span class="font-semibold">詳細</span>{% endblock %}
 
+{% block style %}
+  /* タッチ端末（ホバー不可）はホバーで出せないため、コンテンツのタップで
+     オーバーレイを表示し（1段階目）、表示中のボタンのタップで遷移する（2段階目）。
+     表示は #fd-content-card に .nav-revealed が付いている間だけ有効。 */
+  @media (hover: none) {
+    #fd-content-card.nav-revealed #fd-nav-prev:not(.hidden),
+    #fd-content-card.nav-revealed #fd-nav-next:not(.hidden) { opacity: 1; pointer-events: auto; }
+  }
+{% endblock %}
+
 {% block content %}
 <div id="not-found" class="hidden max-w-md mx-auto mt-24">
   <div class="alert alert-error">
@@ -17,7 +27,7 @@
   <div class="flex flex-col lg:flex-row gap-4 items-start">
     <!-- メインカラム: content を優先表示 -->
     <div class="flex-1 min-w-0 w-full space-y-4">
-      <div class="card bg-base-100 shadow-sm">
+      <div id="fd-content-card" class="card bg-base-100 shadow-sm group relative">
         <div class="card-body p-4">
           <div class="flex items-start justify-between gap-2">
             <h2 id="fd-name" class="card-title text-lg break-all cursor-text hover:opacity-70 flex-1 min-w-0"
@@ -39,6 +49,16 @@
 
           <div id="fd-content" class="min-h-[2rem]">…</div>
         </div>
+        <!-- シリーズ内の前後ファイルへ遷移。コンテンツにホバー時のみ表示し、
+             編集モード中・前後ファイルが無いときは隠す（更新は updateContentNav）。 -->
+        <button id="fd-nav-prev" type="button"
+                class="hidden absolute left-2 top-1/2 -translate-y-1/2 z-10 btn btn-circle btn-sm
+                       bg-base-100/70 hover:bg-base-100 shadow transition-opacity
+                       opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto">&lt;</button>
+        <button id="fd-nav-next" type="button"
+                class="hidden absolute right-2 top-1/2 -translate-y-1/2 z-10 btn btn-circle btn-sm
+                       bg-base-100/70 hover:bg-base-100 shadow transition-opacity
+                       opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto">&gt;</button>
       </div>
 
       <div class="card bg-base-100 shadow-sm">
@@ -154,6 +174,7 @@ let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
 let seriesOptions = [];         // 候補シリーズ（自分が閲覧可能なもの。名前→ID 解決に使う）
+let fileSeries = [];            // このファイルが所属するシリーズ（コンテンツ両端の前後遷移に使う）
 
 // --- テキスト表示の状態 ---
 // 小さいファイル（TEXT_FULL_LOAD_MAX 以下）は全文を取得し読み取り専用 textarea で描画
@@ -245,6 +266,7 @@ async function init() {
   }
   $('main').classList.remove('hidden');
   document.title = 'yozist - ' + currentFile.display_name;
+  setupTouchNav();
   await Promise.all([loadSeriesOptions(), loadDetail()]);
 }
 
@@ -941,6 +963,7 @@ async function toggleEdit() {
     cont.classList.add('hidden');
     editOriginal = ta.value;            // 未保存変更の判定基準
     $('fd-edit-btn').textContent = '完了';
+    updateContentNav();                 // 編集モードではオーバーレイを隠す
   } else {
     await finishEdit();
   }
@@ -968,6 +991,7 @@ function exitEditMode() {
   $('fd-editor').classList.add('hidden');
   $('fd-content').classList.remove('hidden');
   $('fd-edit-btn').textContent = '編集';
+  updateContentNav();                   // 表示モードに戻ったらオーバーレイを復帰
 }
 
 // 画面に見えている表示先頭のファイル内バイト位置（概算）を返す（編集対象の決定用）。
@@ -1128,10 +1152,64 @@ async function loadFileSeries() {
   let list = [];
   try { list = await json(`/api/files/${fileId}/series`); }
   catch (e) { list = []; }
+  fileSeries = list;
   renderFileSeries(list);
+  updateContentNav();
 }
 
 function gotoFile(id) { location.href = '/ui/files/' + id; }
+
+// コンテンツ両端のオーバーレイ遷移先（先頭シリーズ基準の前後ファイル）。
+// 複数シリーズに所属する場合は最初のシリーズを採用する（全シリーズはカードに表示）。
+function contentNavTargets() {
+  const s = fileSeries[0];
+  if (!s) return { prev: null, next: null };
+  const idx = s.position - 1;            // position は 1 始まり、0 は不在
+  const total = s.members.length;
+  const prev = idx > 0 ? s.members[idx - 1] : null;
+  const next = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
+  return { prev, next };
+}
+
+// コンテンツ両端の前後ボタンを更新する。前後が無い・編集モード中は隠す
+// （表示自体は CSS の group-hover によりホバー時のみ）。
+function updateContentNav() {
+  const prevBtn = $('fd-nav-prev');
+  const nextBtn = $('fd-nav-next');
+  if (!prevBtn || !nextBtn) return;
+  const editing = !$('fd-editor').classList.contains('hidden');
+  // 編集モードに入ったらタッチ用の表示状態も解除する。
+  if (editing) { const c = $('fd-content-card'); if (c) c.classList.remove('nav-revealed'); }
+  const { prev, next } = contentNavTargets();
+  const apply = (btn, target, label) => {
+    if (editing || !target) {
+      btn.classList.add('hidden');
+      btn.onclick = null;
+      btn.removeAttribute('title');
+    } else {
+      btn.classList.remove('hidden');
+      btn.title = label + ': ' + target.display_name;
+      btn.onclick = () => gotoFile(target.file_id);
+    }
+  };
+  apply(prevBtn, prev, '前へ');
+  apply(nextBtn, next, '次へ');
+}
+
+// タッチ端末（ホバー不可）はホバーでオーバーレイを出せないため、2 段階にする。
+// 1 段階目: コンテンツのタップでオーバーレイを表示（.nav-revealed をトグル）。
+// 2 段階目: 表示中のボタンのタップで遷移（ボタンの onclick に任せる）。
+// ホバー端末では CSS の group-hover が表示を担うので何もしない。
+function setupTouchNav() {
+  if (!window.matchMedia('(hover: none)').matches) return;
+  const card = $('fd-content-card');
+  if (!card) return;
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('#fd-nav-prev, #fd-nav-next')) return;  // ボタンは遷移
+    if (!$('fd-editor').classList.contains('hidden')) return;    // 編集モード中は無効
+    card.classList.toggle('nav-revealed');
+  });
+}
 
 async function removeFromSeries(seriesId) {
   const r = await api(`/api/series/${seriesId}/members/${fileId}`, { method: 'DELETE' });
