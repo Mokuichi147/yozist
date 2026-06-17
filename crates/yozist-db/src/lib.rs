@@ -94,6 +94,13 @@ pub trait MetaStore: Send + Sync {
         file: &FileId,
     ) -> Result<(), DbError>;
     async fn list_series_members(&self, series: &SeriesId) -> Result<Vec<SeriesMember>, DbError>;
+    /// 指定ファイルが所属するシリーズ一覧（名前順）を返す。
+    async fn list_series_of_file(&self, file: &FileId) -> Result<Vec<Series>, DbError>;
+    /// 指定シリーズの順序付きメンバーを表示名付きで返す（削除済みファイルは除外）。
+    async fn list_series_members_named(
+        &self,
+        series: &SeriesId,
+    ) -> Result<Vec<(FileId, String)>, DbError>;
 
     // ---- commits ----
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError>;

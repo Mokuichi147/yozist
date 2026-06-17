@@ -112,6 +112,7 @@ pub fn router(state: ApiState) -> Router {
             get(list_file_tags).post(attach_tag),
         )
         .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
+        .route("/api/files/:id/series", get(list_file_series))
         .route("/api/tags", get(list_tags).post(upsert_tag))
         .route(
             "/api/tags/:id",
@@ -1403,9 +1404,37 @@ struct CreateSeriesInput {
     description: Option<String>,
 }
 
-async fn list_series(State(s): State<ApiState>) -> Result<Json<Vec<Series>>, ApiError> {
-    let list = s.meta.list_series().await.map_err(ApiError::from_db)?;
-    Ok(Json(list))
+/// シリーズ候補の一覧。ファイル一覧と同じく、閲覧者が VIEW できるメンバーを
+/// 1 件以上含むシリーズのみ返す（他人だけのシリーズは候補に出さない）。
+/// 候補ピッカー（一覧フィルター・シリーズ追加・条件ビルダー）が共通で使う。
+async fn list_series(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<Vec<Series>>, ApiError> {
+    let all = s.meta.list_series().await.map_err(ApiError::from_db)?;
+    let mut out = Vec::with_capacity(all.len());
+    for sr in all {
+        let members = s
+            .meta
+            .list_series_members(&sr.id)
+            .await
+            .map_err(ApiError::from_db)?;
+        let mut visible = false;
+        for m in &members {
+            if s.authz
+                .check(&ctx, &Target::file(m.file_id), PermissionMask::VIEW)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?
+            {
+                visible = true;
+                break;
+            }
+        }
+        if visible {
+            out.push(sr);
+        }
+    }
+    Ok(Json(out))
 }
 
 async fn create_series(
@@ -1542,6 +1571,66 @@ async fn list_series_members(
         .await
         .map_err(ApiError::from_db)?;
     Ok(Json(members))
+}
+
+/// シリーズ内 1 メンバー（順序付き）の表示用ビュー。
+#[derive(Serialize)]
+struct SeriesMemberView {
+    file_id: String,
+    display_name: String,
+}
+
+/// 1 ファイルが所属するシリーズと、その順序付きメンバー一覧。
+/// 前後・最初・最後への遷移はフロント側でこの members から算出する。
+#[derive(Serialize)]
+struct FileSeriesView {
+    id: String,
+    name: String,
+    /// シリーズ内でのこのファイルの位置（1 始まり）。見つからなければ 0。
+    position: usize,
+    members: Vec<SeriesMemberView>,
+}
+
+/// 指定ファイルが所属する全シリーズを、順序付きメンバー（表示名付き）とともに返す。
+async fn list_file_series(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<FileSeriesView>>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(&*s.authz, &ctx, &Target::file(file_id), PermissionMask::VIEW).await?;
+    let series = s
+        .meta
+        .list_series_of_file(&file_id)
+        .await
+        .map_err(ApiError::from_db)?;
+    let mut out = Vec::with_capacity(series.len());
+    for sr in series {
+        let named = s
+            .meta
+            .list_series_members_named(&sr.id)
+            .await
+            .map_err(ApiError::from_db)?;
+        let position = named
+            .iter()
+            .position(|(fid, _)| *fid == file_id)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let members = named
+            .into_iter()
+            .map(|(fid, display_name)| SeriesMemberView {
+                file_id: fid.to_string(),
+                display_name,
+            })
+            .collect();
+        out.push(FileSeriesView {
+            id: sr.id.to_string(),
+            name: sr.name,
+            position,
+            members,
+        });
+    }
+    Ok(Json(out))
 }
 
 async fn add_series_member(
@@ -1722,9 +1811,20 @@ fn require_filter_owner(ctx: &AuthContext, q: &Filter) -> Result<(), ApiError> {
 
 async fn list_filters(
     State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
 ) -> Result<Json<Vec<Filter>>, ApiError> {
+    let viewer = match &ctx {
+        AuthContext::User { user, .. } => Some(user.id),
+        _ => None,
+    };
     let list = s.meta.list_filters().await.map_err(ApiError::from_db)?;
-    Ok(Json(list))
+    // 自分が作成したフィルターのみ返す（未ログインは作成者なしのみ）。
+    // 候補ドロップダウン・管理ページの双方で他人のフィルターを出さない。
+    let mine: Vec<Filter> = list
+        .into_iter()
+        .filter(|f| f.created_by == viewer)
+        .collect();
+    Ok(Json(mine))
 }
 
 async fn create_filter(

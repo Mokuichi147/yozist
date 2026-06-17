@@ -2,6 +2,16 @@
 {% block title %}yozist - file{% endblock %}
 {% block subtabs %}<span class="opacity-40">›</span><span class="font-semibold">詳細</span>{% endblock %}
 
+{% block style %}
+  /* タッチ端末（ホバー不可）はホバーで出せないため、コンテンツのタップで
+     オーバーレイを表示し（1段階目）、表示中のボタンのタップで遷移する（2段階目）。
+     表示は #fd-content-card に .nav-revealed が付いている間だけ有効。 */
+  @media (hover: none) {
+    #fd-content-card.nav-revealed #fd-nav-prev:not(.hidden),
+    #fd-content-card.nav-revealed #fd-nav-next:not(.hidden) { opacity: 1; pointer-events: auto; }
+  }
+{% endblock %}
+
 {% block content %}
 <div id="not-found" class="hidden max-w-md mx-auto mt-24">
   <div class="alert alert-error">
@@ -17,7 +27,7 @@
   <div class="flex flex-col lg:flex-row gap-4 items-start">
     <!-- メインカラム: content を優先表示 -->
     <div class="flex-1 min-w-0 w-full space-y-4">
-      <div class="card bg-base-100 shadow-sm">
+      <div id="fd-content-card" class="card bg-base-100 shadow-sm group relative">
         <div class="card-body p-4">
           <div class="flex items-start justify-between gap-2">
             <h2 id="fd-name" class="card-title text-lg break-all cursor-text hover:opacity-70 flex-1 min-w-0"
@@ -39,6 +49,16 @@
 
           <div id="fd-content" class="min-h-[2rem]">…</div>
         </div>
+        <!-- シリーズ内の前後ファイルへ遷移。コンテンツにホバー時のみ表示し、
+             編集モード中・前後ファイルが無いときは隠す（更新は updateContentNav）。 -->
+        <button id="fd-nav-prev" type="button"
+                class="hidden absolute left-2 top-1/2 -translate-y-1/2 z-10 btn btn-circle btn-sm
+                       bg-base-100/70 hover:bg-base-100 shadow transition-opacity
+                       opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto">&lt;</button>
+        <button id="fd-nav-next" type="button"
+                class="hidden absolute right-2 top-1/2 -translate-y-1/2 z-10 btn btn-circle btn-sm
+                       bg-base-100/70 hover:bg-base-100 shadow transition-opacity
+                       opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto">&gt;</button>
       </div>
 
       <div class="card bg-base-100 shadow-sm">
@@ -91,12 +111,14 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
           <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">シリーズ</h3>
-          <div class="join w-full mt-1">
-            <select id="fd-add-series" class="select select-bordered select-sm join-item w-full">
-              <option value="">シリーズ選択…</option>
-            </select>
+          <div class="join w-full">
+            <input id="fd-add-series" class="input input-bordered input-sm join-item w-full"
+                   list="fd-series-options" placeholder="シリーズ名を入力して追加"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();addToSeries();}">
+            <datalist id="fd-series-options"></datalist>
             <button class="btn btn-sm join-item" onclick="addToSeries()">+</button>
           </div>
+          <div id="fd-series-list" class="space-y-2 mt-1"></div>
         </div>
       </div>
     </aside>
@@ -151,6 +173,8 @@ let contentObjectUrl = null;  // メディアプレビュー用の object URL
 let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
+let seriesOptions = [];         // 候補シリーズ（自分が閲覧可能なもの。名前→ID 解決に使う）
+let fileSeries = [];            // このファイルが所属するシリーズ（コンテンツ両端の前後遷移に使う）
 
 // --- テキスト表示の状態 ---
 // 小さいファイル（TEXT_FULL_LOAD_MAX 以下）は全文を取得し読み取り専用 textarea で描画
@@ -242,15 +266,16 @@ async function init() {
   }
   $('main').classList.remove('hidden');
   document.title = 'yozist - ' + currentFile.display_name;
+  setupTouchNav();
   await Promise.all([loadSeriesOptions(), loadDetail()]);
 }
 
 async function loadSeriesOptions() {
   try {
-    const list = await json('/api/series');
-    $('fd-add-series').innerHTML = '<option value="">シリーズ選択…</option>' +
-      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
-  } catch (e) {}
+    seriesOptions = await json('/api/series');
+    $('fd-series-options').innerHTML =
+      seriesOptions.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+  } catch (e) { seriesOptions = []; }
 }
 
 async function loadDetail() {
@@ -266,7 +291,7 @@ async function loadDetail() {
     ${metaRow('current_commit', escapeHtml(currentFile.current_commit), true)}
   </dl>`;
   $('fd-share').textContent = '';
-  await Promise.all([loadTags(), loadHistory(), renderContent()]);
+  await Promise.all([loadTags(), loadHistory(), loadFileSeries(), renderContent()]);
 }
 
 // 種別ごとのバッジ配色（files 一覧と統一。ダークでも視認できるよう塗りつぶし）
@@ -938,6 +963,7 @@ async function toggleEdit() {
     cont.classList.add('hidden');
     editOriginal = ta.value;            // 未保存変更の判定基準
     $('fd-edit-btn').textContent = '完了';
+    updateContentNav();                 // 編集モードではオーバーレイを隠す
   } else {
     await finishEdit();
   }
@@ -965,6 +991,7 @@ function exitEditMode() {
   $('fd-editor').classList.add('hidden');
   $('fd-content').classList.remove('hidden');
   $('fd-edit-btn').textContent = '編集';
+  updateContentNav();                   // 表示モードに戻ったらオーバーレイを復帰
 }
 
 // 画面に見えている表示先頭のファイル内バイト位置（概算）を返す（編集対象の決定用）。
@@ -1102,14 +1129,142 @@ async function detachTag(tagId) {
 }
 
 async function addToSeries() {
-  const sid = $('fd-add-series').value;
-  if (!sid) { uiToast('シリーズを選択してください', 'warning'); return; }
+  const name = $('fd-add-series').value.trim();
+  if (!name) { uiToast('シリーズ名を入力してください', 'warning'); return; }
   try {
+    // 入力名が既存（自分の）シリーズなら再利用し、なければ新規作成する。
+    let sid = (seriesOptions.find(s => s.name === name) || {}).id;
+    if (!sid) {
+      const created = await json('/api/series', { method: 'POST', body: { name } });
+      sid = created.id;
+    }
     await json(`/api/series/${sid}/members`, { method: 'POST', body: { file_id: fileId } });
     uiToast('シリーズに追加しました', 'success');
+    $('fd-add-series').value = '';
+    await Promise.all([loadSeriesOptions(), loadFileSeries()]);
   } catch (e) {
     uiToast('シリーズ追加に失敗しました: ' + e.message, 'error');
   }
+}
+
+// このファイルが所属するシリーズと、各シリーズ内での前後ファイルへの遷移を描画する。
+async function loadFileSeries() {
+  let list = [];
+  try { list = await json(`/api/files/${fileId}/series`); }
+  catch (e) { list = []; }
+  fileSeries = list;
+  renderFileSeries(list);
+  updateContentNav();
+}
+
+function gotoFile(id) { location.href = '/ui/files/' + id; }
+
+// コンテンツ両端のオーバーレイ遷移先（先頭シリーズ基準の前後ファイル）。
+// 複数シリーズに所属する場合は最初のシリーズを採用する（全シリーズはカードに表示）。
+function contentNavTargets() {
+  const s = fileSeries[0];
+  if (!s) return { prev: null, next: null };
+  const idx = s.position - 1;            // position は 1 始まり、0 は不在
+  const total = s.members.length;
+  const prev = idx > 0 ? s.members[idx - 1] : null;
+  const next = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
+  return { prev, next };
+}
+
+// コンテンツ両端の前後ボタンを更新する。前後が無い・編集モード中は隠す
+// （表示自体は CSS の group-hover によりホバー時のみ）。
+function updateContentNav() {
+  const prevBtn = $('fd-nav-prev');
+  const nextBtn = $('fd-nav-next');
+  if (!prevBtn || !nextBtn) return;
+  const editing = !$('fd-editor').classList.contains('hidden');
+  // 編集モードに入ったらタッチ用の表示状態も解除する。
+  if (editing) { const c = $('fd-content-card'); if (c) c.classList.remove('nav-revealed'); }
+  const { prev, next } = contentNavTargets();
+  const apply = (btn, target, label) => {
+    if (editing || !target) {
+      btn.classList.add('hidden');
+      btn.onclick = null;
+      btn.removeAttribute('title');
+    } else {
+      btn.classList.remove('hidden');
+      btn.title = label + ': ' + target.display_name;
+      btn.onclick = () => gotoFile(target.file_id);
+    }
+  };
+  apply(prevBtn, prev, '前へ');
+  apply(nextBtn, next, '次へ');
+}
+
+// タッチ端末（ホバー不可）はホバーでオーバーレイを出せないため、2 段階にする。
+// 1 段階目: コンテンツのタップでオーバーレイを表示（.nav-revealed をトグル）。
+// 2 段階目: 表示中のボタンのタップで遷移（ボタンの onclick に任せる）。
+// ホバー端末では CSS の group-hover が表示を担うので何もしない。
+function setupTouchNav() {
+  if (!window.matchMedia('(hover: none)').matches) return;
+  const card = $('fd-content-card');
+  if (!card) return;
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('#fd-nav-prev, #fd-nav-next')) return;  // ボタンは遷移
+    if (!$('fd-editor').classList.contains('hidden')) return;    // 編集モード中は無効
+    card.classList.toggle('nav-revealed');
+  });
+}
+
+async function removeFromSeries(seriesId) {
+  const r = await api(`/api/series/${seriesId}/members/${fileId}`, { method: 'DELETE' });
+  if (!r.ok) { uiToast('シリーズからの取り外しに失敗しました', 'error'); return; }
+  uiToast('シリーズから外しました', 'success');
+  await loadFileSeries();
+}
+
+// 所属シリーズごとに「名前 + 位置」と『最初/前/次/最後』への遷移ボタンを描画する。
+// members はシリーズ内の順序どおり。端ではその方向のボタンを無効化する。
+function renderFileSeries(list) {
+  const box = $('fd-series-list');
+  if (!box) return;
+  if (!list || list.length === 0) { box.innerHTML = ''; return; }
+
+  box.innerHTML = list.map(s => {
+    const total = s.members.length;
+    const pos = s.position;            // 1 始まり。0 = 見つからない
+    const idx = pos - 1;
+    const atStart = pos <= 1;
+    const atEnd = pos <= 0 || pos >= total;
+    const first = total ? s.members[0] : null;
+    const prev  = idx > 0 ? s.members[idx - 1] : null;
+    const next  = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
+    const last  = total ? s.members[total - 1] : null;
+
+    const navBtn = (label, target, title, disabled) => {
+      if (disabled || !target) {
+        return `<button type="button" class="btn btn-xs join-item" disabled>${label}</button>`;
+      }
+      return `<button type="button" class="btn btn-xs join-item"
+                 title="${escapeHtml(title + ': ' + target.display_name)}"
+                 onclick="gotoFile('${target.file_id}')">${label}</button>`;
+    };
+
+    return `
+      <div class="rounded bg-base-200/60 px-2 py-1.5">
+        <div class="flex items-center justify-between gap-2">
+          <a href="/ui/files?series=${encodeURIComponent(s.id)}"
+             class="text-sm font-medium link link-hover truncate"
+             title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</a>
+          <span class="text-xs opacity-60 shrink-0 tabular-nums">${pos} / ${total}</span>
+        </div>
+        <div class="flex items-center gap-1 mt-1.5">
+          <div class="join">
+            ${navBtn('«', first, '最初へ', atStart)}
+            ${navBtn('&lt;', prev, '前へ', atStart)}
+            ${navBtn('&gt;', next, '次へ', atEnd)}
+            ${navBtn('»', last, '最後へ', atEnd)}
+          </div>
+          <button type="button" class="btn btn-xs btn-ghost ml-auto"
+                  title="このシリーズから外す" onclick="removeFromSeries('${s.id}')">×</button>
+        </div>
+      </div>`;
+  }).join('');
 }
 
 async function issueShare() {
