@@ -36,6 +36,18 @@ pub fn system_tags_for(hint: &FormatHint) -> Vec<Tag> {
     out
 }
 
+/// アップロード元（`rest` / `web` / `smb` など）を示すシステムタグを返す。
+/// 名前は `src:<source>`（小文字化）。`ext:` / `type:` と同じ System 種別で、
+/// フィルタや by-tags 絞り込みからアップロード経路を辿れるようにする。
+pub fn source_tag(source: &str) -> Tag {
+    Tag {
+        id: TagId::new(),
+        name: format!("src:{}", source.trim().to_ascii_lowercase()),
+        kind: TagKind::System,
+        confidence: None,
+    }
+}
+
 /// f64 の中間挿入アルゴリズム。`a < b` 前提で中点を返す。
 pub fn midpoint_order(a: f64, b: f64) -> f64 {
     (a + b) / 2.0
@@ -55,6 +67,13 @@ mod tests {
         let tags = system_tags_for(&hint);
         assert!(tags.iter().any(|t| t.name == "ext:md"));
         assert!(tags.iter().any(|t| t.name == "type:text"));
+    }
+
+    #[test]
+    fn source_tag_uses_prefix_and_system_kind() {
+        let t = source_tag("REST");
+        assert_eq!(t.name, "src:rest");
+        assert!(matches!(t.kind, TagKind::System));
     }
 
     #[test]

@@ -370,6 +370,8 @@ impl AllBackend {
                     .map_err(io_err);
                 match r {
                     Ok((file, _)) => {
+                        // アップロード元を示すシステムタグ `src:smb` を付与。
+                        self.deps.engine.attach_source_tag(file.id, "smb").await;
                         let owner_rule = yozist_auth::Permission {
                             subject: yozist_auth::Subject::User(owner),
                             target: yozist_auth::Target::file(file.id),

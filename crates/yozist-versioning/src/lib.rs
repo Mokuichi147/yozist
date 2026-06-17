@@ -395,6 +395,27 @@ impl VersioningEngine {
         }
     }
 
+    /// 作成済みファイルにアップロード元タグ `src:<source>` を付与する。
+    ///
+    /// `persist_create` のシステムタグ付与と同じ作法で、`upsert_tag` →
+    /// `attach_tag` の冪等な 2 段で行い、失敗してもアップロード自体は壊さないよう
+    /// 警告に留める。`source` は `rest` / `web` / `smb` などアップロード経路の識別子。
+    ///
+    /// 付与は `file_tags` テーブルに対して行うため、フィルタ／by-tags の絞り込み
+    /// （`file_tags` 直参照）からは即座に辿れる。FTS のタグ列は作成時点の内容で
+    /// 確定済みで本文を再取得せず安全に作り直せないため、ここでは更新しない。
+    pub async fn attach_source_tag(&self, file_id: FileId, source: &str) {
+        let tag = yozist_tagging::source_tag(source);
+        match self.meta.upsert_tag(&tag).await {
+            Ok(tag_id) => {
+                if let Err(e) = self.meta.attach_tag(&file_id, &tag_id).await {
+                    tracing::warn!("ソースタグの付与に失敗: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("ソースタグの登録に失敗: {e}"),
+        }
+    }
+
     /// 既存ファイルへの新規コミットをストリームから行う。
     /// バイナリ（LWW=全置換）は直前 blob を読まずにそのまま保存する。
     pub async fn commit_streaming(
@@ -1246,6 +1267,26 @@ mod engine_tests {
         // 拡張子と MIME カテゴリのシステムタグが自動付与される。
         assert!(names.contains(&"ext:jpg".to_string()), "tags={names:?}");
         assert!(names.contains(&"type:image".to_string()), "tags={names:?}");
+    }
+
+    #[tokio::test]
+    async fn attach_source_tag_adds_src_tag() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let (file, _c) = eng
+            .create_file("note.txt", b"hi", actor, None, None, None)
+            .await
+            .unwrap();
+        eng.attach_source_tag(file.id, "rest").await;
+        let names: Vec<String> = eng
+            .meta
+            .list_tags_of(&file.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"src:rest".to_string()), "tags={names:?}");
     }
 
     #[tokio::test]
