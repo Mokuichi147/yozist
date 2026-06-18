@@ -446,6 +446,8 @@ impl Handle for YozistFileHandle {
                         .map_err(|e| {
                             smb_server::SmbError::Io(std::io::Error::other(e.to_string()))
                         })?;
+                    // アップロード元を示すシステムタグ `src:smb` を付与。
+                    self.engine.attach_source_tag(file.id, "smb").await;
                     if let Some(meta) = &self.meta {
                         for t in &pending_tags {
                             meta.attach_tag(&file.id, t).await.map_err(|e| {
