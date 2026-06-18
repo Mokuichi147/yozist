@@ -395,24 +395,36 @@ impl VersioningEngine {
         }
     }
 
-    /// 作成済みファイルにアップロード元タグ `src:<source>` を付与する。
+    /// 単一タグを `upsert_tag` → `attach_tag` の冪等な 2 段で付与する内部ヘルパ。
     ///
-    /// `persist_create` のシステムタグ付与と同じ作法で、`upsert_tag` →
-    /// `attach_tag` の冪等な 2 段で行い、失敗してもアップロード自体は壊さないよう
-    /// 警告に留める。`source` は `rest` / `web` / `smb` などアップロード経路の識別子。
-    ///
-    /// 付与は `file_tags` テーブルに対して行うため、フィルタ／by-tags の絞り込み
-    /// （`file_tags` 直参照）からは即座に辿れる。FTS のタグ列は作成時点の内容で
-    /// 確定済みで本文を再取得せず安全に作り直せないため、ここでは更新しない。
-    pub async fn attach_source_tag(&self, file_id: FileId, source: &str) {
-        let tag = yozist_tagging::source_tag(source);
+    /// `persist_create` のシステムタグ付与と同じ作法で、失敗してもアップロード自体
+    /// は壊さないよう警告に留める。付与は `file_tags` テーブルへ行うため、フィルタ／
+    /// by-tags の絞り込み（`file_tags` 直参照）からは即座に辿れる。FTS のタグ列は
+    /// 作成時点の内容で確定済みで本文を再取得せず安全に作り直せないため更新しない。
+    async fn attach_meta_tag(&self, file_id: FileId, tag: yozist_core::Tag, what: &str) {
         match self.meta.upsert_tag(&tag).await {
             Ok(tag_id) => {
                 if let Err(e) = self.meta.attach_tag(&file_id, &tag_id).await {
-                    tracing::warn!("ソースタグの付与に失敗: {e}");
+                    tracing::warn!("{what}の付与に失敗: {e}");
                 }
             }
-            Err(e) => tracing::warn!("ソースタグの登録に失敗: {e}"),
+            Err(e) => tracing::warn!("{what}の登録に失敗: {e}"),
+        }
+    }
+
+    /// 作成済みファイルにアップロード元タグ `src:<source>` を付与する。
+    /// `source` は `rest` / `web` / `smb` などアップロード経路の識別子。
+    pub async fn attach_source_tag(&self, file_id: FileId, source: &str) {
+        self.attach_meta_tag(file_id, yozist_tagging::source_tag(source), "ソースタグ")
+            .await;
+    }
+
+    /// 作成済みファイルにクライアントソフト識別タグ `client:<name>` を付与する。
+    /// `client` が空などで正規化結果が無い場合は何もしない。`src:`（経路）とは
+    /// 独立した名前空間なので、経路タグと併存して両軸で絞り込める。
+    pub async fn attach_client_tag(&self, file_id: FileId, client: &str) {
+        if let Some(tag) = yozist_tagging::client_tag(client) {
+            self.attach_meta_tag(file_id, tag, "クライアントタグ").await;
         }
     }
 
@@ -1287,6 +1299,27 @@ mod engine_tests {
             .map(|t| t.name)
             .collect();
         assert!(names.contains(&"src:rest".to_string()), "tags={names:?}");
+    }
+
+    #[tokio::test]
+    async fn attach_client_tag_adds_client_tag() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let (file, _c) = eng
+            .create_file("note.txt", b"hi", actor, None, None, None)
+            .await
+            .unwrap();
+        eng.attach_client_tag(file.id, " MyApp ").await;
+        eng.attach_client_tag(file.id, "   ").await; // 空は無視される
+        let names: Vec<String> = eng
+            .meta
+            .list_tags_of(&file.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"client:myapp".to_string()), "tags={names:?}");
     }
 
     #[tokio::test]

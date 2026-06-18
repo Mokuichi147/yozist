@@ -48,6 +48,31 @@ pub fn source_tag(source: &str) -> Tag {
     }
 }
 
+/// アップロードしたクライアントソフトを示すシステムタグ `client:<name>` を返す。
+/// `src:`（経路）とは独立した名前空間で、どのソフト由来かを絞り込めるようにする。
+///
+/// 名前は trim → カンマ除去（by-tags がカンマ区切りで解決するため）→ 64 文字に
+/// 制限 → 小文字化して正規化する。実体が空になる場合は `None`（タグを付けない）。
+pub fn client_tag(name: &str) -> Option<Tag> {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .filter(|c| *c != ',')
+        .take(64)
+        .collect::<String>()
+        .trim()
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(Tag {
+        id: TagId::new(),
+        name: format!("client:{cleaned}"),
+        kind: TagKind::System,
+        confidence: None,
+    })
+}
+
 /// f64 の中間挿入アルゴリズム。`a < b` 前提で中点を返す。
 pub fn midpoint_order(a: f64, b: f64) -> f64 {
     (a + b) / 2.0
@@ -74,6 +99,15 @@ mod tests {
         let t = source_tag("REST");
         assert_eq!(t.name, "src:rest");
         assert!(matches!(t.kind, TagKind::System));
+    }
+
+    #[test]
+    fn client_tag_normalizes_and_rejects_empty() {
+        let t = client_tag(" MyApp ").unwrap();
+        assert_eq!(t.name, "client:myapp");
+        assert!(matches!(t.kind, TagKind::System));
+        assert!(client_tag("   ").is_none());
+        assert!(client_tag(",,").is_none());
     }
 
     #[test]

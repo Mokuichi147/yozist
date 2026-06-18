@@ -280,6 +280,9 @@ async fn redirect_to_ui() -> axum::response::Redirect {
 struct CreateFileQuery {
     name: String,
     actor: Option<String>,
+    /// アップロードしたクライアントソフトの識別子（任意）。指定時は
+    /// `client:<name>` タグを付与し、どのソフト由来かで絞り込めるようにする。
+    client: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -447,6 +450,7 @@ async fn create_file(
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
     require_authenticated(&ctx).await?;
     let source = upload_source(&headers);
+    let client = q.client.clone();
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let name_for_audit = q.name.clone();
     // ボディをメモリに載せず 1 チャンクずつ blob ストアへ流す。
@@ -508,6 +512,10 @@ async fn create_file(
 
     // アップロード元（rest / web）を示すシステムタグ `src:<source>` を付与。
     s.engine.attach_source_tag(file.id, source).await;
+    // クライアントソフト指定があれば `client:<name>` タグも付与。
+    if let Some(client) = client.as_deref() {
+        s.engine.attach_client_tag(file.id, client).await;
+    }
 
     let file = record_file_actor(&s, file.id, &ctx, true).await.unwrap_or(file);
     Ok((StatusCode::CREATED, Json(file)))
