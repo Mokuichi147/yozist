@@ -412,8 +412,9 @@ impl VersioningEngine {
         }
     }
 
-    /// 作成済みファイルにアップロード元タグ `src:<source>` を付与する。
-    /// `source` は `rest` / `web` / `smb` などアップロード経路の識別子。
+    /// 作成済みファイルにアップロード経路タグ `src:<source>` を付与する。
+    /// `source` は `rest` / `smb` などアップロード経路の識別子（WebUI も REST 経由
+    /// なので `rest`）。どのクライアントソフトかは `attach_client_tag` で表す。
     pub async fn attach_source_tag(&self, file_id: FileId, source: &str) {
         self.attach_meta_tag(file_id, yozist_tagging::source_tag(source), "ソースタグ")
             .await;

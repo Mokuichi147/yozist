@@ -81,14 +81,7 @@ const $ = id => document.getElementById(id);
 let token = localStorage.getItem('yozist_token') || '';
 
 function api(path, opts = {}) {
-  // X-Yozist-Client: web で WebUI 由来のアップロードを REST と区別する
-  // （サーバ側で src:web / src:rest タグを付与する）。
-  opts.headers = Object.assign(
-    {},
-    { 'X-Yozist-Client': 'web' },
-    opts.headers,
-    token ? { Authorization: 'Bearer ' + token } : {}
-  );
+  opts.headers = Object.assign({}, opts.headers, token ? { Authorization: 'Bearer ' + token } : {});
   return fetch(path, opts);
 }
 function json(path, opts) {

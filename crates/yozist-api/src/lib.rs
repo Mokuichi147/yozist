@@ -427,29 +427,13 @@ async fn record_file_actor(
     Some(meta)
 }
 
-/// アップロード経路（`web` / `rest`）を判定する。WebUI は共通 fetch ヘルパで
-/// `X-Yozist-Client: web` を必ず送る。ヘッダが無い／別値の場合は外部からの素の
-/// REST 呼び出しとみなす。`src:<source>` タグの値に使う。
-fn upload_source(headers: &axum::http::HeaderMap) -> &'static str {
-    match headers
-        .get("x-yozist-client")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-    {
-        Some("web") => "web",
-        _ => "rest",
-    }
-}
-
 async fn create_file(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
     Query(q): Query<CreateFileQuery>,
-    headers: axum::http::HeaderMap,
     body: Body,
 ) -> Result<(StatusCode, Json<FileMeta>), ApiError> {
     require_authenticated(&ctx).await?;
-    let source = upload_source(&headers);
     let client = q.client.clone();
     let actor = parse_actor(q.actor.as_deref()).unwrap_or_else(ActorId::new);
     let name_for_audit = q.name.clone();
@@ -510,9 +494,10 @@ async fn create_file(
             .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
 
-    // アップロード元（rest / web）を示すシステムタグ `src:<source>` を付与。
-    s.engine.attach_source_tag(file.id, source).await;
-    // クライアントソフト指定があれば `client:<name>` タグも付与。
+    // REST 経路を示すシステムタグ `src:rest` を付与。WebUI も REST 経由のため
+    // 経路は rest で、どのクライアントソフトかは下の `client:` タグで区別する。
+    s.engine.attach_source_tag(file.id, "rest").await;
+    // クライアントソフト指定（WebUI は `?client=web`）があれば `client:<name>` も付与。
     if let Some(client) = client.as_deref() {
         s.engine.attach_client_tag(file.id, client).await;
     }

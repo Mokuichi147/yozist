@@ -500,7 +500,7 @@ async function uploadFiles(fileList) {
   let ok = 0;
   for (const f of files) {
     try {
-      const r = await api('/api/files?name=' + encodeURIComponent(f.name), {
+      const r = await api('/api/files?client=web&name=' + encodeURIComponent(f.name), {
         method: 'POST',
         body: await f.arrayBuffer(),
         headers: { 'content-type': 'application/octet-stream' },
@@ -527,7 +527,7 @@ async function newFile() {
   if (!r || !r.name.trim()) return;
   try {
     // 本文は空で作成し、内容は詳細ページで編集する。
-    const resp = await api('/api/files?name=' + encodeURIComponent(r.name.trim()), {
+    const resp = await api('/api/files?client=web&name=' + encodeURIComponent(r.name.trim()), {
       method: 'POST',
       body: new ArrayBuffer(0),
       headers: { 'content-type': 'application/octet-stream' },

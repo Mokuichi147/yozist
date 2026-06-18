@@ -36,7 +36,8 @@ pub fn system_tags_for(hint: &FormatHint) -> Vec<Tag> {
     out
 }
 
-/// アップロード元（`rest` / `web` / `smb` など）を示すシステムタグを返す。
+/// アップロード経路（`rest` / `smb` など）を示すシステムタグを返す。
+/// WebUI も REST 経由なので `rest`。どのクライアントソフトかは `client_tag` で表す。
 /// 名前は `src:<source>`（小文字化）。`ext:` / `type:` と同じ System 種別で、
 /// フィルタや by-tags 絞り込みからアップロード経路を辿れるようにする。
 pub fn source_tag(source: &str) -> Tag {
