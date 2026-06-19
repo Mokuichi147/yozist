@@ -19,19 +19,23 @@
         <span class="opacity-80">システムタグ（拡張子・種別など自動付与）はここには表示されません。</span>
       </p>
 
-      <!-- 合流アクションバー（1件以上選択時に表示） -->
-      <div id="merge-bar" class="hidden alert alert-info py-2 px-3 mb-2 flex items-center justify-between">
-        <span class="text-sm"><span id="merge-count">0</span> 件選択中</span>
-        <div class="flex items-center gap-2">
-          <button class="btn btn-xs" onclick="clearSelection()">選択解除</button>
-          <button id="merge-btn" class="btn btn-xs btn-primary" onclick="openMerge()">合流…</button>
-        </div>
-      </div>
+      <!-- 合流アクションバーは画面下部に固定表示（リストを押し下げないため、ここには置かない） -->
 
       <div id="tag-list" class="space-y-1">…</div>
     </div>
   </div>
 
+</div>
+
+<!-- 合流アクションバー（1件以上選択時に画面下部へ固定表示。リストのレイアウトに影響しない） -->
+<div id="merge-bar" class="hidden fixed inset-x-0 bottom-4 z-40 px-4 pointer-events-none">
+  <div class="alert alert-info shadow-lg py-2 px-3 max-w-3xl mx-auto flex items-center justify-between pointer-events-auto">
+    <span class="text-sm"><span id="merge-count">0</span> 件選択中</span>
+    <div class="flex items-center gap-2">
+      <button class="btn btn-xs" onclick="clearSelection()">選択解除</button>
+      <button id="merge-btn" class="btn btn-xs btn-primary" onclick="openMerge()">合流…</button>
+    </div>
+  </div>
 </div>
 
 <!-- 合流先選択モーダル -->
@@ -124,8 +128,11 @@ function clearSelection() {
 
 function updateMergeBar() {
   const bar = $('merge-bar');
+  const active = selected.size > 0;
   $('merge-count').textContent = selected.size;
-  bar.classList.toggle('hidden', selected.size === 0);
+  bar.classList.toggle('hidden', !active);
+  // 固定バーが最下行に重ならないよう、表示中はコンテナ下部に余白を確保する
+  $('main').classList.toggle('pb-24', active);
   // 合流は 2 件以上で有効
   $('merge-btn').disabled = selected.size < 2;
 }
