@@ -1350,6 +1350,24 @@ struct TagStat {
     count: u64,
 }
 
+/// 管理操作（改名・削除・合流）の対象タグを検証する。タグが存在しなければ `NotFound`、
+/// システムタグ（拡張子・種別など自動付与）なら `BadRequest` を返す。システムタグは
+/// ファイル属性から自動再生成されるため、手動での改名・削除・合流の対象にしない。
+async fn require_editable_tag(s: &ApiState, id: &TagId) -> Result<(), ApiError> {
+    let tag = s
+        .meta
+        .get_tag(id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    if matches!(tag.kind, TagKind::System) {
+        return Err(ApiError::BadRequest(
+            "システムタグは変更・削除・合流できません".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn list_tag_stats(State(s): State<ApiState>) -> Result<Json<Vec<TagStat>>, ApiError> {
     let rows = s
         .meta
@@ -1383,6 +1401,8 @@ async fn merge_tags(
     if input.source_ids.is_empty() {
         return Err(ApiError::BadRequest("source_ids が空です".into()));
     }
+    // 合流先・合流元ともにシステムタグは対象外。
+    require_editable_tag(&s, &target).await?;
     for source_id in &input.source_ids {
         let source = uuid::Uuid::parse_str(source_id)
             .map(TagId::from_uuid)
@@ -1390,6 +1410,7 @@ async fn merge_tags(
         if source == target {
             continue;
         }
+        require_editable_tag(&s, &source).await?;
         let res = s
             .meta
             .merge_tags(&source, &target)
@@ -1426,6 +1447,7 @@ async fn rename_tag(
     let tag_id = uuid::Uuid::parse_str(&id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag id: {e}")))?;
+    require_editable_tag(&s, &tag_id).await?;
     let new_name = input.name.clone();
     let res = s
         .meta
@@ -1456,6 +1478,7 @@ async fn delete_tag(
     let tag_id = uuid::Uuid::parse_str(&id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag id: {e}")))?;
+    require_editable_tag(&s, &tag_id).await?;
     let res = s.meta.delete_tag(&tag_id).await.map_err(ApiError::from_db);
     audit_event(
         &s,

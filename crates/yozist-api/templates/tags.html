@@ -14,8 +14,9 @@
         </div>
       </div>
       <p class="text-xs opacity-60 mb-2">
-        タグ名の変更・追加・削除ができます。複数のタグを選択すると 1 つに合流できます。
-        <span class="opacity-80">⚙ システムタグ / 🤖 AI タグは自動付与されます。</span>
+        手動タグと <span class="opacity-80">🤖 AI タグ</span>の名前変更・追加・削除ができます。
+        複数のタグを選択すると 1 つに合流できます。
+        <span class="opacity-80">システムタグ（拡張子・種別など自動付与）はここには表示されません。</span>
       </p>
 
       <!-- 合流アクションバー（1件以上選択時に表示） -->
@@ -76,7 +77,8 @@ function tagIcon(kind) {
 async function loadTags() {
   const el = $('tag-list');
   try {
-    tags = await json('/api/tags/stats');
+    // システムタグ（拡張子・種別など自動付与）は管理対象外。手動 / AI タグのみ扱う。
+    tags = (await json('/api/tags/stats')).filter(t => t.kind !== 'system');
     // 存在しなくなったタグを選択から除去
     const ids = new Set(tags.map(t => t.id));
     for (const id of [...selected]) if (!ids.has(id)) selected.delete(id);
