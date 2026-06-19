@@ -38,14 +38,25 @@
   <!-- メンバーの並び替え -->
   <div class="card bg-base-100 shadow-sm">
     <div class="card-body p-4">
-      <div class="flex items-center justify-between mb-2">
+      <div class="flex items-center justify-between gap-2 mb-2 flex-wrap">
         <h3 class="text-base font-semibold">項目の並び替え</h3>
-        <button id="ss-save-order" class="btn btn-sm btn-primary" onclick="saveOrder()" disabled>
-          並び順を保存
-        </button>
+        <div class="flex items-center gap-2">
+          <label class="text-xs opacity-60 shrink-0" for="ss-sort">並び順</label>
+          <select id="ss-sort" class="select select-bordered select-sm" onchange="onSortChange()">
+            <option value="created_asc">登録日時（昇順）</option>
+            <option value="created_desc">登録日時（降順）</option>
+            <option value="name_asc">ファイル名（昇順）</option>
+            <option value="name_desc">ファイル名（降順）</option>
+            <option value="manual">マニュアル順</option>
+          </select>
+          <button id="ss-save-order" class="btn btn-sm btn-primary" onclick="saveOrder()" disabled>
+            並び順を保存
+          </button>
+        </div>
       </div>
       <p class="text-xs opacity-60 mb-3 leading-relaxed">
-        ドラッグ＆ドロップ、または ▲▼ ボタンで順序を入れ替えられます。変更後「並び順を保存」を押してください。
+        並び順を選ぶと自動で適用されます。マニュアル順では ▲▼ ボタンやドラッグ＆ドロップで
+        順序を入れ替え、「並び順を保存」で確定します。手作業で並び替えると自動でマニュアル順に切り替わります。
       </p>
       <ul id="ss-list" class="space-y-1">…</ul>
     </div>
@@ -60,6 +71,7 @@
 const seriesId = decodeURIComponent((location.pathname.match(/\/ui\/series\/([^/]+)/) || [])[1] || '');
 let members = [];          // [{ file_id, display_name }] 現在の表示順
 let savedOrder = [];       // 最後に保存された file_id の順序（dirty 判定用）
+let sortOrder = 'created_asc'; // 現在の並び順設定
 let dragIndex = null;      // ドラッグ中の行インデックス
 
 async function init() {
@@ -80,6 +92,8 @@ async function loadDetail() {
   }
   $('ss-name').value = data.name || '';
   $('ss-desc').value = data.description || '';
+  sortOrder = data.sort_order || 'created_asc';
+  $('ss-sort').value = sortOrder;
   // 戻り先はこのシリーズのファイル一覧にしておく
   $('ss-back').href = `/ui/files?series=${encodeURIComponent(seriesId)}`;
   members = (data.members || []).map(m => ({ file_id: m.file_id, display_name: m.display_name }));
@@ -87,13 +101,34 @@ async function loadDetail() {
   renderList();
 }
 
+const isManual = () => sortOrder === 'manual';
+
 function isDirty() {
   const cur = members.map(m => m.file_id);
   return cur.length !== savedOrder.length || cur.some((id, i) => id !== savedOrder[i]);
 }
 
 function refreshDirty() {
-  $('ss-save-order').disabled = !isDirty();
+  // 保存対象があるのはマニュアル順かつ並びが変わっているときだけ。
+  $('ss-save-order').disabled = !(isManual() && isDirty());
+}
+
+// 並び順ドロップダウンの変更。マニュアル以外は即時適用し、サーバ並びを再取得する。
+// マニュアルを選んだ場合は現在の表示順をそのまま手動順として確定する。
+async function onSortChange() {
+  const val = $('ss-sort').value;
+  if (val === 'manual') {
+    await saveOrder('マニュアル順に切り替えました');
+    return;
+  }
+  try {
+    await json(`/api/series/${seriesId}/sort`, { method: 'PUT', body: { sort_order: val } });
+    uiToast('並び順を変更しました', 'success');
+    await loadDetail();
+  } catch (e) {
+    uiToast('並び順の変更に失敗しました: ' + e.message, 'error');
+    $('ss-sort').value = sortOrder; // 失敗時は元に戻す
+  }
 }
 
 function renderList() {
@@ -122,10 +157,19 @@ function renderList() {
   refreshDirty();
 }
 
+// 手作業で並び替えたら並び順設定を「マニュアル順」に切り替える。
+function markManual() {
+  if (sortOrder !== 'manual') {
+    sortOrder = 'manual';
+    $('ss-sort').value = 'manual';
+  }
+}
+
 // ---- ▲▼ による移動 ----
 function move(i, dir) {
   const j = i + dir;
   if (j < 0 || j >= members.length) return;
+  markManual();
   [members[i], members[j]] = [members[j], members[i]];
   renderList();
 }
@@ -152,6 +196,7 @@ function bindDnd() {
       e.preventDefault();
       const to = parseInt(row.dataset.idx, 10);
       if (dragIndex === null || dragIndex === to) return;
+      markManual();
       const [moved] = members.splice(dragIndex, 1);
       members.splice(to, 0, moved);
       dragIndex = null;
@@ -176,16 +221,16 @@ async function saveName() {
   }
 }
 
-async function saveOrder() {
+// 現在の表示順を手動順として保存する。サーバ側で sort_order が manual に切り替わる。
+async function saveOrder(successMsg) {
   const file_ids = members.map(m => m.file_id);
   try {
     await json(`/api/series/${seriesId}/members/order`, {
       method: 'PUT',
       body: { file_ids },
     });
-    savedOrder = file_ids.slice();
-    refreshDirty();
-    uiToast('並び順を保存しました', 'success');
+    uiToast(successMsg || '並び順を保存しました', 'success');
+    await loadDetail();
   } catch (e) {
     uiToast('並び順の保存に失敗しました: ' + e.message, 'error');
   }

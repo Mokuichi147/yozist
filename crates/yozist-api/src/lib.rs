@@ -37,7 +37,7 @@ use yozist_auth::{
 pub mod ui;
 use yozist_core::{
     ActorId, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId, Series, SeriesId,
-    SeriesMember, Tag, TagId, TagKind, UserId,
+    SeriesMember, SeriesSort, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
 use yozist_versioning::VersioningEngine;
@@ -133,6 +133,10 @@ pub fn router(state: ApiState) -> Router {
                 .delete(delete_series),
         )
         .route("/api/series/:id/detail", get(get_series_detail))
+        .route(
+            "/api/series/:id/sort",
+            axum::routing::put(update_series_sort),
+        )
         .route(
             "/api/series/:id/members",
             get(list_series_members).post(add_series_member),
@@ -1671,6 +1675,7 @@ async fn create_series(
         id: SeriesId::new(),
         name: input.name,
         description: input.description,
+        sort_order: SeriesSort::default(),
     };
     let res = s
         .meta
@@ -1775,11 +1780,13 @@ async fn get_series(
 }
 
 /// シリーズ設定ページ用ビュー。シリーズ本体に加え、順序付きメンバーを表示名付きで返す。
+/// `members` はシリーズの `sort_order` 設定に従って並んでいる。
 #[derive(Serialize)]
 struct SeriesDetailView {
     id: String,
     name: String,
     description: Option<String>,
+    sort_order: SeriesSort,
     members: Vec<SeriesMemberView>,
 }
 
@@ -1814,8 +1821,49 @@ async fn get_series_detail(
         id: series.id.to_string(),
         name: series.name,
         description: series.description,
+        sort_order: series.sort_order,
         members,
     }))
+}
+
+#[derive(Deserialize)]
+struct SetSeriesSortInput {
+    sort_order: SeriesSort,
+}
+
+/// シリーズの並び順設定を更新する。並び替えはシリーズ単位の操作とみなし、
+/// rename と同様に認証済みであれば許可する。`manual` に切り替えるだけでは
+/// order_index は変更しない（現在の表示順を手動順として保持したい場合は
+/// `PUT /members/order` を使う）。
+async fn update_series_sort(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<SetSeriesSortInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let series_id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let res = s
+        .meta
+        .set_series_sort(&series_id, input.sort_order)
+        .await
+        .map_err(ApiError::from_db);
+    let sid = series_id.to_string();
+    let meta = format!("{{\"sort_order\":\"{}\"}}", input.sort_order.as_str());
+    audit_event(
+        &s,
+        &ctx,
+        "set_series_sort",
+        Some("series"),
+        Some(&sid),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -2002,6 +2050,11 @@ async fn reorder_series_members(
                 .map_err(ApiError::from_db)?;
             order += 10.0;
         }
+        // 手作業で並び替えたので、並び順設定を「手動」に切り替える。
+        s.meta
+            .set_series_sort(&series_id, SeriesSort::Manual)
+            .await
+            .map_err(ApiError::from_db)?;
         Ok(())
     }
     .await;
