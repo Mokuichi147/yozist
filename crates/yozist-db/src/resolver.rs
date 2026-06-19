@@ -214,7 +214,7 @@ fn date_op(
 mod tests {
     use super::*;
     use crate::SqliteMetaStore;
-    use yozist_core::{ActorId, Series, SeriesId, SeriesMember};
+    use yozist_core::{ActorId, Series, SeriesId, SeriesMember, SeriesSort};
 
     async fn store() -> SqliteMetaStore {
         SqliteMetaStore::open_in_memory().await.unwrap()
@@ -345,6 +345,7 @@ mod tests {
             id: SeriesId::new(),
             name: "連載".into(),
             description: None,
+            sort_order: SeriesSort::default(),
         };
         let sid = s.upsert_series(&series).await.unwrap();
         s.add_to_series(&SeriesMember {

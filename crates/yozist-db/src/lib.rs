@@ -15,8 +15,8 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use yozist_core::{
-    Commit, FileId, FileMeta, Filter, FilterId, Series, SeriesId, SeriesMember, Tag,
-    TagId,
+    Commit, FileId, FileMeta, Filter, FilterId, Series, SeriesId, SeriesMember, SeriesSort,
+    Tag, TagId,
 };
 
 pub mod audit;
@@ -93,6 +93,8 @@ pub trait MetaStore: Send + Sync {
         description: Option<&str>,
     ) -> Result<(), DbError>;
     async fn delete_series(&self, id: &SeriesId) -> Result<(), DbError>;
+    /// シリーズの並び順設定のみを更新する。
+    async fn set_series_sort(&self, id: &SeriesId, sort: SeriesSort) -> Result<(), DbError>;
     async fn add_to_series(&self, member: &SeriesMember) -> Result<(), DbError>;
     async fn remove_from_series(
         &self,
@@ -102,7 +104,8 @@ pub trait MetaStore: Send + Sync {
     async fn list_series_members(&self, series: &SeriesId) -> Result<Vec<SeriesMember>, DbError>;
     /// 指定ファイルが所属するシリーズ一覧（名前順）を返す。
     async fn list_series_of_file(&self, file: &FileId) -> Result<Vec<Series>, DbError>;
-    /// 指定シリーズの順序付きメンバーを表示名付きで返す（削除済みファイルは除外）。
+    /// 指定シリーズのメンバーを表示名付きで返す（削除済みファイルは除外）。
+    /// 並び順はシリーズの `sort_order` 設定に従う（登録日時 / 名前 / 手動）。
     async fn list_series_members_named(
         &self,
         series: &SeriesId,

@@ -28,6 +28,7 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/files/:id", get(file_detail_page))
         .route("/files/:id/compare", get(file_compare_page))
         .route("/files/:id/histories/:cid", get(file_commit_page))
+        .route("/series/:id", get(series_settings_page))
 }
 
 /// askama テンプレートを描画して HTML レスポンスにする。
@@ -103,6 +104,12 @@ struct FileCommitTemplate {
     active: &'static str,
 }
 
+#[derive(Template)]
+#[template(path = "series_settings.html")]
+struct SeriesSettingsTemplate {
+    active: &'static str,
+}
+
 async fn index() -> Response {
     render(IndexTemplate { active: "" })
 }
@@ -141,4 +148,8 @@ async fn file_compare_page() -> Response {
 
 async fn file_commit_page() -> Response {
     render(FileCommitTemplate { active: "" })
+}
+
+async fn series_settings_page() -> Response {
+    render(SeriesSettingsTemplate { active: "" })
 }

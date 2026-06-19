@@ -17,7 +17,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 use yozist_core::{
     ActorId, BlobId, Commit, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId,
-    Series, SeriesId, SeriesMember, Tag, TagId, TagKind,
+    Series, SeriesId, SeriesMember, SeriesSort, Tag, TagId, TagKind,
 };
 
 use crate::{DbError, FileSort, MetaStore};
@@ -150,10 +150,12 @@ fn row_to_series(row: SqliteRow) -> Result<Series, DbError> {
     let id: String = row.try_get("id")?;
     let name: String = row.try_get("name")?;
     let description: Option<String> = row.try_get("description")?;
+    let sort_order: String = row.try_get("sort_order")?;
     Ok(Series {
         id: SeriesId::from_uuid(parse_uuid(&id)?),
         name,
         description,
+        sort_order: SeriesSort::from_str_lenient(&sort_order),
     })
 }
 
@@ -532,17 +534,18 @@ impl MetaStore for SqliteMetaStore {
         {
             return Ok(SeriesId::from_uuid(parse_uuid(&existing_id)?));
         }
-        sqlx::query("INSERT INTO series (id, name, description) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO series (id, name, description, sort_order) VALUES (?, ?, ?, ?)")
             .bind(series.id.to_string())
             .bind(&series.name)
             .bind(&series.description)
+            .bind(series.sort_order.as_str())
             .execute(&self.pool)
             .await?;
         Ok(series.id)
     }
 
     async fn get_series(&self, id: &SeriesId) -> Result<Option<Series>, DbError> {
-        let row = sqlx::query("SELECT id, name, description FROM series WHERE id = ?")
+        let row = sqlx::query("SELECT id, name, description, sort_order FROM series WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await?;
@@ -550,9 +553,10 @@ impl MetaStore for SqliteMetaStore {
     }
 
     async fn list_series(&self) -> Result<Vec<Series>, DbError> {
-        let rows = sqlx::query("SELECT id, name, description FROM series ORDER BY name ASC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT id, name, description, sort_order FROM series ORDER BY name ASC")
+                .fetch_all(&self.pool)
+                .await?;
         rows.into_iter().map(row_to_series).collect()
     }
 
@@ -577,6 +581,18 @@ impl MetaStore for SqliteMetaStore {
     async fn delete_series(&self, id: &SeriesId) -> Result<(), DbError> {
         // series_members は CASCADE で自動削除される
         let res = sqlx::query("DELETE FROM series WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn set_series_sort(&self, id: &SeriesId, sort: SeriesSort) -> Result<(), DbError> {
+        let res = sqlx::query("UPDATE series SET sort_order = ? WHERE id = ?")
+            .bind(sort.as_str())
             .bind(id.to_string())
             .execute(&self.pool)
             .await?;
@@ -643,7 +659,7 @@ impl MetaStore for SqliteMetaStore {
 
     async fn list_series_of_file(&self, file: &FileId) -> Result<Vec<Series>, DbError> {
         let rows = sqlx::query(
-            r#"SELECT s.id, s.name, s.description
+            r#"SELECT s.id, s.name, s.description, s.sort_order
                FROM series s
                JOIN series_members m ON m.series_id = s.id
                WHERE m.file_id = ?
@@ -659,16 +675,34 @@ impl MetaStore for SqliteMetaStore {
         &self,
         series: &SeriesId,
     ) -> Result<Vec<(FileId, String)>, DbError> {
-        let rows = sqlx::query(
+        // 並び順はシリーズの sort_order 設定に従う。ORDER BY 句は固定の列・方向に
+        // しか展開しない（ユーザー入力を SQL に埋め込まない）ため安全。
+        let sort = match sqlx::query_as::<_, (String,)>("SELECT sort_order FROM series WHERE id = ?")
+            .bind(series.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+        {
+            Some((s,)) => SeriesSort::from_str_lenient(&s),
+            None => SeriesSort::default(),
+        };
+        let order_by = match sort {
+            SeriesSort::CreatedAsc => "f.created_at ASC, m.order_index ASC",
+            SeriesSort::CreatedDesc => "f.created_at DESC, m.order_index ASC",
+            SeriesSort::NameAsc => "f.display_name COLLATE NOCASE ASC",
+            SeriesSort::NameDesc => "f.display_name COLLATE NOCASE DESC",
+            SeriesSort::Manual => "m.order_index ASC",
+        };
+        let sql = format!(
             r#"SELECT m.file_id, f.display_name
                FROM series_members m
                JOIN files f ON f.id = m.file_id
                WHERE m.series_id = ? AND f.deleted = 0
-               ORDER BY m.order_index ASC"#,
-        )
-        .bind(series.to_string())
-        .fetch_all(&self.pool)
-        .await?;
+               ORDER BY {order_by}"#,
+        );
+        let rows = sqlx::query(&sql)
+            .bind(series.to_string())
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter()
             .map(|row| {
                 let fid: String = row.try_get("file_id")?;
@@ -1060,6 +1094,7 @@ mod tests {
             id: SeriesId::new(),
             name: "manual".into(),
             description: None,
+            sort_order: SeriesSort::Manual,
         };
         s.upsert_series(&series).await.unwrap();
 
@@ -1091,6 +1126,7 @@ mod tests {
             id: SeriesId::new(),
             name: "saga".into(),
             description: None,
+            sort_order: SeriesSort::Manual,
         };
         s.upsert_series(&series).await.unwrap();
 
@@ -1135,6 +1171,73 @@ mod tests {
         let lonely = sample_file();
         s.insert_file(&lonely).await.unwrap();
         assert!(s.list_series_of_file(&lonely.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn series_named_members_honor_sort_order() {
+        let s = store().await;
+        let series = Series {
+            id: SeriesId::new(),
+            name: "並び替え".into(),
+            description: None,
+            sort_order: SeriesSort::default(), // 既定は登録日時の昇順
+        };
+        s.upsert_series(&series).await.unwrap();
+
+        // created_at と名前を意図的に逆相関させ、order_index も別の順序にする。
+        // f0: 古い / "charlie" / idx 30
+        // f1: 中間 / "bravo"   / idx 10
+        // f2: 新しい/ "alpha"   / idx 20
+        let base = OffsetDateTime::now_utc();
+        let specs = [
+            ("charlie.md", base - time::Duration::hours(2), 30.0_f64),
+            ("bravo.md", base - time::Duration::hours(1), 10.0),
+            ("alpha.md", base, 20.0),
+        ];
+        let mut ids = vec![];
+        for (name, created, idx) in specs {
+            let mut f = sample_file();
+            f.display_name = name.into();
+            f.created_at = created;
+            s.insert_file(&f).await.unwrap();
+            s.add_to_series(&SeriesMember {
+                series_id: series.id,
+                file_id: f.id,
+                order_index: idx,
+            })
+            .await
+            .unwrap();
+            ids.push(f.id);
+        }
+        let names = |v: Vec<(FileId, String)>| v.into_iter().map(|(_, n)| n).collect::<Vec<_>>();
+
+        // 既定（登録日時の昇順）: charlie, bravo, alpha
+        let got = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(names(got), vec!["charlie.md", "bravo.md", "alpha.md"]);
+
+        // 登録日時の降順
+        s.set_series_sort(&series.id, SeriesSort::CreatedDesc).await.unwrap();
+        let got = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(names(got), vec!["alpha.md", "bravo.md", "charlie.md"]);
+
+        // 名前の昇順
+        s.set_series_sort(&series.id, SeriesSort::NameAsc).await.unwrap();
+        let got = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(names(got), vec!["alpha.md", "bravo.md", "charlie.md"]);
+
+        // 名前の降順
+        s.set_series_sort(&series.id, SeriesSort::NameDesc).await.unwrap();
+        let got = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(names(got), vec!["charlie.md", "bravo.md", "alpha.md"]);
+
+        // 手動順（order_index 昇順）: bravo(10), alpha(20), charlie(30)
+        s.set_series_sort(&series.id, SeriesSort::Manual).await.unwrap();
+        let got = s.list_series_members_named(&series.id).await.unwrap();
+        assert_eq!(names(got), vec!["bravo.md", "alpha.md", "charlie.md"]);
+
+        // set_series_sort は get_series にも反映される。
+        let reloaded = s.get_series(&series.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.sort_order, SeriesSort::Manual);
     }
 
     #[tokio::test]

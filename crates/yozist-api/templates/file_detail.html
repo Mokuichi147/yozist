@@ -1279,7 +1279,12 @@ function renderFileSeries(list) {
           <a href="/ui/files?series=${encodeURIComponent(s.id)}"
              class="text-sm font-medium link link-hover truncate"
              title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</a>
-          <span class="text-xs opacity-60 shrink-0 tabular-nums">${pos} / ${total}</span>
+          <div class="flex items-center gap-1 shrink-0">
+            <span class="text-xs opacity-60 tabular-nums">${pos} / ${total}</span>
+            <a href="/ui/series/${encodeURIComponent(s.id)}"
+               class="btn btn-xs btn-ghost btn-square"
+               title="シリーズ設定（並び替え・名称変更）">⚙</a>
+          </div>
         </div>
         <div class="flex items-center gap-1 mt-1.5">
           <div class="join">

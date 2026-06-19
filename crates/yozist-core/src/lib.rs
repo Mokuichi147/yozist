@@ -153,11 +153,57 @@ pub struct Tag {
     pub confidence: Option<f32>,
 }
 
+/// シリーズ内メンバーの並び順。`Manual` のみ `order_index` を使い、それ以外は
+/// メンバーのファイル属性（登録日時 / 名前）で動的に並べる。手作業で並び替えると
+/// `Manual` へ切り替わる。デフォルトは登録日時の昇順 (`CreatedAsc`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesSort {
+    /// 登録日時（ファイル作成日時）の昇順。デフォルト。
+    #[default]
+    CreatedAsc,
+    /// 登録日時の降順。
+    CreatedDesc,
+    /// ファイル名の昇順。
+    NameAsc,
+    /// ファイル名の降順。
+    NameDesc,
+    /// 手動並び（`order_index` 順）。
+    Manual,
+}
+
+impl SeriesSort {
+    /// DB / API で用いる安定した文字列表現。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SeriesSort::CreatedAsc => "created_asc",
+            SeriesSort::CreatedDesc => "created_desc",
+            SeriesSort::NameAsc => "name_asc",
+            SeriesSort::NameDesc => "name_desc",
+            SeriesSort::Manual => "manual",
+        }
+    }
+
+    /// 文字列から復元する。未知の値（旧データ・不正値）は既定の `CreatedAsc` に倒す。
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "created_desc" => SeriesSort::CreatedDesc,
+            "name_asc" => SeriesSort::NameAsc,
+            "name_desc" => SeriesSort::NameDesc,
+            "manual" => SeriesSort::Manual,
+            _ => SeriesSort::CreatedAsc,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Series {
     pub id: SeriesId,
     pub name: String,
     pub description: Option<String>,
+    /// メンバーの並び順設定。
+    #[serde(default)]
+    pub sort_order: SeriesSort,
 }
 
 /// 条件のマッチ方法。`All` = すべて(AND)、`Any` = いずれか(OR)。

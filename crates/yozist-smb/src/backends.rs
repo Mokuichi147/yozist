@@ -1341,6 +1341,7 @@ impl ShareBackend for SeriesBackend {
                             id: yozist_core::SeriesId::new(),
                             name: series_name.clone(),
                             description: None,
+                            sort_order: yozist_core::SeriesSort::default(),
                         };
                         self.deps
                             .meta
