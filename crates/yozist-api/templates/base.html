@@ -25,23 +25,44 @@
 </head>
 <body class="min-h-screen bg-base-200 text-base-content">
 
-<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30">
-  <div class="flex-1 px-2 flex items-center gap-4">
-    <a href="/ui" class="text-xl font-bold">yozist</a>
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30 gap-2">
+  <div class="flex-1 px-2 flex items-center gap-3 min-w-0">
+    <a href="/ui" class="text-xl font-bold shrink-0">yozist</a>
     {% if active != "login" %}
-    <nav class="flex items-center gap-3 text-sm">
+    <!-- デスクトップ: 主要ナビをインライン表示 -->
+    <nav class="hidden sm:flex items-center gap-3 text-sm">
       <a href="/ui/files" class="link link-hover {% if active == "files" %}font-semibold{% endif %}">ファイル</a>
       <a href="/ui/filters" class="link link-hover {% if active == "filters" %}font-semibold{% endif %}">フィルター</a>
       <a href="/ui/trash" class="link link-hover {% if active == "trash" %}font-semibold{% endif %}">ゴミ箱</a>
+    </nav>
+    <!-- サブタブ(パンくず)は両環境で表示。狭い画面では横スクロール可能に -->
+    <nav class="flex items-center gap-2 text-sm min-w-0 overflow-x-auto whitespace-nowrap">
       {% block subtabs %}{% endblock %}
     </nav>
     {% endif %}
   </div>
   {% if active != "login" %}
-  <div class="flex-none flex items-center gap-4 px-2 text-sm">
+  <!-- デスクトップ: 右側リンクをインライン表示 -->
+  <div class="hidden sm:flex flex-none items-center gap-4 px-2 text-sm">
     <a href="/ui/manage" class="link link-hover {% if active == "manage" %}font-semibold{% endif %}">管理</a>
     <a id="me" href="/ui/settings" class="link link-hover" title="ユーザー設定">…</a>
-    <button id="logout" class="btn btn-sm btn-outline">ログアウト</button>
+    <button data-logout class="btn btn-sm btn-outline">ログアウト</button>
+  </div>
+  <!-- モバイル: 全ナビをハンバーガーメニューに集約 -->
+  <div class="flex-none sm:hidden px-1">
+    <div class="dropdown dropdown-end">
+      <div tabindex="0" role="button" class="btn btn-ghost btn-sm" aria-label="メニュー">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" /></svg>
+      </div>
+      <ul tabindex="0" class="menu dropdown-content bg-base-100 rounded-box z-40 mt-2 w-52 p-2 shadow">
+        <li><a href="/ui/files" class="{% if active == "files" %}font-semibold{% endif %}">ファイル</a></li>
+        <li><a href="/ui/filters" class="{% if active == "filters" %}font-semibold{% endif %}">フィルター</a></li>
+        <li><a href="/ui/trash" class="{% if active == "trash" %}font-semibold{% endif %}">ゴミ箱</a></li>
+        <li><a href="/ui/manage" class="{% if active == "manage" %}font-semibold{% endif %}">管理</a></li>
+        <li><a id="me-mobile" href="/ui/settings">ユーザー設定</a></li>
+        <li><button data-logout>ログアウト</button></li>
+      </ul>
+    </div>
   </div>
   {% endif %}
 </div>
@@ -152,7 +173,7 @@ function logout() {
   token = '';
   redirectToLogin();
 }
-if ($('logout')) $('logout').onclick = logout;
+document.querySelectorAll('[data-logout]').forEach(b => b.onclick = logout);
 
 // ログイン必須ページの共通初期化。認証OKなら me を返し、navbar のユーザー名を反映する。
 async function requireAuth() {
@@ -160,8 +181,9 @@ async function requireAuth() {
   try {
     const me = await json('/api/auth/me');
     if (me.anonymous) { logout(); return null; }
-    const meEl = $('me');
-    if (meEl) meEl.textContent = me.user.display_name || me.user.username;
+    const name = me.user.display_name || me.user.username;
+    if ($('me')) $('me').textContent = name;
+    if ($('me-mobile')) $('me-mobile').textContent = name;
     return me;
   } catch (e) { logout(); return null; }
 }
