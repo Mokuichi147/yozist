@@ -600,6 +600,7 @@ impl VersioningEngine {
             created_at: now,
             updated_at: now,
             deleted: false,
+            deleted_at: None,
             // 作成者/更新者ラベルは利用者を知る上位層（API 等）が書き込む。
             created_by: None,
             updated_by: None,
@@ -1237,6 +1238,7 @@ mod engine_tests {
             created_at: now,
             updated_at: now,
             deleted: false,
+            deleted_at: None,
             created_by: None,
             updated_by: None,
             created_by_user_id: None,

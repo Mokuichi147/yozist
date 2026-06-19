@@ -32,6 +32,7 @@
     <nav class="flex items-center gap-3 text-sm">
       <a href="/ui/files" class="link link-hover {% if active == "files" %}font-semibold{% endif %}">ファイル</a>
       <a href="/ui/filters" class="link link-hover {% if active == "filters" %}font-semibold{% endif %}">フィルター</a>
+      <a href="/ui/trash" class="link link-hover {% if active == "trash" %}font-semibold{% endif %}">ゴミ箱</a>
       {% block subtabs %}{% endblock %}
     </nav>
     {% endif %}
