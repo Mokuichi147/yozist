@@ -119,6 +119,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
         .route("/api/files/:id/series", get(list_file_series))
         .route("/api/tags", get(list_tags).post(upsert_tag))
+        // 注意: 静的セグメント "stats"/"merge" は `:id` より優先マッチする（matchit の仕様）。
+        .route("/api/tags/stats", get(list_tag_stats))
+        .route("/api/tags/merge", post(merge_tags))
         .route(
             "/api/tags/:id",
             axum::routing::patch(rename_tag).delete(delete_tag),
@@ -1337,6 +1340,75 @@ async fn list_tags(
     }
     .map_err(ApiError::from_db)?;
     Ok(Json(tags))
+}
+
+/// タグ管理ページ用。各タグに割り当てファイル数 `count` を添えて返す。
+#[derive(Serialize)]
+struct TagStat {
+    #[serde(flatten)]
+    tag: Tag,
+    count: u64,
+}
+
+async fn list_tag_stats(State(s): State<ApiState>) -> Result<Json<Vec<TagStat>>, ApiError> {
+    let rows = s
+        .meta
+        .list_tags_with_counts()
+        .await
+        .map_err(ApiError::from_db)?;
+    let stats = rows
+        .into_iter()
+        .map(|(tag, count)| TagStat { tag, count })
+        .collect();
+    Ok(Json(stats))
+}
+
+#[derive(Deserialize)]
+struct MergeTagsInput {
+    /// 合流元タグの ID 群（これらは削除され、ファイルは target に付け替えられる）。
+    source_ids: Vec<String>,
+    /// 合流先タグの ID（残るタグ）。
+    target_id: String,
+}
+
+async fn merge_tags(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<MergeTagsInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let target = uuid::Uuid::parse_str(&input.target_id)
+        .map(TagId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("target_id: {e}")))?;
+    if input.source_ids.is_empty() {
+        return Err(ApiError::BadRequest("source_ids が空です".into()));
+    }
+    for source_id in &input.source_ids {
+        let source = uuid::Uuid::parse_str(source_id)
+            .map(TagId::from_uuid)
+            .map_err(|e| ApiError::BadRequest(format!("source_id: {e}")))?;
+        if source == target {
+            continue;
+        }
+        let res = s
+            .meta
+            .merge_tags(&source, &target)
+            .await
+            .map_err(ApiError::from_db);
+        let meta = format!("{{\"target_id\":\"{}\"}}", input.target_id);
+        audit_event(
+            &s,
+            &ctx,
+            "merge_tag",
+            Some("tag"),
+            Some(source_id),
+            Some(&meta),
+            &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        )
+        .await;
+        res?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

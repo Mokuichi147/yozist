@@ -70,8 +70,14 @@ pub trait MetaStore: Send + Sync {
     async fn list_tags(&self) -> Result<Vec<Tag>, DbError>;
     /// 割り当て数の多い順（同数は名前昇順）にタグを返す。タグ候補の提示に使う。
     async fn list_tags_by_usage(&self) -> Result<Vec<Tag>, DbError>;
+    /// 各タグと割り当てファイル数を名前昇順で返す。タグ管理ページの一覧表示に使う。
+    async fn list_tags_with_counts(&self) -> Result<Vec<(Tag, u64)>, DbError>;
     async fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<(), DbError>;
     async fn delete_tag(&self, id: &TagId) -> Result<(), DbError>;
+    /// `source` タグを `target` タグへ合流する。`source` を付けていたファイルはすべて
+    /// `target` に付け替え（重複は無視）、`source` タグ自体を削除する。
+    /// `source` が存在しなければ `NotFound`、`target` が存在しなければ `Invalid`。
+    async fn merge_tags(&self, source: &TagId, target: &TagId) -> Result<(), DbError>;
     async fn attach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn detach_tag(&self, file: &FileId, tag: &TagId) -> Result<(), DbError>;
     async fn list_tags_of(&self, file: &FileId) -> Result<Vec<Tag>, DbError>;
