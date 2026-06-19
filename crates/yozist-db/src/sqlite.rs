@@ -91,6 +91,7 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
     let created_at: String = row.try_get("created_at")?;
     let updated_at: String = row.try_get("updated_at")?;
     let deleted: i64 = row.try_get("deleted")?;
+    let deleted_at: Option<String> = row.try_get("deleted_at")?;
     let created_by: Option<String> = row.try_get("created_by")?;
     let updated_by: Option<String> = row.try_get("updated_by")?;
     let created_by_user_id: Option<i64> = row.try_get("created_by_user_id")?;
@@ -107,6 +108,7 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
         deleted: deleted != 0,
+        deleted_at: deleted_at.map(|s| parse_dt(&s)).transpose()?,
         created_by,
         updated_by,
         created_by_user_id,
@@ -214,9 +216,9 @@ impl MetaStore for SqliteMetaStore {
         sqlx::query(
             r#"INSERT INTO files
                (id, display_name, size, mime, charset, current_commit,
-                created_at, updated_at, deleted, created_by, updated_by,
+                created_at, updated_at, deleted, deleted_at, created_by, updated_by,
                 created_by_user_id, updated_by_user_id, version)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)"#,
         )
         .bind(meta.id.to_string())
         .bind(&meta.display_name)
@@ -227,6 +229,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(fmt_dt(meta.created_at))
         .bind(fmt_dt(meta.updated_at))
         .bind(meta.deleted as i64)
+        .bind(meta.deleted_at.map(fmt_dt))
         .bind(&meta.created_by)
         .bind(&meta.updated_by)
         .bind(meta.created_by_user_id)
@@ -249,7 +252,7 @@ impl MetaStore for SqliteMetaStore {
         let res = sqlx::query(
             r#"UPDATE files SET
                  display_name = ?, size = ?, mime = ?, charset = ?,
-                 current_commit = ?, updated_at = ?, deleted = ?,
+                 current_commit = ?, updated_at = ?, deleted = ?, deleted_at = ?,
                  created_by = ?, updated_by = ?,
                  created_by_user_id = ?, updated_by_user_id = ?,
                  version = version + 1
@@ -262,6 +265,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(meta.current_commit.map(|c| c.to_string()))
         .bind(fmt_dt(meta.updated_at))
         .bind(meta.deleted as i64)
+        .bind(meta.deleted_at.map(fmt_dt))
         .bind(&meta.created_by)
         .bind(&meta.updated_by)
         .bind(meta.created_by_user_id)
@@ -306,6 +310,32 @@ impl MetaStore for SqliteMetaStore {
         rows.into_iter().map(row_to_file).collect()
     }
 
+    async fn list_deleted_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError> {
+        // ゴミ箱: 論理削除済みを削除日時の新しい順で。削除時刻不明の旧データは末尾へ。
+        let rows = sqlx::query(
+            "SELECT * FROM files WHERE deleted = 1 \
+             ORDER BY deleted_at IS NULL, deleted_at DESC, updated_at DESC \
+             LIMIT ? OFFSET ?",
+        )
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(row_to_file).collect()
+    }
+
+    async fn purge_file(&self, id: &FileId) -> Result<(), DbError> {
+        // files 行を物理削除。commits / file_tags / series_members / blob_refs は
+        // ON DELETE CASCADE で同時に消える（foreign_keys=ON 前提）。
+        let res = sqlx::query("DELETE FROM files WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
 
     async fn upsert_tag(&self, tag: &Tag) -> Result<TagId, DbError> {
         // 同名タグがあればそのIDを返す（kindの優先度: Manual > AI > System）。
@@ -841,6 +871,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted: false,
+            deleted_at: None,
             created_by: Some("tester".into()),
             updated_by: Some("tester".into()),
             created_by_user_id: Some(7),
@@ -874,6 +905,82 @@ mod tests {
         s.update_file(&a).await.unwrap();
         let after = s.get_file(&a.id).await.unwrap().unwrap();
         assert_eq!(after.display_name, "renamed.md");
+    }
+
+    #[tokio::test]
+    async fn trash_lists_deleted_and_preserves_deleted_at() {
+        let s = store().await;
+        let live = sample_file();
+        let mut gone = sample_file();
+        let deleted_at = OffsetDateTime::now_utc();
+        gone.deleted = true;
+        gone.deleted_at = Some(deleted_at);
+        s.insert_file(&live).await.unwrap();
+        s.insert_file(&gone).await.unwrap();
+
+        // ゴミ箱には削除済みのみが並ぶ
+        let trash = s.list_deleted_files(100, 0).await.unwrap();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, gone.id);
+        // deleted_at が往復で保持される（秒精度）
+        assert_eq!(
+            trash[0].deleted_at.map(|d| d.unix_timestamp()),
+            Some(deleted_at.unix_timestamp()),
+        );
+
+        // 復元すると一覧から外れ deleted_at も消える
+        let mut restored = trash.into_iter().next().unwrap();
+        restored.deleted = false;
+        restored.deleted_at = None;
+        s.update_file(&restored).await.unwrap();
+        assert!(s.list_deleted_files(100, 0).await.unwrap().is_empty());
+        let back = s.get_file(&restored.id).await.unwrap().unwrap();
+        assert!(!back.deleted);
+        assert!(back.deleted_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_file_removes_row_and_cascades() {
+        let s = store().await;
+        let file = sample_file();
+        s.insert_file(&file).await.unwrap();
+        // タグとコミットを関連付け、CASCADE で消えることを確認する
+        let tag_id = s
+            .upsert_tag(&Tag {
+                id: TagId::new(),
+                name: "keep".into(),
+                kind: TagKind::Manual,
+                confidence: None,
+            })
+            .await
+            .unwrap();
+        s.attach_tag(&file.id, &tag_id).await.unwrap();
+        let commit = Commit {
+            id: CommitId::new(),
+            file_id: file.id,
+            parent: None,
+            actor: ActorId::new(),
+            blob: BlobId::from_hex("aa"),
+            format_id: "text/plain".into(),
+            timestamp: OffsetDateTime::now_utc(),
+            message: Some("init".into()),
+            committed_by: None,
+            committed_by_user_id: None,
+        };
+        s.insert_commit(&commit).await.unwrap();
+
+        // 物理削除: ファイル行が消え、関連も CASCADE で消える
+        s.purge_file(&file.id).await.unwrap();
+        assert!(s.get_file(&file.id).await.unwrap().is_none());
+        assert!(s.list_commits(&file.id).await.unwrap().is_empty());
+        assert!(s.list_tags_of(&file.id).await.unwrap().is_empty());
+        // タグ定義自体は残る（共有されうるため）
+        assert!(s.list_tags().await.unwrap().iter().any(|t| t.id == tag_id));
+        // 存在しないファイルの purge は NotFound
+        assert!(matches!(
+            s.purge_file(&file.id).await,
+            Err(DbError::NotFound)
+        ));
     }
 
     #[tokio::test]

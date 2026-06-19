@@ -78,12 +78,16 @@
     <aside class="w-full lg:w-80 shrink-0 space-y-4">
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4 gap-2">
+          <div id="fd-deleted-banner" class="hidden alert alert-warning text-xs py-2 mb-1">
+            このファイルはゴミ箱にあります（削除済み）。「復元」で元に戻せます。
+          </div>
           <button class="btn btn-sm btn-block" onclick="downloadContent()">ダウンロード</button>
-          <button class="btn btn-sm btn-block" onclick="$('fd-upload-input').click()">内容を更新</button>
+          <button id="fd-update-btn" class="btn btn-sm btn-block" onclick="$('fd-upload-input').click()">内容を更新</button>
           <input id="fd-upload-input" type="file" class="hidden" onchange="uploadContent(this.files[0])">
-          <button class="btn btn-sm btn-block" onclick="issueShare()">共有URL</button>
-          <button class="btn btn-sm btn-block" onclick="grantPermission()">権限付与</button>
-          <button class="btn btn-sm btn-block btn-error btn-outline" onclick="deleteFile()">削除</button>
+          <button id="fd-share-btn" class="btn btn-sm btn-block" onclick="issueShare()">共有URL</button>
+          <button id="fd-perm-btn" class="btn btn-sm btn-block" onclick="grantPermission()">権限付与</button>
+          <button id="fd-delete-btn" class="btn btn-sm btn-block btn-error btn-outline" onclick="deleteFile()">削除</button>
+          <button id="fd-restore-btn" class="hidden btn btn-sm btn-block btn-primary" onclick="restoreFile()">復元</button>
           <div id="fd-share" class="text-xs break-all"></div>
         </div>
       </div>
@@ -278,8 +282,31 @@ async function loadSeriesOptions() {
   } catch (e) { seriesOptions = []; }
 }
 
+// 削除済み（ゴミ箱内）ファイルの表示制御。閲覧は可能だが、削除済みへの
+// 変更・共有・権限操作は混乱を招くため無効化し、代わりに「復元」を出す。
+function applyDeletedState() {
+  const d = !!currentFile.deleted;
+  $('fd-deleted-banner').classList.toggle('hidden', !d);
+  $('fd-delete-btn').classList.toggle('hidden', d);
+  $('fd-restore-btn').classList.toggle('hidden', !d);
+  ['fd-update-btn', 'fd-share-btn', 'fd-perm-btn'].forEach(id => {
+    const el = $(id);
+    if (el) el.disabled = d;
+  });
+}
+
+async function restoreFile() {
+  const r = await api(`/api/files/${fileId}/restore`, { method: 'POST' });
+  if (!r.ok) { uiToast('復元に失敗しました: ' + await r.text(), 'error'); return; }
+  currentFile = await json('/api/files/' + fileId);
+  applyDeletedState();
+  renderContent();
+  uiToast('復元しました', 'success');
+}
+
 async function loadDetail() {
   $('fd-name').textContent = currentFile.display_name;
+  applyDeletedState();
   const metaRow = (label, value, mono) =>
     `<div><dt class="opacity-50">${label}</dt>` +
     `<dd class="break-all${mono ? ' font-mono' : ''}">${value}</dd></div>`;
@@ -496,7 +523,8 @@ async function renderContent() {
   } catch (e) {
     cont.innerHTML = `<span class="text-error text-xs">content の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
   }
-  $('fd-edit-btn').classList.toggle('hidden', !canEdit);
+  // 削除済みファイルはテキスト編集も無効化（復元してから編集する）
+  $('fd-edit-btn').classList.toggle('hidden', !canEdit || !!(currentFile && currentFile.deleted));
 }
 
 // テキスト/不明データを表示する。通常サイズは全文、巨大ファイルは仮想スクロール。

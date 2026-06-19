@@ -102,6 +102,10 @@ pub struct FileMeta {
     pub created_at: time::OffsetDateTime,
     pub updated_at: time::OffsetDateTime,
     pub deleted: bool,
+    /// 論理削除された日時（ゴミ箱表示・並び替え用）。`deleted == true` のとき
+    /// 削除時刻を持つ。`None` は未削除、または削除時刻が記録されていない旧データ。
+    #[serde(default)]
+    pub deleted_at: Option<time::OffsetDateTime>,
     /// 作成者のユーザー名ラベル。ユーザー削除後も表示が残るよう ID ではなく
     /// ラベルを保存する。`None` は記録なし（旧データ・SMB 経由など）。
     #[serde(default)]

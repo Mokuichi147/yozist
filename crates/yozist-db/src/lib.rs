@@ -56,6 +56,12 @@ pub trait MetaStore: Send + Sync {
         sort: FileSort,
         asc: bool,
     ) -> Result<Vec<FileMeta>, DbError>;
+    /// 論理削除済みファイル（ゴミ箱）の一覧。削除日時の新しい順に返す。
+    async fn list_deleted_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError>;
+    /// ファイルを物理削除する（ゴミ箱からの完全削除）。関連する commits / file_tags /
+    /// series_members / blob_refs は FK の ON DELETE CASCADE で同時に消える。blob 本体は
+    /// CAS（共有・GC なし）のため残す。存在しなければ `NotFound`。
+    async fn purge_file(&self, id: &FileId) -> Result<(), DbError>;
 
     // ---- tags ----
     async fn upsert_tag(&self, tag: &Tag) -> Result<TagId, DbError>;

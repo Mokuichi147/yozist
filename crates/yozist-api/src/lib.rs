@@ -99,10 +99,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files", get(list_files).post(create_file))
         // 注意: 静的セグメント "tags" は `:id` より優先マッチする（matchit の仕様）。
         .route("/api/files/tags", get(list_tags_batch))
+        // ゴミ箱（論理削除済みファイルの一覧 / 空にする）。
+        .route("/api/trash", get(list_trash).delete(empty_trash))
+        // ゴミ箱内ファイルの完全削除（物理削除）。
+        .route("/api/trash/:id", axum::routing::delete(purge_trash_file))
         .route(
             "/api/files/:id",
             get(get_file).patch(rename_file).delete(delete_file),
         )
+        .route("/api/files/:id/restore", post(restore_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
         .route("/api/files/:id/commits/:cid", get(read_commit))
@@ -590,8 +595,10 @@ async fn delete_file(
             .await
             .map_err(ApiError::from_db)?
             .ok_or(ApiError::NotFound)?;
+        let now = time::OffsetDateTime::now_utc();
         meta.deleted = true;
-        meta.updated_at = time::OffsetDateTime::now_utc();
+        meta.deleted_at = Some(now);
+        meta.updated_at = now;
         if let AuthContext::User { user, .. } = &ctx {
             meta.updated_by = Some(user.username.clone());
         }
@@ -612,6 +619,205 @@ async fn delete_file(
     .await;
     res?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/files/:id/restore — 論理削除されたファイルをゴミ箱から復元する。
+async fn restore_file(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<Json<FileMeta>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::file(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let res = async {
+        let mut meta = s
+            .meta
+            .get_file(&file_id)
+            .await
+            .map_err(ApiError::from_db)?
+            .ok_or(ApiError::NotFound)?;
+        if !meta.deleted {
+            return Err(ApiError::BadRequest("削除されていません".into()));
+        }
+        meta.deleted = false;
+        meta.deleted_at = None;
+        meta.updated_at = time::OffsetDateTime::now_utc();
+        if let AuthContext::User { user, .. } = &ctx {
+            meta.updated_by = Some(user.username.clone());
+        }
+        s.meta.update_file(&meta).await.map_err(ApiError::from_db)?;
+        Ok::<_, ApiError>(meta)
+    }
+    .await;
+    // FTS は削除時に消えているため、名前・タグを再投入して検索に復帰させる
+    // （本文は次回 commit 時に再投入される。refresh_fts_tags と同じ方針）。
+    if res.is_ok() {
+        refresh_fts_tags(&s, &file_id).await;
+    }
+    audit_event(
+        &s,
+        &ctx,
+        "restore_file",
+        Some("file"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    Ok(Json(res?))
+}
+
+/// GET /api/trash — 論理削除済みファイル（ゴミ箱）の一覧。削除日時の新しい順。
+/// `list_files` と同様に権限フィルタとページングを行う。
+async fn list_trash(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Query(q): Query<ListFilesQuery>,
+) -> Result<axum::response::Response, ApiError> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = q.offset.unwrap_or(0);
+    // 権限フィルタでページが縮む分を吸収する（list_files と同じ方針）。
+    const MAX_SCAN_PAGES: u32 = 10;
+    let mut visible = Vec::new();
+    let mut db_offset = offset;
+    let mut has_more = false;
+    for _ in 0..MAX_SCAN_PAGES {
+        let files = s
+            .meta
+            .list_deleted_files(limit, db_offset)
+            .await
+            .map_err(ApiError::from_db)?;
+        let fetched = files.len() as u32;
+        visible.extend(filter_visible_files(&*s.authz, &ctx, files).await?);
+        db_offset += fetched;
+        if fetched < limit {
+            has_more = false;
+            break;
+        }
+        has_more = true;
+        if visible.len() as u32 >= limit {
+            break;
+        }
+    }
+    let mut resp = Json(visible).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        "x-has-more",
+        axum::http::HeaderValue::from_static(if has_more { "1" } else { "0" }),
+    );
+    if has_more {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&db_offset.to_string()) {
+            h.insert("x-next-offset", v);
+        }
+    }
+    Ok(resp)
+}
+
+/// DELETE /api/trash/:id — ゴミ箱内のファイルを完全削除（物理削除・復元不可）。
+/// 論理削除済み（ゴミ箱内）のファイルのみ対象。未削除ファイルは 400。
+async fn purge_trash_file(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::file(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let res = async {
+        let meta = s
+            .meta
+            .get_file(&file_id)
+            .await
+            .map_err(ApiError::from_db)?
+            .ok_or(ApiError::NotFound)?;
+        // 安全策: 生きているファイルを誤って物理削除しない（先にゴミ箱へ）。
+        if !meta.deleted {
+            return Err(ApiError::BadRequest(
+                "完全削除はゴミ箱内のファイルのみ可能です".into(),
+            ));
+        }
+        let _ = s.meta.delete_fts(&file_id).await;
+        s.meta.purge_file(&file_id).await.map_err(ApiError::from_db)?;
+        Ok::<_, ApiError>(())
+    }
+    .await;
+    audit_event(
+        &s,
+        &ctx,
+        "purge_file",
+        Some("file"),
+        Some(&id),
+        None,
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// DELETE /api/trash — ゴミ箱を空にする。呼び出し元が WRITE 権限を持つ
+/// 論理削除済みファイルをすべて完全削除する。削除件数を JSON で返す。
+async fn empty_trash(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    const PAGE: u32 = 200;
+    const MAX_SCAN_PAGES: u32 = 1000; // 暴走防止の上限
+    let mut purged: u64 = 0;
+    for _ in 0..MAX_SCAN_PAGES {
+        // 物理削除で行が消えるので offset は常に 0 から取り直す。
+        let files = s
+            .meta
+            .list_deleted_files(PAGE, 0)
+            .await
+            .map_err(ApiError::from_db)?;
+        if files.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for f in &files {
+            // 権限の無いファイルは飛ばす（他者のファイルまで消さない）。
+            let can = s
+                .authz
+                .check(&ctx, &Target::file(f.id), PermissionMask::WRITE)
+                .await
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            if !can {
+                continue;
+            }
+            let _ = s.meta.delete_fts(&f.id).await;
+            if s.meta.purge_file(&f.id).await.is_ok() {
+                purged += 1;
+                progressed = true;
+            }
+        }
+        // このページが全件権限なし（=消せない）なら無限ループになるため打ち切る。
+        if !progressed {
+            break;
+        }
+    }
+    audit_event(
+        &s,
+        &ctx,
+        "empty_trash",
+        Some("trash"),
+        None,
+        Some(&purged.to_string()),
+        &Ok::<(), String>(()),
+    )
+    .await;
+    Ok(Json(serde_json::json!({ "purged": purged })))
 }
 
 /// 保存済み MIME と本文を、配信用の `(Content-Type, body)` に整える。

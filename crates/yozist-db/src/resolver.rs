@@ -232,6 +232,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             deleted: false,
+            deleted_at: None,
             created_by: None,
             updated_by: None,
             created_by_user_id: None,
