@@ -132,9 +132,14 @@ pub fn router(state: ApiState) -> Router {
                 .patch(rename_series)
                 .delete(delete_series),
         )
+        .route("/api/series/:id/detail", get(get_series_detail))
         .route(
             "/api/series/:id/members",
             get(list_series_members).post(add_series_member),
+        )
+        .route(
+            "/api/series/:id/members/order",
+            axum::routing::put(reorder_series_members),
         )
         .route(
             "/api/series/:id/members/:file_id",
@@ -1769,6 +1774,50 @@ async fn get_series(
     Ok(Json(series))
 }
 
+/// シリーズ設定ページ用ビュー。シリーズ本体に加え、順序付きメンバーを表示名付きで返す。
+#[derive(Serialize)]
+struct SeriesDetailView {
+    id: String,
+    name: String,
+    description: Option<String>,
+    members: Vec<SeriesMemberView>,
+}
+
+/// シリーズ本体 + 順序付きメンバー（表示名付き）を 1 リクエストで返す。
+/// 設定ページ（並び替え・名称変更）が初期描画に使う。
+async fn get_series_detail(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<SeriesDetailView>, ApiError> {
+    let series_id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    let series = s
+        .meta
+        .get_series(&series_id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let named = s
+        .meta
+        .list_series_members_named(&series_id)
+        .await
+        .map_err(ApiError::from_db)?;
+    let members = named
+        .into_iter()
+        .map(|(fid, display_name)| SeriesMemberView {
+            file_id: fid.to_string(),
+            display_name,
+        })
+        .collect();
+    Ok(Json(SeriesDetailView {
+        id: series.id.to_string(),
+        name: series.name,
+        description: series.description,
+        members,
+    }))
+}
+
 #[derive(Deserialize)]
 struct AddMemberInput {
     file_id: String,
@@ -1901,6 +1950,69 @@ async fn add_series_member(
         Some("series"),
         Some(&sid),
         Some(&m),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    res?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ReorderMembersInput {
+    /// 新しい並び順を表すファイル ID 列。先頭から順に order_index を振り直す。
+    file_ids: Vec<String>,
+}
+
+/// シリーズ内メンバーの並び順を一括で更新する。
+/// `file_ids` の順に order_index を 10, 20, 30… と振り直す。並び替えはシリーズ単位の
+/// 操作とみなし、rename と同様に認証済みであれば許可する（個別ファイル権限は要求しない）。
+/// 既存メンバーでない ID は無視する（誤って未所属ファイルを追加しないため）。
+async fn reorder_series_members(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Json(input): Json<ReorderMembersInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let series_id = uuid::Uuid::parse_str(&id)
+        .map(SeriesId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("series id: {e}")))?;
+    // 既存メンバー集合。リクエストに含まれない ID は触らず、未所属の ID は無視する。
+    let existing = s
+        .meta
+        .list_series_members(&series_id)
+        .await
+        .map_err(ApiError::from_db)?;
+    let member_ids: std::collections::HashSet<FileId> =
+        existing.iter().map(|m| m.file_id).collect();
+    let mut order: f64 = 10.0;
+    let res: Result<(), ApiError> = async {
+        for raw in &input.file_ids {
+            let file_id = parse_file_id(raw)?;
+            if !member_ids.contains(&file_id) {
+                continue;
+            }
+            s.meta
+                .add_to_series(&SeriesMember {
+                    series_id,
+                    file_id,
+                    order_index: order,
+                })
+                .await
+                .map_err(ApiError::from_db)?;
+            order += 10.0;
+        }
+        Ok(())
+    }
+    .await;
+    let sid = series_id.to_string();
+    audit_event(
+        &s,
+        &ctx,
+        "reorder_series",
+        Some("series"),
+        Some(&sid),
+        None,
         &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
     )
     .await;
