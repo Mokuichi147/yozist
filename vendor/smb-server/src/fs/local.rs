@@ -16,7 +16,6 @@
 //!   `?` and `*`), since cap-std only provides raw `entries()`.
 
 use std::io;
-use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,6 +32,38 @@ use crate::backend::{
 };
 use crate::error::{SmbError, SmbResult};
 use crate::path::SmbPath;
+
+// ---------------------------------------------------------------------------
+// Cross-platform positioned read/write
+// ---------------------------------------------------------------------------
+//
+// Unix exposes `FileExt::{read_at, write_at}`; Windows exposes
+// `FileExt::{seek_read, seek_write}`. Both perform a positioned I/O without
+// disturbing the file cursor, so we wrap them behind a single signature.
+
+#[cfg(unix)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_at(buf, offset)
+}
+
+#[cfg(unix)]
+fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.write_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+    file.seek_read(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+    file.seek_write(buf, offset)
+}
 
 // ---------------------------------------------------------------------------
 // Backend
@@ -476,7 +507,7 @@ impl Handle for LocalHandle {
                 let n = len as usize;
                 let bytes = spawn_blocking(move || -> io::Result<Bytes> {
                     let mut buf = vec![0u8; n];
-                    let read = file.read_at(&mut buf, offset)?;
+                    let read = read_at(&file, &mut buf, offset)?;
                     buf.truncate(read);
                     Ok(Bytes::from(buf))
                 })
@@ -503,7 +534,7 @@ impl Handle for LocalHandle {
                     return Err(SmbError::AccessDenied);
                 }
                 let file = Arc::clone(file);
-                let written = spawn_blocking(move || file.write_at(&data, offset))
+                let written = spawn_blocking(move || write_at(&file, &data, offset))
                     .await
                     .map_err(join_to_io)
                     .map_err(io_to_smb)?
