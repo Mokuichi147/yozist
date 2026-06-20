@@ -281,6 +281,12 @@ pub struct Commit {
     pub format_id: String,
     pub timestamp: time::OffsetDateTime,
     pub message: Option<String>,
+    /// このコミット（バージョン）の論理サイズ（提示サイズ）。`FileMeta.size` と
+    /// 同じ基準で、一覧やダウンロードで見えるサイズに一致する。zstd 圧縮後の
+    /// blob 実体サイズとは別物。バージョン別のストレージ集計に使う。
+    /// 旧データ（size 列追加前のコミット）は `0`。
+    #[serde(default)]
+    pub size: u64,
     /// コミットを実行したユーザー名ラベル。CRDT マージ用の `actor` とは別物で、
     /// 「誰が変更したか」の表示・監査用。ユーザー削除後も残るよう ID ではなくラベルで保持。
     /// 旧データや SMB 経由の書き込みでは NULL。

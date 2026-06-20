@@ -618,6 +618,7 @@ impl VersioningEngine {
             format_id: format_id.to_string(),
             timestamp: now,
             message: Some("create".into()),
+            size,
             committed_by,
             committed_by_user_id,
         };
@@ -686,6 +687,7 @@ impl VersioningEngine {
             format_id: format_id.to_string(),
             timestamp: now,
             message,
+            size,
             committed_by,
             committed_by_user_id,
         };
