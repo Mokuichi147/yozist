@@ -119,6 +119,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
         .route("/api/files/:id/series", get(list_file_series))
         .route("/api/tags", get(list_tags).post(upsert_tag))
+        // 注意: 静的セグメント "stats"/"merge" は `:id` より優先マッチする（matchit の仕様）。
+        .route("/api/tags/stats", get(list_tag_stats))
+        .route("/api/tags/merge", post(merge_tags))
         .route(
             "/api/tags/:id",
             axum::routing::patch(rename_tag).delete(delete_tag),
@@ -1339,6 +1342,96 @@ async fn list_tags(
     Ok(Json(tags))
 }
 
+/// タグ管理ページ用。各タグに割り当てファイル数 `count` を添えて返す。
+#[derive(Serialize)]
+struct TagStat {
+    #[serde(flatten)]
+    tag: Tag,
+    count: u64,
+}
+
+/// 管理操作（改名・削除・合流）の対象タグを検証する。タグが存在しなければ `NotFound`、
+/// システムタグ（拡張子・種別など自動付与）なら `BadRequest` を返す。システムタグは
+/// ファイル属性から自動再生成されるため、手動での改名・削除・合流の対象にしない。
+async fn require_editable_tag(s: &ApiState, id: &TagId) -> Result<(), ApiError> {
+    let tag = s
+        .meta
+        .get_tag(id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    if matches!(tag.kind, TagKind::System) {
+        return Err(ApiError::BadRequest(
+            "システムタグは変更・削除・合流できません".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn list_tag_stats(State(s): State<ApiState>) -> Result<Json<Vec<TagStat>>, ApiError> {
+    let rows = s
+        .meta
+        .list_tags_with_counts()
+        .await
+        .map_err(ApiError::from_db)?;
+    let stats = rows
+        .into_iter()
+        .map(|(tag, count)| TagStat { tag, count })
+        .collect();
+    Ok(Json(stats))
+}
+
+#[derive(Deserialize)]
+struct MergeTagsInput {
+    /// 合流元タグの ID 群（これらは削除され、ファイルは target に付け替えられる）。
+    source_ids: Vec<String>,
+    /// 合流先タグの ID（残るタグ）。
+    target_id: String,
+}
+
+async fn merge_tags(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<MergeTagsInput>,
+) -> Result<StatusCode, ApiError> {
+    require_authenticated(&ctx).await?;
+    let target = uuid::Uuid::parse_str(&input.target_id)
+        .map(TagId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("target_id: {e}")))?;
+    if input.source_ids.is_empty() {
+        return Err(ApiError::BadRequest("source_ids が空です".into()));
+    }
+    // 合流先・合流元ともにシステムタグは対象外。
+    require_editable_tag(&s, &target).await?;
+    for source_id in &input.source_ids {
+        let source = uuid::Uuid::parse_str(source_id)
+            .map(TagId::from_uuid)
+            .map_err(|e| ApiError::BadRequest(format!("source_id: {e}")))?;
+        if source == target {
+            continue;
+        }
+        require_editable_tag(&s, &source).await?;
+        let res = s
+            .meta
+            .merge_tags(&source, &target)
+            .await
+            .map_err(ApiError::from_db);
+        let meta = format!("{{\"target_id\":\"{}\"}}", input.target_id);
+        audit_event(
+            &s,
+            &ctx,
+            "merge_tag",
+            Some("tag"),
+            Some(source_id),
+            Some(&meta),
+            &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        )
+        .await;
+        res?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct RenameTagInput {
     name: String,
@@ -1354,6 +1447,7 @@ async fn rename_tag(
     let tag_id = uuid::Uuid::parse_str(&id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag id: {e}")))?;
+    require_editable_tag(&s, &tag_id).await?;
     let new_name = input.name.clone();
     let res = s
         .meta
@@ -1384,6 +1478,7 @@ async fn delete_tag(
     let tag_id = uuid::Uuid::parse_str(&id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag id: {e}")))?;
+    require_editable_tag(&s, &tag_id).await?;
     let res = s.meta.delete_tag(&tag_id).await.map_err(ApiError::from_db);
     audit_event(
         &s,

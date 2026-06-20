@@ -22,6 +22,7 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/login", get(login_page))
         .route("/settings", get(settings_page))
         .route("/filters", get(filters_page))
+        .route("/tags", get(tags_page))
         .route("/manage", get(manage_page))
         .route("/files", get(files_page))
         .route("/trash", get(trash_page))
@@ -71,6 +72,12 @@ struct ManageTemplate {
 #[derive(Template)]
 #[template(path = "filters.html")]
 struct FiltersTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "tags.html")]
+struct TagsTemplate {
     active: &'static str,
 }
 
@@ -128,6 +135,10 @@ async fn manage_page() -> Response {
 
 async fn filters_page() -> Response {
     render(FiltersTemplate { active: "filters" })
+}
+
+async fn tags_page() -> Response {
+    render(TagsTemplate { active: "tags" })
 }
 
 async fn files_page() -> Response {

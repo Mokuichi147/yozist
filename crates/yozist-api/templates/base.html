@@ -33,6 +33,7 @@
     <nav class="hidden sm:flex items-center gap-3 text-sm">
       <a href="/ui/files" class="link link-hover {% if active == "files" %}font-semibold{% endif %}">ファイル</a>
       <a href="/ui/filters" class="link link-hover {% if active == "filters" %}font-semibold{% endif %}">フィルター</a>
+      <a href="/ui/tags" class="link link-hover {% if active == "tags" %}font-semibold{% endif %}">タグ</a>
       <a href="/ui/trash" class="link link-hover {% if active == "trash" %}font-semibold{% endif %}">ゴミ箱</a>
     </nav>
     <!-- サブタブ(パンくず)は両環境で表示。狭い画面では横スクロール可能に -->
@@ -57,6 +58,7 @@
       <ul tabindex="0" class="menu dropdown-content bg-base-100 rounded-box z-40 mt-2 w-52 p-2 shadow">
         <li><a href="/ui/files" class="{% if active == "files" %}font-semibold{% endif %}">ファイル</a></li>
         <li><a href="/ui/filters" class="{% if active == "filters" %}font-semibold{% endif %}">フィルター</a></li>
+        <li><a href="/ui/tags" class="{% if active == "tags" %}font-semibold{% endif %}">タグ</a></li>
         <li><a href="/ui/trash" class="{% if active == "trash" %}font-semibold{% endif %}">ゴミ箱</a></li>
         <li><a href="/ui/manage" class="{% if active == "manage" %}font-semibold{% endif %}">管理</a></li>
         <li><a id="me-mobile" href="/ui/settings">ユーザー設定</a></li>

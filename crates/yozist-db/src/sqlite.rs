@@ -408,6 +408,70 @@ impl MetaStore for SqliteMetaStore {
         rows.into_iter().map(row_to_tag).collect()
     }
 
+    async fn list_tags_with_counts(&self) -> Result<Vec<(Tag, u64)>, DbError> {
+        let rows = sqlx::query(
+            r#"SELECT t.id, t.name, t.kind, t.confidence, COUNT(ft.file_id) AS cnt
+               FROM tags t
+               LEFT JOIN file_tags ft ON ft.tag_id = t.id
+               GROUP BY t.id, t.name, t.kind, t.confidence
+               ORDER BY t.name ASC"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let cnt: i64 = row.try_get("cnt")?;
+                let tag = row_to_tag(row)?;
+                Ok((tag, cnt.max(0) as u64))
+            })
+            .collect()
+    }
+
+    async fn merge_tags(&self, source: &TagId, target: &TagId) -> Result<(), DbError> {
+        if source == target {
+            return Err(DbError::Invalid("source と target が同一です".into()));
+        }
+        let source_s = source.to_string();
+        let target_s = target.to_string();
+
+        let mut tx = self.pool.begin().await?;
+
+        // source / target の存在確認。source が無ければ NotFound、target が無ければ Invalid。
+        let source_exists: Option<String> = sqlx::query_scalar("SELECT id FROM tags WHERE id = ?")
+            .bind(&source_s)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if source_exists.is_none() {
+            return Err(DbError::NotFound);
+        }
+        let target_exists: Option<String> = sqlx::query_scalar("SELECT id FROM tags WHERE id = ?")
+            .bind(&target_s)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if target_exists.is_none() {
+            return Err(DbError::Invalid("合流先のタグが存在しません".into()));
+        }
+
+        // source を付けていたファイルを target に付け替え（既に target 付きなら無視）。
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO file_tags (file_id, tag_id)
+               SELECT file_id, ? FROM file_tags WHERE tag_id = ?"#,
+        )
+        .bind(&target_s)
+        .bind(&source_s)
+        .execute(&mut *tx)
+        .await?;
+
+        // source タグを削除（残った source の file_tags は CASCADE で消える）。
+        sqlx::query("DELETE FROM tags WHERE id = ?")
+            .bind(&source_s)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn rename_tag(&self, id: &TagId, new_name: &str) -> Result<(), DbError> {
         let res = sqlx::query("UPDATE tags SET name = ? WHERE id = ?")
             .bind(new_name)
@@ -1085,6 +1149,72 @@ mod tests {
         s.detach_tag(&f1.id, &urgent).await.unwrap();
         let after = s.list_files_by_tags(&[work, urgent]).await.unwrap();
         assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_tags_repoints_files_and_removes_source() {
+        let s = store().await;
+        let f1 = sample_file();
+        let f2 = sample_file();
+        let f3 = sample_file();
+        s.insert_file(&f1).await.unwrap();
+        s.insert_file(&f2).await.unwrap();
+        s.insert_file(&f3).await.unwrap();
+        let mk = |name: &str| Tag {
+            id: TagId::new(),
+            name: name.into(),
+            kind: TagKind::Manual,
+            confidence: None,
+        };
+        let keep = s.upsert_tag(&mk("仕事")).await.unwrap();
+        let dup = s.upsert_tag(&mk("work")).await.unwrap();
+        // f1: 両方 / f2: dup のみ / f3: keep のみ
+        s.attach_tag(&f1.id, &keep).await.unwrap();
+        s.attach_tag(&f1.id, &dup).await.unwrap();
+        s.attach_tag(&f2.id, &dup).await.unwrap();
+        s.attach_tag(&f3.id, &keep).await.unwrap();
+
+        s.merge_tags(&dup, &keep).await.unwrap();
+
+        // source タグは消えている
+        assert!(s.get_tag(&dup).await.unwrap().is_none());
+        // keep は f1/f2/f3 すべてに付く（f1 の重複は 1 件に集約）
+        let files = s.list_files_by_tags(&[keep]).await.unwrap();
+        assert_eq!(files.len(), 3);
+        // 件数も 3
+        let stats = s.list_tags_with_counts().await.unwrap();
+        let (_, cnt) = stats.iter().find(|(t, _)| t.id == keep).unwrap();
+        assert_eq!(*cnt, 3);
+    }
+
+    #[tokio::test]
+    async fn merge_tags_validates_ids() {
+        let s = store().await;
+        let only = s
+            .upsert_tag(&Tag {
+                id: TagId::new(),
+                name: "only".into(),
+                kind: TagKind::Manual,
+                confidence: None,
+            })
+            .await
+            .unwrap();
+        // 同一 ID は Invalid
+        assert!(matches!(
+            s.merge_tags(&only, &only).await,
+            Err(DbError::Invalid(_))
+        ));
+        // source 不在は NotFound
+        let missing = TagId::new();
+        assert!(matches!(
+            s.merge_tags(&missing, &only).await,
+            Err(DbError::NotFound)
+        ));
+        // target 不在は Invalid
+        assert!(matches!(
+            s.merge_tags(&only, &missing).await,
+            Err(DbError::Invalid(_))
+        ));
     }
 
     #[tokio::test]
