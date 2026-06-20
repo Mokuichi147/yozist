@@ -36,7 +36,7 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, BlobId, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId, Series, SeriesId,
+    ActorId, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId, Series, SeriesId,
     SeriesMember, SeriesSort, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -389,16 +389,17 @@ struct CategoryStat {
     bytes: u64,
 }
 
-/// `GET /api/stats/storage` のレスポンス。サイズはいずれも blob の
-/// **オンディスク実バイト数（zstd 圧縮後・重複排除済み）** で、実際の
-/// ディスク使用量を表す。一覧の `FileMeta.size`（提示サイズ）とは別物。
+/// `GET /api/stats/storage` のレスポンス。サイズはいずれも **論理サイズ
+/// （提示サイズ）** で、ファイル一覧やダウンロードで見えるサイズと一致する。
+/// blob のオンディスク実体は zstd 圧縮されており論理サイズと大きく異なる
+/// （特にテキスト）ため、ユーザーの体感に合う論理サイズで集計する。
 #[derive(Serialize)]
 struct StorageStats {
-    /// 現行ファイルのカテゴリ別内訳。
+    /// 最新版のカテゴリ別内訳。
     categories: Vec<CategoryStat>,
-    /// 現行ファイル（最新コミット）の合計。
+    /// 最新版を表示するための容量（各ファイルの最新版サイズの合計）。
     current_bytes: u64,
-    /// 過去バージョン（最新以外のコミット）が占める容量 = 差分。
+    /// それ以前のバージョンを維持するための容量（最新以外の各コミットサイズの合計）。
     history_bytes: u64,
     /// 可視ファイル数。
     file_count: u64,
@@ -440,16 +441,15 @@ fn storage_category(f: &FileMeta) -> &'static str {
     }
 }
 
-/// アップロード済みファイルの合計サイズと内訳、及び過去バージョン（差分）が
-/// 占める容量を集計する。VIEW 権限のあるファイルのみを対象とする。
+/// アップロード済みファイルの最新版の合計・カテゴリ別内訳と、それ以前の
+/// バージョンを維持するための容量を集計する。VIEW 権限のあるファイルのみが対象。
 ///
-/// blob は CAS（同一内容は 1 つ）なので、重複排除のため blob_id 単位で集計する。
+/// サイズはすべて論理サイズ（提示サイズ）。最新版はファイル行の `size` を使い、
+/// 過去バージョンは各コミットの `size` を合算する（一覧の表示サイズと一致）。
 async fn storage_stats(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
 ) -> Result<Json<StorageStats>, ApiError> {
-    use std::collections::{HashMap, HashSet};
-
     // 可視ファイルを全件走査する（ページング）。
     const PAGE: u32 = 500;
     const MAX_SCAN: u32 = 200_000; // 暴走防止の安全上限。
@@ -469,42 +469,24 @@ async fn storage_stats(
         }
     }
 
-    // 全コミットの blob を収集。現行 blob にはカテゴリを紐付ける。
-    let mut all_blobs: HashSet<BlobId> = HashSet::new();
-    let mut current_blobs: HashMap<BlobId, &'static str> = HashMap::new();
+    // 最新版: ファイル行の論理サイズをカテゴリ別に集計（一覧の表示サイズと一致）。
+    let mut cat_map: std::collections::BTreeMap<&'static str, u64> = Default::default();
+    let mut current_bytes = 0u64;
+    for f in &visible {
+        *cat_map.entry(storage_category(f)).or_insert(0) += f.size;
+        current_bytes += f.size;
+    }
+
+    // 過去バージョン維持容量: 各ファイルの「最新以外」のコミットの論理サイズ合算。
+    let mut history_bytes = 0u64;
     let mut commit_count = 0u64;
     for f in &visible {
         let commits = s.meta.list_commits(&f.id).await.map_err(ApiError::from_db)?;
         commit_count += commits.len() as u64;
-        let cat = storage_category(f);
         for c in &commits {
-            all_blobs.insert(c.blob.clone());
-            if Some(c.id) == f.current_commit {
-                current_blobs.entry(c.blob.clone()).or_insert(cat);
+            if Some(c.id) != f.current_commit {
+                history_bytes += c.size;
             }
-        }
-    }
-
-    // 各 distinct blob のオンディスク実サイズを取得（取得不可は 0 扱い）。
-    let mut blob_sizes: HashMap<BlobId, u64> = HashMap::with_capacity(all_blobs.len());
-    for b in &all_blobs {
-        let sz = s.engine.blob.size(b).await.unwrap_or(0);
-        blob_sizes.insert(b.clone(), sz);
-    }
-
-    // 現行ファイルをカテゴリ別に集計。
-    let mut cat_map: std::collections::BTreeMap<&'static str, u64> = Default::default();
-    let mut current_bytes = 0u64;
-    for (b, cat) in &current_blobs {
-        let sz = blob_sizes.get(b).copied().unwrap_or(0);
-        *cat_map.entry(cat).or_insert(0) += sz;
-        current_bytes += sz;
-    }
-    // 差分（過去バージョン）= 現行 blob 以外の全 blob。
-    let mut history_bytes = 0u64;
-    for (b, sz) in &blob_sizes {
-        if !current_blobs.contains_key(b) {
-            history_bytes += sz;
         }
     }
 

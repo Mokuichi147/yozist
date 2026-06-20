@@ -190,6 +190,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let format_id: String = row.try_get("format_id")?;
     let timestamp: String = row.try_get("timestamp")?;
     let message: Option<String> = row.try_get("message")?;
+    let size: i64 = row.try_get("size")?;
     let committed_by: Option<String> = row.try_get("committed_by")?;
     let committed_by_user_id: Option<i64> = row.try_get("committed_by_user_id")?;
     Ok(Commit {
@@ -203,6 +204,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
         format_id,
         timestamp: parse_dt(&timestamp)?,
         message,
+        size: size.max(0) as u64,
         committed_by,
         committed_by_user_id,
     })
@@ -780,8 +782,8 @@ impl MetaStore for SqliteMetaStore {
         sqlx::query(
             r#"INSERT INTO commits
                (id, file_id, parent, actor, blob, format_id, timestamp, message,
-                committed_by, committed_by_user_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                size, committed_by, committed_by_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(commit.id.to_string())
         .bind(commit.file_id.to_string())
@@ -791,6 +793,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(&commit.format_id)
         .bind(fmt_dt(commit.timestamp))
         .bind(&commit.message)
+        .bind(commit.size as i64)
         .bind(&commit.committed_by)
         .bind(commit.committed_by_user_id)
         .execute(&self.pool)
@@ -1062,6 +1065,7 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc(),
             message: Some("init".into()),
+            size: 0,
             committed_by: None,
             committed_by_user_id: None,
         };
@@ -1385,6 +1389,7 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc(),
             message: Some("init".into()),
+            size: 100,
             committed_by: None,
             committed_by_user_id: None,
         };
@@ -1397,6 +1402,7 @@ mod tests {
             format_id: "text/plain".into(),
             timestamp: OffsetDateTime::now_utc() + time::Duration::seconds(1),
             message: Some("edit".into()),
+            size: 250,
             committed_by: Some("alice".into()),
             committed_by_user_id: Some(42),
         };
@@ -1406,6 +1412,9 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].id, c1.id);
         assert_eq!(log[1].id, c2.id);
+        // size が往復で保持される
+        assert_eq!(log[0].size, 100);
+        assert_eq!(log[1].size, 250);
         // committed_by / committed_by_user_id が往復で保持される（NULL/値の両方）
         assert_eq!(log[0].committed_by, None);
         assert_eq!(log[0].committed_by_user_id, None);

@@ -38,14 +38,6 @@ pub trait BlobStore: Send + Sync {
     /// blob の存在確認。
     async fn exists(&self, id: &BlobId) -> Result<bool, StorageError>;
 
-    /// blob の保存サイズ（オンディスク実バイト数）を返す。
-    ///
-    /// 既定実装は `get` して展開後の長さを返すフォールバック。実体ストアは
-    /// メタデータから安価に取得できるよう（圧縮後サイズを返すよう）オーバーライドする。
-    async fn size(&self, id: &BlobId) -> Result<u64, StorageError> {
-        Ok(self.get(id).await?.len() as u64)
-    }
-
     /// ストリームを逐次保存し、`(コンテンツアドレス, 生バイト長)` を返す。
     ///
     /// デフォルト実装はストリームをメモリに集約してから `put` を呼ぶ
