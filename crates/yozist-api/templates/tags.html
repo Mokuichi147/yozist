@@ -18,14 +18,14 @@
         複数のタグを選択すると 1 つに合流できます。
       </p>
 
-      <!-- 並べ替えコントロール -->
-      <div class="flex flex-wrap items-center gap-2 mb-2">
+      <!-- 並べ替えコントロール（モバイルでも 1 行に収める） -->
+      <div class="flex items-center gap-2 mb-2">
         <span class="text-xs opacity-60 shrink-0 whitespace-nowrap">並べ替え</span>
-        <select id="sort-key" class="select select-bordered select-xs" onchange="onSortKeyChange()">
+        <select id="sort-key" class="select select-bordered select-xs shrink-0" onchange="onSortKeyChange()">
           <option value="name">名前</option>
           <option value="count">件数</option>
         </select>
-        <select id="sort-dir" class="select select-bordered select-xs" onchange="applySort()">
+        <select id="sort-dir" class="select select-bordered select-xs shrink-0" onchange="applySort()">
           <option value="asc">昇順</option>
           <option value="desc">降順</option>
         </select>
