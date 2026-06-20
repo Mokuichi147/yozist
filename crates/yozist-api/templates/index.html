@@ -1,8 +1,35 @@
 {% extends "base.html" %}
 {% block title %}yozist{% endblock %}
 
+{% block style %}
+  /* 内訳ドーナツグラフ: conic-gradient を radial マスクで中抜きにする */
+  #storage-donut {
+    -webkit-mask: radial-gradient(transparent 54%, #000 55%);
+    mask: radial-gradient(transparent 54%, #000 55%);
+  }
+{% endblock %}
+
 {% block content %}
-<div id="main" class="hidden max-w-2xl mx-auto p-4">
+<div id="main" class="hidden max-w-2xl mx-auto p-4 space-y-4">
+
+      <!-- ストレージ使用量（合計 + 内訳）カード -->
+      <div class="card bg-base-100 shadow-sm">
+        <div class="card-body p-4 sm:p-6">
+          <h2 class="card-title text-base mb-4">ストレージ使用量</h2>
+          <div id="storage-loading" class="text-sm opacity-60">読み込み中…</div>
+          <div id="storage-empty" class="hidden text-sm opacity-60">アップロードされたファイルはまだありません。</div>
+          <div id="storage-content" class="hidden flex flex-col sm:flex-row items-center gap-6">
+            <div class="relative shrink-0" style="width:10rem;height:10rem;">
+              <div id="storage-donut" class="w-40 h-40 rounded-full"></div>
+              <div class="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none">
+                <span id="storage-total" class="text-lg font-bold leading-tight"></span>
+                <span id="storage-count" class="text-xs opacity-60"></span>
+              </div>
+            </div>
+            <ul id="storage-legend" class="flex-1 w-full space-y-1.5 text-sm"></ul>
+          </div>
+        </div>
+      </div>
 
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4 sm:p-6">
@@ -49,6 +76,105 @@ async function init() {
   const me = await requireAuth();
   if (!me) return;
   $('main').classList.remove('hidden');
+  loadStorage();
+}
+
+// ===== ストレージ使用量（合計 + 内訳グラフ）=====
+
+// 表示カテゴリの順序と色（ライト/ダーク両テーマで視認できる固定色）。
+const STORAGE_CATS = [
+  ['画像',          '#3b82f6'],
+  ['動画',          '#8b5cf6'],
+  ['音声',          '#ec4899'],
+  ['ドキュメント',  '#ef4444'],
+  ['テキスト/コード', '#10b981'],
+  ['アーカイブ',    '#f59e0b'],
+  ['その他',        '#6b7280'],
+];
+const STORAGE_COLORS = Object.fromEntries(STORAGE_CATS);
+
+// ファイルを内訳カテゴリに分類する（files ページのアイコン判定と整合）。
+function storageCategory(f) {
+  const m = (f.mime || '').toLowerCase();
+  const n = (f.display_name || f.name || '').toLowerCase();
+  if (m.startsWith('image/')) return '画像';
+  if (m.startsWith('video/')) return '動画';
+  if (m.startsWith('audio/')) return '音声';
+  if (m.includes('pdf') || /\.(csv|tsv|xlsx?|docx?|pptx?)$/.test(n)) return 'ドキュメント';
+  if (m.includes('zip') || m.includes('compressed') || /\.(zip|gz|7z|rar|tar|xz|zst)$/.test(n)) return 'アーカイブ';
+  if (m.startsWith('text/') ||
+      /\.(md|markdown|txt|js|ts|jsx|tsx|py|rs|go|java|kt|c|cpp|h|hpp|sh|rb|php|html|css|json|yaml|yml|toml|sql|xml)$/.test(n))
+    return 'テキスト/コード';
+  return 'その他';
+}
+
+// 権限フィルタ済みの全ファイルをページングで取得する（x-has-more/x-next-offset を辿る）。
+async function fetchAllFiles() {
+  const all = [];
+  let offset = 0;
+  for (let i = 0; i < 50; i++) { // 最大 50 ページ (50,000 件) で打ち切り
+    const resp = await api(`/api/files?limit=1000&offset=${offset}`);
+    if (!resp.ok) break;
+    all.push(...await resp.json());
+    if (resp.headers.get('x-has-more') !== '1') break;
+    const next = resp.headers.get('x-next-offset');
+    if (!next) break;
+    offset = parseInt(next, 10);
+  }
+  return all;
+}
+
+async function loadStorage() {
+  let files;
+  try {
+    files = await fetchAllFiles();
+  } catch (_) {
+    $('storage-loading').textContent = '使用量を取得できませんでした';
+    return;
+  }
+  $('storage-loading').classList.add('hidden');
+
+  const totalBytes = files.reduce((a, f) => a + (f.size || 0), 0);
+  if (files.length === 0 || totalBytes === 0) {
+    $('storage-empty').classList.remove('hidden');
+    return;
+  }
+
+  // カテゴリ別に合計サイズを集計。
+  const agg = {};
+  for (const f of files) {
+    const c = storageCategory(f);
+    agg[c] = (agg[c] || 0) + (f.size || 0);
+  }
+
+  // conic-gradient のストップ列とレジェンドを表示順に組み立てる。
+  const stops = [];
+  const legend = $('storage-legend');
+  legend.innerHTML = '';
+  let acc = 0;
+  for (const [cat, color] of STORAGE_CATS) {
+    const v = agg[cat] || 0;
+    if (v <= 0) continue;
+    const start = acc / totalBytes * 100;
+    acc += v;
+    const end = acc / totalBytes * 100;
+    stops.push(`${color} ${start}% ${end}%`);
+
+    const pct = v / totalBytes * 100;
+    const li = document.createElement('li');
+    li.className = 'flex items-center gap-2';
+    li.innerHTML =
+      `<span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:${color}"></span>` +
+      `<span class="flex-1 min-w-0 truncate">${escapeHtml(cat)}</span>` +
+      `<span class="opacity-70 tabular-nums shrink-0">${fmtSize(v)}</span>` +
+      `<span class="opacity-50 tabular-nums shrink-0 w-12 text-right">${pct.toFixed(1)}%</span>`;
+    legend.appendChild(li);
+  }
+
+  $('storage-donut').style.background = `conic-gradient(${stops.join(',')})`;
+  $('storage-total').textContent = fmtSize(totalBytes);
+  $('storage-count').textContent = `${files.length} 件`;
+  $('storage-content').classList.remove('hidden');
 }
 
 // ===== アップロード（ドラッグ&ドロップ / 複数ファイル / フォルダ）=====
@@ -139,8 +265,11 @@ function renderFileList() {
 
 function fmtSize(n) {
   if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / 1024 / 1024).toFixed(1) + ' MB';
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(1) + ' ' + units[i];
 }
 
 // ---- DataTransfer からフォルダ込みで File を再帰収集 ----
