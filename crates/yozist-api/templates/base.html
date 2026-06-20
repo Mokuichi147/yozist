@@ -15,8 +15,11 @@
 <link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
 <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
 <style>
-  /* CDN ロード完了前のフラッシュ防止 */
-  .hidden { display: none !important; }
+  /* CDN ロード完了前のフラッシュ防止。
+     `@layer base` に入れることで、Tailwind 読込後はユーティリティ層
+     (sm:flex などのレスポンシブ表示) が正しく上書きできるようにする。
+     `display:none !important` だと sm:flex を潰し、PC でナビが消える。 */
+  @layer base { .hidden { display: none; } }
   /* row-compact: Tailwind 拡張に頼らず純 CSS で */
   .row-compact { padding: 0.25rem 0.5rem; border-radius: 0.375rem; font-size: 0.875rem; }
   .row-compact:hover { background: rgba(127,127,127,0.12); }
