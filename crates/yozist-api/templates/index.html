@@ -143,15 +143,18 @@ async function loadStorage() {
   }
 
   // ドーナツ + レジェンド: 最新版のファイル種別内訳（分母は最新版合計）。
+  // 凡例・ドーナツともサイズの降順で並べる。
   const bytes = {};
   for (const c of stats.categories || []) bytes[c.category] = c.bytes;
+  const segments = STORAGE_SEGMENTS
+    .map(([seg, color]) => ({ seg, color, v: bytes[seg] || 0 }))
+    .filter(s => s.v > 0)
+    .sort((a, b) => b.v - a.v);
   const stops = [];
   const legend = $('storage-legend');
   legend.innerHTML = '';
   let acc = 0;
-  for (const [seg, color] of STORAGE_SEGMENTS) {
-    const v = bytes[seg] || 0;
-    if (v <= 0) continue;
+  for (const { seg, color, v } of segments) {
     const start = currentBytes ? acc / currentBytes * 100 : 0;
     acc += v;
     const end = currentBytes ? acc / currentBytes * 100 : 0;
