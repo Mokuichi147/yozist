@@ -9,14 +9,13 @@
       <div class="flex items-center justify-between mb-1">
         <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">tags</h2>
         <div class="flex items-center gap-2">
-          <button class="btn btn-xs btn-ghost" onclick="loadTags()">refresh</button>
+          <button class="btn btn-xs btn-ghost" onclick="loadTags()">更新</button>
           <button class="btn btn-xs btn-primary" onclick="createTag()">+ 新規</button>
         </div>
       </div>
       <p class="text-xs opacity-60 mb-2">
         手動タグと <span class="opacity-80">🤖 AI タグ</span>の名前変更・追加・削除ができます。
         複数のタグを選択すると 1 つに合流できます。
-        <span class="opacity-80">システムタグ（拡張子・種別など自動付与）はここには表示されません。</span>
       </p>
 
       <!-- 合流アクションバーは画面下部に固定表示（リストを押し下げないため、ここには置かない） -->
