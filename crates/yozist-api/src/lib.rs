@@ -36,7 +36,7 @@ use yozist_auth::{
 
 pub mod ui;
 use yozist_core::{
-    ActorId, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId, Series, SeriesId,
+    ActorId, BlobId, CommitId, FileId, FileMeta, FilterDef, Filter, FilterId, Series, SeriesId,
     SeriesMember, SeriesSort, Tag, TagId, TagKind, UserId,
 };
 use yozist_db::{AuditRecord, SharedAuditLog, SharedMetaStore};
@@ -97,6 +97,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/", get(redirect_to_ui))
         .route("/health", get(health))
         .route("/api/files", get(list_files).post(create_file))
+        .route("/api/stats/storage", get(storage_stats))
         // 注意: 静的セグメント "tags" は `:id` より優先マッチする（matchit の仕様）。
         .route("/api/files/tags", get(list_tags_batch))
         // ゴミ箱（論理削除済みファイルの一覧 / 空にする）。
@@ -376,6 +377,149 @@ async fn list_files(
         }
     }
     Ok(resp)
+}
+
+// ---------------------------------------------------------------------------
+// ストレージ統計（トップページのダッシュボードカード用）
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct CategoryStat {
+    category: &'static str,
+    bytes: u64,
+}
+
+/// `GET /api/stats/storage` のレスポンス。サイズはいずれも blob の
+/// **オンディスク実バイト数（zstd 圧縮後・重複排除済み）** で、実際の
+/// ディスク使用量を表す。一覧の `FileMeta.size`（提示サイズ）とは別物。
+#[derive(Serialize)]
+struct StorageStats {
+    /// 現行ファイルのカテゴリ別内訳。
+    categories: Vec<CategoryStat>,
+    /// 現行ファイル（最新コミット）の合計。
+    current_bytes: u64,
+    /// 過去バージョン（最新以外のコミット）が占める容量 = 差分。
+    history_bytes: u64,
+    /// 可視ファイル数。
+    file_count: u64,
+    /// 可視ファイルのコミット総数。
+    commit_count: u64,
+}
+
+/// ファイルを内訳カテゴリに分類する（WebUI の `storageCategory` / files ページの
+/// アイコン判定と整合させる）。返す文字列がそのままレジェンドのキーになる。
+fn storage_category(f: &FileMeta) -> &'static str {
+    let m = f.mime.as_deref().unwrap_or("").to_ascii_lowercase();
+    let n = f.display_name.to_ascii_lowercase();
+    let ends = |exts: &[&str]| exts.iter().any(|e| n.ends_with(e));
+    if m.starts_with("image/") {
+        "画像"
+    } else if m.starts_with("video/") {
+        "動画"
+    } else if m.starts_with("audio/") {
+        "音声"
+    } else if m.contains("pdf")
+        || ends(&[".csv", ".tsv", ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt"])
+    {
+        "ドキュメント"
+    } else if m.contains("zip")
+        || m.contains("compressed")
+        || ends(&[".zip", ".gz", ".7z", ".rar", ".tar", ".xz", ".zst"])
+    {
+        "アーカイブ"
+    } else if m.starts_with("text/")
+        || ends(&[
+            ".md", ".markdown", ".txt", ".js", ".ts", ".jsx", ".tsx", ".py", ".rs", ".go", ".java",
+            ".kt", ".c", ".cpp", ".h", ".hpp", ".sh", ".rb", ".php", ".html", ".css", ".json",
+            ".yaml", ".yml", ".toml", ".sql", ".xml",
+        ])
+    {
+        "テキスト/コード"
+    } else {
+        "その他"
+    }
+}
+
+/// アップロード済みファイルの合計サイズと内訳、及び過去バージョン（差分）が
+/// 占める容量を集計する。VIEW 権限のあるファイルのみを対象とする。
+///
+/// blob は CAS（同一内容は 1 つ）なので、重複排除のため blob_id 単位で集計する。
+async fn storage_stats(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<StorageStats>, ApiError> {
+    use std::collections::{HashMap, HashSet};
+
+    // 可視ファイルを全件走査する（ページング）。
+    const PAGE: u32 = 500;
+    const MAX_SCAN: u32 = 200_000; // 暴走防止の安全上限。
+    let mut visible: Vec<FileMeta> = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let files = s
+            .meta
+            .list_files_sorted(PAGE, offset, yozist_db::FileSort::UpdatedAt, false)
+            .await
+            .map_err(ApiError::from_db)?;
+        let fetched = files.len() as u32;
+        visible.extend(filter_visible_files(&*s.authz, &ctx, files).await?);
+        offset += fetched;
+        if fetched < PAGE || offset >= MAX_SCAN {
+            break;
+        }
+    }
+
+    // 全コミットの blob を収集。現行 blob にはカテゴリを紐付ける。
+    let mut all_blobs: HashSet<BlobId> = HashSet::new();
+    let mut current_blobs: HashMap<BlobId, &'static str> = HashMap::new();
+    let mut commit_count = 0u64;
+    for f in &visible {
+        let commits = s.meta.list_commits(&f.id).await.map_err(ApiError::from_db)?;
+        commit_count += commits.len() as u64;
+        let cat = storage_category(f);
+        for c in &commits {
+            all_blobs.insert(c.blob.clone());
+            if Some(c.id) == f.current_commit {
+                current_blobs.entry(c.blob.clone()).or_insert(cat);
+            }
+        }
+    }
+
+    // 各 distinct blob のオンディスク実サイズを取得（取得不可は 0 扱い）。
+    let mut blob_sizes: HashMap<BlobId, u64> = HashMap::with_capacity(all_blobs.len());
+    for b in &all_blobs {
+        let sz = s.engine.blob.size(b).await.unwrap_or(0);
+        blob_sizes.insert(b.clone(), sz);
+    }
+
+    // 現行ファイルをカテゴリ別に集計。
+    let mut cat_map: std::collections::BTreeMap<&'static str, u64> = Default::default();
+    let mut current_bytes = 0u64;
+    for (b, cat) in &current_blobs {
+        let sz = blob_sizes.get(b).copied().unwrap_or(0);
+        *cat_map.entry(cat).or_insert(0) += sz;
+        current_bytes += sz;
+    }
+    // 差分（過去バージョン）= 現行 blob 以外の全 blob。
+    let mut history_bytes = 0u64;
+    for (b, sz) in &blob_sizes {
+        if !current_blobs.contains_key(b) {
+            history_bytes += sz;
+        }
+    }
+
+    let categories = cat_map
+        .into_iter()
+        .map(|(category, bytes)| CategoryStat { category, bytes })
+        .collect();
+
+    Ok(Json(StorageStats {
+        categories,
+        current_bytes,
+        history_bytes,
+        file_count: visible.len() as u64,
+        commit_count,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -3464,6 +3608,45 @@ mod tests {
         // 継続バイトの途中(7,10)でも境界(6,9)へ補正され破損しない。
         let spliced = splice_range("X".as_bytes(), current, 7, 10);
         assert_eq!(String::from_utf8(spliced).unwrap(), "あいXえお");
+    }
+
+    #[test]
+    fn storage_category_classifies_by_mime_and_extension() {
+        let mk = |mime: Option<&str>, name: &str| FileMeta {
+            id: FileId::new(),
+            display_name: name.to_string(),
+            size: 0,
+            mime: mime.map(|s| s.to_string()),
+            charset: None,
+            current_commit: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            deleted: false,
+            deleted_at: None,
+            created_by: None,
+            updated_by: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+        };
+        // MIME 優先。
+        assert_eq!(storage_category(&mk(Some("image/png"), "a.bin")), "画像");
+        assert_eq!(storage_category(&mk(Some("video/mp4"), "a")), "動画");
+        assert_eq!(storage_category(&mk(Some("audio/mpeg"), "a")), "音声");
+        assert_eq!(storage_category(&mk(Some("application/pdf"), "a")), "ドキュメント");
+        // 拡張子フォールバック（MIME 不明 / octet-stream）。
+        assert_eq!(storage_category(&mk(None, "data.csv")), "ドキュメント");
+        assert_eq!(
+            storage_category(&mk(Some("application/octet-stream"), "x.zip")),
+            "アーカイブ"
+        );
+        assert_eq!(storage_category(&mk(None, "main.rs")), "テキスト/コード");
+        assert_eq!(storage_category(&mk(Some("text/plain"), "notes")), "テキスト/コード");
+        // 大文字拡張子も分類できる（拡張子判定のカテゴリ）。
+        assert_eq!(storage_category(&mk(None, "DATA.CSV")), "ドキュメント");
+        // 画像/動画/音声は MIME 判定のみ（拡張子では判定しない）。
+        assert_eq!(storage_category(&mk(None, "photo.png")), "その他");
+        // 未知は「その他」。
+        assert_eq!(storage_category(&mk(None, "mystery")), "その他");
     }
 
     async fn make_state() -> (ApiState, tempfile::TempDir) {

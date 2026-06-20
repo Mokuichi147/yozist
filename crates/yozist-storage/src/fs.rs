@@ -110,6 +110,18 @@ impl BlobStore for FsBlobStore {
         Ok(fs::try_exists(self.blob_path(id)).await.unwrap_or(false))
     }
 
+    /// オンディスクの実バイト数（zstd 圧縮後）をメタデータから取得する。
+    /// 展開を伴わないため、多数の blob を集計するストレージ統計で安価に使える。
+    async fn size(&self, id: &BlobId) -> Result<u64, StorageError> {
+        match fs::metadata(self.blob_path(id)).await {
+            Ok(m) => Ok(m.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(StorageError::NotFound(id.clone()))
+            }
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+
     /// ストリームを逐次 zstd 圧縮しながら一時ファイルへ書き込み、生バイトの
     /// sha256 を逐次計算する。完了後にコンテンツアドレスへ rename する。
     /// オンディスク形式は `put` と同じ単一 zstd フレームなので `get` は無変更。
@@ -203,6 +215,22 @@ mod tests {
         let got = store.get(&id).await.unwrap();
         assert_eq!(&got[..], b"hello yozist");
         assert!(store.exists(&id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn size_reports_ondisk_bytes_and_notfound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).await.unwrap();
+        let id = store.put(b"hello yozist").await.unwrap();
+        // 圧縮後の実ファイルサイズ（メタデータ由来）と一致する。
+        let on_disk = std::fs::metadata(store.blob_path(&id)).unwrap().len();
+        assert_eq!(store.size(&id).await.unwrap(), on_disk);
+        // 未知の blob は NotFound。
+        let missing = BlobId::from_hex("deadbeef");
+        assert!(matches!(
+            store.size(&missing).await,
+            Err(StorageError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
