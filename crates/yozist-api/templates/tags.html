@@ -21,7 +21,7 @@
       <!-- 並べ替えコントロール -->
       <div class="flex flex-wrap items-center gap-2 mb-2">
         <span class="text-xs opacity-60 shrink-0 whitespace-nowrap">並べ替え</span>
-        <select id="sort-key" class="select select-bordered select-xs" onchange="applySort()">
+        <select id="sort-key" class="select select-bordered select-xs" onchange="onSortKeyChange()">
           <option value="name">名前</option>
           <option value="count">件数</option>
         </select>
@@ -116,6 +116,13 @@ function sortTags() {
     if (d === 0 && key !== 'name') d = a.name.localeCompare(b.name, 'ja');
     return d * sign;
   });
+}
+
+// 基準変更時は方向を既定値（名前→昇順 / 件数→降順）に合わせてから並べ替える。
+// 方向はその後ユーザーが手動で上書きできる。
+function onSortKeyChange() {
+  $('sort-dir').value = $('sort-key').value === 'count' ? 'desc' : 'asc';
+  applySort();
 }
 
 // 並べ替えコントロール変更時。再取得せず手元の一覧だけ並べ替える。
