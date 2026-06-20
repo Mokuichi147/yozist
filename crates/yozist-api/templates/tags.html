@@ -18,6 +18,19 @@
         複数のタグを選択すると 1 つに合流できます。
       </p>
 
+      <!-- 並べ替えコントロール -->
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-xs opacity-60">並べ替え</span>
+        <select id="sort-key" class="select select-bordered select-xs" onchange="applySort()">
+          <option value="name">名前</option>
+          <option value="count">件数</option>
+        </select>
+        <select id="sort-dir" class="select select-bordered select-xs" onchange="applySort()">
+          <option value="asc">昇順</option>
+          <option value="desc">降順</option>
+        </select>
+      </div>
+
       <!-- 合流アクションバーは画面下部に固定表示（リストを押し下げないため、ここには置かない） -->
 
       <div id="tag-list" class="space-y-1">…</div>
@@ -85,10 +98,30 @@ async function loadTags() {
     // 存在しなくなったタグを選択から除去
     const ids = new Set(tags.map(t => t.id));
     for (const id of [...selected]) if (!ids.has(id)) selected.delete(id);
+    sortTags();
     render();
   } catch (e) {
     el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>';
   }
+}
+
+// 選択中の基準・方向で tags を並べ替える。件数が同じ場合は名前で安定させる。
+function sortTags() {
+  const key = $('sort-key').value;
+  const sign = $('sort-dir').value === 'desc' ? -1 : 1;
+  tags.sort((a, b) => {
+    let d;
+    if (key === 'count') d = a.count - b.count;
+    else d = a.name.localeCompare(b.name, 'ja');
+    if (d === 0 && key !== 'name') d = a.name.localeCompare(b.name, 'ja');
+    return d * sign;
+  });
+}
+
+// 並べ替えコントロール変更時。再取得せず手元の一覧だけ並べ替える。
+function applySort() {
+  sortTags();
+  render();
 }
 
 function render() {
