@@ -225,34 +225,9 @@ async function imageInfo(key, bytes, mime) {
 }
 
 // ===========================================================================
-// ビュー・ランタイム（レジストリ）
-//   - registerConverter: 生バイト → ViewModel（フロント変換。core 種別は恒等）
-//   - registerView: ViewModel の差分描画（kind ごと）
-//   - resolveModel: 先勝ちの変換で ViewModel を得る（無ければ core/binary へ）
-// 重い形式はフロント変換を持たず、将来 GET …/commits/:cid/view（X-View-Kind）で
-// バックエンド変換へ委譲する。その差し替え口がこのランタイム。
+// ビュー・ランタイムは base.html の共有 ViewRuntime を使う（このページは差分=diff）。
+// 比較ページはここで「変換プラグイン」と「差分対応ビュープラグイン」を登録する。
 // ===========================================================================
-const ViewRuntime = (() => {
-  const views = new Map();   // kind → ViewPlugin
-  const converters = [];     // フロント変換（順に detect、先勝ち）
-  function registerView(p) { views.set(p.kind, p); }
-  function registerConverter(c) { converters.push(c); }
-  function hasView(kind) { return views.has(kind); }
-  function getView(kind) { return views.get(kind) || views.get('core/binary'); }
-  async function resolveModel(bytes, hint) {
-    for (const c of converters) {
-      if (c.detect(bytes, hint)) {
-        const m = await c.convert(bytes, hint);
-        m.id = hint.id;
-        return m;
-      }
-    }
-    // 普遍的フォールバック: どんな形式も必ず core/binary に着地する。
-    return { kind: 'core/binary', payload: bytes,
-             contentType: 'application/octet-stream', meta: {}, id: hint.id };
-  }
-  return { registerView, registerConverter, hasView, getView, resolveModel, views };
-})();
 
 // ---- フロント変換（core 種別はすべて恒等変換）----------------------------
 // 画像はマジックナンバーで厳密に判定できるため先に試し、次にテキスト。

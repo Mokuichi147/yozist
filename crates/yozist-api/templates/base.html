@@ -317,6 +317,38 @@ async function uiCopyUrl(url, title) {
     }
   }
 }
+
+// ===========================================================================
+// ビュー／変換プラグイン基盤の共有ランタイム（docs/plugin-view-system.md）。
+//   生バイト ──(変換プラグイン)──▶ ViewModel ──(ビュープラグイン)──▶ 表示/差分
+// ビュー（表示=mount / 差分=diff）と変換（形式→ViewModel）の登録・解決だけを担う
+// 純粋なレジストリ。DOM には触れない。各ページが必要なプラグインを登録して使う
+// （比較ページは diff、ファイル詳細は mount）。プラグイン未使用のページでは何も
+// しない（不活性）。新形式は変換＋ビューの登録だけで増やせる。
+const ViewRuntime = (() => {
+  const views = new Map();   // kind → ViewPlugin
+  const converters = [];     // フロント変換（順に detect、先勝ち）
+  function registerView(p) { views.set(p.kind, p); }
+  function registerConverter(c) { converters.push(c); }
+  function hasView(kind) { return views.has(kind); }
+  function getView(kind) { return views.get(kind) || views.get('core/binary'); }
+  // 生バイト → ViewModel。フロント変換を先勝ちで適用し、無ければ core/binary へ。
+  // 重い形式は将来 GET …/commits/:cid/view（X-View-Kind）でバックエンド変換へ
+  // 委譲する。その差し替え口がここ。
+  async function resolveModel(bytes, hint) {
+    hint = hint || {};
+    for (const c of converters) {
+      if (c.detect(bytes, hint)) {
+        const m = await c.convert(bytes, hint);
+        m.id = hint.id;
+        return m;
+      }
+    }
+    return { kind: 'core/binary', payload: bytes,
+             contentType: (hint.mime || 'application/octet-stream'), meta: {}, id: hint.id };
+  }
+  return { registerView, registerConverter, hasView, getView, resolveModel, views };
+})();
 </script>
 {% block script %}{% endblock %}
 </body>
