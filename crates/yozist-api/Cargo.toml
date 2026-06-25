@@ -10,6 +10,7 @@ yozist-core.workspace = true
 yozist-db.workspace = true
 yozist-storage.workspace = true
 yozist-versioning.workspace = true
+yozist-view.workspace = true
 yozist-auth.workspace = true
 yozist-ai.workspace = true
 yozist-tagging.workspace = true

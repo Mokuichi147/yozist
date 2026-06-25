@@ -157,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
                 share_admin,
                 smb_creds,
                 content_cache: std::sync::Arc::new(yozist_api::ContentCache::default()),
+                view_registry: std::sync::Arc::new(yozist_view::ViewRegistry::with_defaults()),
             };
             let app = yozist_api::router(state);
 

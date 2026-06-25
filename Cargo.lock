@@ -3782,6 +3782,7 @@ dependencies = [
  "yozist-storage",
  "yozist-tagging",
  "yozist-versioning",
+ "yozist-view",
 ]
 
 [[package]]
@@ -3858,6 +3859,7 @@ dependencies = [
  "yozist-storage",
  "yozist-tagging",
  "yozist-versioning",
+ "yozist-view",
 ]
 
 [[package]]
@@ -3934,6 +3936,18 @@ dependencies = [
  "yozist-storage",
  "yozist-tagging",
  "yrs",
+]
+
+[[package]]
+name = "yozist-view"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "yozist-core",
 ]
 
 [[package]]

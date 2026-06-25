@@ -295,7 +295,24 @@ if (o.kind === n.kind && views.get(o.kind)?.diff) {
 4. **新形式の実証**: 任意の 1 形式を「変換＋ビュー」追加だけで載せ、基盤の拡張性を検証。
 5. **将来拡張**（§9）は別フェーズ。
 
-## 11. まとめ
+## 11. 実装状況（本ブランチ）
+
+| 項目 | 状態 |
+|------|------|
+| `yozist-view` クレート（`ViewKind`/`ViewModel`/`ViewConverter`/`ViewRegistry`＋Text/Image/Binary 変換、検出ヘルパ、ユニットテスト） | ✅ 実装・テスト済 |
+| REST `GET …/commits/:cid/view`（`X-View-Kind` 付き）／`…/view-kind`（軽量プローブ） | ✅ 実装（`ApiState.view_registry` 経由でプラガブル） |
+| フロント view-runtime（`registerView`/`registerConverter`/`resolveModel`／汎用モードツールバー） | ✅ `compare.html` に実装 |
+| 第一者ビュープラグイン `core/text`・`core/image`・`core/binary`（既存の行差分・画像4モード・メタ比較を移植） | ✅ 挙動を保って移植 |
+| 比較ページのオーケストレーション（2 コミット解決 → 同種は専用差分／異種はメタ比較） | ✅ ハードコード分岐を撤去 |
+| 単一表示（`file_detail.html`）の runtime 統合（仮想スクロール／巨大ファイル編集を含む） | ⬜ 未着手（リグレッション影響が大きいため別フェーズ） |
+| view-runtime の `base.html` への抽出（全ページ共有化） | ⬜ 未着手（現状は compare に内包） |
+| 重い形式のバックエンド変換の実例（フロントから `/view` へ委譲する経路） | ⬜ 口は用意済み（`resolveModel` の差し替え点）。実形式は未追加 |
+
+> 注: バックエンドの全体ビルド（`yozist-server`）は vendor の `smb-server` が rustc 1.95 を要求する
+> 既存制約のため本環境では通らない。本変更に関係する `yozist-view` / `yozist-api` は
+> ビルド・テストとも green。
+
+## 12. まとめ
 
 - 現状は**プラグイン方式ではない**（フロントのハードコード分岐、行差分前提）。
 - 本設計は既存の `CrdtRegistry`/`CrdtFormat` 規範を踏襲し、**変換層（Rust）×ビュー層（JS）**の
