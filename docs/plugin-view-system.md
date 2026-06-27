@@ -304,7 +304,8 @@ if (o.kind === n.kind && views.get(o.kind)?.diff) {
 | フロント view-runtime（`registerView`/`registerConverter`/`resolveModel`／汎用モードツールバー） | ✅ `compare.html` に実装 |
 | 第一者ビュープラグイン `core/text`・`core/image`・`core/binary`（既存の行差分・画像4モード・メタ比較を移植） | ✅ 挙動を保って移植 |
 | 比較ページのオーケストレーション（2 コミット解決 → 同種は専用差分／異種はメタ比較） | ✅ ハードコード分岐を撤去 |
-| 単一表示（`file_detail.html`）の runtime 統合 | ✅ 描画ディスパッチをビュープラグイン（`mount`）化。画像/動画/音声/PDF を `core/image`・`media/video`・`media/audio`・`doc/pdf` プラグインへ移植。テキストの仮想スクロール／巨大ファイル編集は温存（`core/text` の mount から既存 `renderTextContent` を呼ぶ）。ブラウザ実機で検証済 |
+| 単一表示（`file_detail.html`）の runtime 統合 | ✅ 描画ディスパッチをビュープラグイン（`mount`）化。テキストの仮想スクロール／巨大ファイル編集は温存（`core/text` の mount から既存 `renderTextContent` を呼ぶ）。ブラウザ実機で検証済 |
+| 単一コミット表示（`file_commit.html`）の runtime 統合 | ✅ 旧来のハードコード分岐を撤去し共有 ViewRuntime 駆動へ。`file_detail` と重複していたメディア描画を共有プラグイン `viewer-media.js`（image/video/audio/pdf）に集約し、両ページで `ctx.objectUrlFor` 注入で共用。テキスト/不明は各ページ固有の分割取得ビューアを `core/text` の mount から呼ぶ。ブラウザ実機で検証済 |
 | view-runtime の `base.html` への抽出（全ページ共有化） | ✅ 純粋レジストリ＋共有ヘルパ(`ViewRuntime.host`)を `base.html` へ。compare(diff) と file_detail(mount) が同一ランタイムを共有 |
 | 差分プラグインの**独立ファイル化**（`core/text`/`core/image`/`core/binary`） | ✅ `crates/yozist-api/assets/view-plugins/*.js` に分離。`GET /ui/plugins/:name` で配信（`include_str!` 埋め込み・ホワイトリスト）。各プラグインは IIFE で内部スコープを隔離し、`ViewRuntime.host` 経由でのみ共有ヘルパへ依存（ページ実装に非依存）。ブラウザ実機で検証済 |
 | 拡張性の実証: 新形式＋新ビュー種別の追加 | ✅ `view-plugins/table-csv.js` を**1ファイル追加**するだけで CSV/TSV を `table/csv` ビューとしてセル単位差分表示（行 LCS＋セルハイライト、独自モード「全行/変更のみ」）。コアは「解決ヒントに `name` を渡す」一度きりの汎用配線のみ。差分アルゴリズムがビュー固有（行ではなく表のセル）である実例。ブラウザ実機で検証済 |

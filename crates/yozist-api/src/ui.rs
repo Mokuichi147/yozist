@@ -44,6 +44,7 @@ async fn view_plugin_asset(
         "image-diff.js" => include_str!("../assets/view-plugins/image-diff.js"),
         "binary-meta.js" => include_str!("../assets/view-plugins/binary-meta.js"),
         "table-csv.js" => include_str!("../assets/view-plugins/table-csv.js"),
+        "viewer-media.js" => include_str!("../assets/view-plugins/viewer-media.js"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     (

@@ -169,6 +169,9 @@
 {% endblock %}
 
 {% block script %}
+<!-- 単一表示の共有メディアビュープラグイン（image/video/audio/pdf）。file_commit と共通。
+     base.html の共有 ViewRuntime に自己登録する。 -->
+<script src="/ui/plugins/viewer-media.js"></script>
 <script>
 const fileId = location.pathname.split('/').pop();
 let currentFile = null;
@@ -275,26 +278,8 @@ function viewerKind(mime, name) {
   }
 }
 
-// メディア系: 認証付き object URL を生成して各要素で表示。
-ViewRuntime.registerView({ kind: 'core/image', async mount(cont, ctx) {
-  const url = await ctx.objectUrlFor(ctx.mime);
-  cont.innerHTML = `<img src="${url}" alt="${escapeHtml(ctx.file.display_name)}"
-    class="max-w-full max-h-[70vh] object-contain mx-auto block rounded bg-base-300/30">`;
-}});
-ViewRuntime.registerView({ kind: 'media/video', async mount(cont, ctx) {
-  const url = await ctx.objectUrlFor(ctx.mime);
-  cont.innerHTML = `<video src="${url}" controls
-    class="max-w-full max-h-[70vh] mx-auto block rounded bg-black"></video>`;
-}});
-ViewRuntime.registerView({ kind: 'media/audio', async mount(cont, ctx) {
-  const url = await ctx.objectUrlFor(ctx.mime);
-  cont.innerHTML = `<audio src="${url}" controls class="w-full mt-2"></audio>`;
-}});
-ViewRuntime.registerView({ kind: 'doc/pdf', async mount(cont, ctx) {
-  const url = await ctx.objectUrlFor(ctx.mime);
-  cont.innerHTML = `<iframe src="${url}" title="${escapeHtml(ctx.file.display_name)}"
-    class="w-full h-[70vh] rounded border border-base-300"></iframe>`;
-}});
+// メディア系（image/video/audio/pdf）は共有プラグイン viewer-media.js が担う
+// （file_commit と共通。block script 冒頭で読み込み済み）。
 // テキスト/不明: 既存の分割取得ビューア（巨大ファイル対応・編集可）をそのまま使う。
 // renderTextContent が内部でバイナリ判定し、テキストなら canEdit を立てる。
 ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
