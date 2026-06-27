@@ -30,6 +30,29 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/files/:id/compare", get(file_compare_page))
         .route("/files/:id/histories/:cid", get(file_commit_page))
         .route("/series/:id", get(series_settings_page))
+        .route("/plugins/:name", get(view_plugin_asset))
+}
+
+/// ビュープラグインの JS を配信する。各プラグインは独立ファイルで、バイナリへ
+/// 埋め込んで（`include_str!`）配信する。第一者組込みのため許可名はホワイトリスト。
+/// 共有 ViewRuntime（base.html）へ自己登録する classic script として読み込まれる。
+async fn view_plugin_asset(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let body: &'static str = match name.as_str() {
+        "text-diff.js" => include_str!("../assets/view-plugins/text-diff.js"),
+        "image-diff.js" => include_str!("../assets/view-plugins/image-diff.js"),
+        "binary-meta.js" => include_str!("../assets/view-plugins/binary-meta.js"),
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// askama テンプレートを描画して HTML レスポンスにする。

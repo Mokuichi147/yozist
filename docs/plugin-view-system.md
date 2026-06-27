@@ -305,7 +305,8 @@ if (o.kind === n.kind && views.get(o.kind)?.diff) {
 | 第一者ビュープラグイン `core/text`・`core/image`・`core/binary`（既存の行差分・画像4モード・メタ比較を移植） | ✅ 挙動を保って移植 |
 | 比較ページのオーケストレーション（2 コミット解決 → 同種は専用差分／異種はメタ比較） | ✅ ハードコード分岐を撤去 |
 | 単一表示（`file_detail.html`）の runtime 統合 | ✅ 描画ディスパッチをビュープラグイン（`mount`）化。画像/動画/音声/PDF を `core/image`・`media/video`・`media/audio`・`doc/pdf` プラグインへ移植。テキストの仮想スクロール／巨大ファイル編集は温存（`core/text` の mount から既存 `renderTextContent` を呼ぶ）。ブラウザ実機で検証済 |
-| view-runtime の `base.html` への抽出（全ページ共有化） | ✅ 純粋レジストリを `base.html` へ。compare(diff) と file_detail(mount) が同一ランタイムを共有 |
+| view-runtime の `base.html` への抽出（全ページ共有化） | ✅ 純粋レジストリ＋共有ヘルパ(`ViewRuntime.host`)を `base.html` へ。compare(diff) と file_detail(mount) が同一ランタイムを共有 |
+| 差分プラグインの**独立ファイル化**（`core/text`/`core/image`/`core/binary`） | ✅ `crates/yozist-api/assets/view-plugins/*.js` に分離。`GET /ui/plugins/:name` で配信（`include_str!` 埋め込み・ホワイトリスト）。各プラグインは IIFE で内部スコープを隔離し、`ViewRuntime.host` 経由でのみ共有ヘルパへ依存（ページ実装に非依存）。ブラウザ実機で検証済 |
 | 重い形式のバックエンド変換の実例（フロントから `/view` へ委譲する経路） | ⬜ 口は用意済み（`resolveModel` の差し替え点）。実形式は未追加 |
 
 > 注: バックエンドの全体ビルド（`yozist-server`）は vendor の `smb-server` が rustc 1.95 を要求する
