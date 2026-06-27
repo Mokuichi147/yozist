@@ -43,6 +43,7 @@ async fn view_plugin_asset(
         "text-diff.js" => include_str!("../assets/view-plugins/text-diff.js"),
         "image-diff.js" => include_str!("../assets/view-plugins/image-diff.js"),
         "binary-meta.js" => include_str!("../assets/view-plugins/binary-meta.js"),
+        "table-csv.js" => include_str!("../assets/view-plugins/table-csv.js"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     (

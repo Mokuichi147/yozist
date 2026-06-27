@@ -142,6 +142,9 @@
 <script src="/ui/plugins/text-diff.js"></script>
 <script src="/ui/plugins/image-diff.js"></script>
 <script src="/ui/plugins/binary-meta.js"></script>
+<!-- 拡張例: CSV/TSV をテーブルとしてセル単位で差分表示する追加プラグイン。
+     コア（このページ）を改変せず、ファイル追加＋登録だけで新ビュー種別が増える。 -->
+<script src="/ui/plugins/table-csv.js"></script>
 <script>
 // ===========================================================================
 // 比較ページ。ビュー／変換プラグイン基盤（docs/plugin-view-system.md）で駆動する。
@@ -159,6 +162,7 @@ const qs = new URLSearchParams(location.search);
 let history = [];
 let currentCommitId = null;
 let fileCharset = null; // 元エンコーディング。テキスト payload のデコードに使う。
+let fileName = null;    // 表示名。変換プラグインが拡張子で種別判定するのに使う。
 const bytesCache = new Map(); // commitId → Uint8Array（生バイト。変換/種別判定の共通源）
 
 const detailUrl = '/ui/files/' + fileId;
@@ -250,8 +254,8 @@ function update() {
   $('cmp-diff').innerHTML = '<span class="opacity-50 text-xs p-3 block">読み込み中…</span>';
 
   Promise.all([fetchBytes(baseId), fetchBytes(compareId)]).then(async ([ob, nb]) => {
-    curOld = await ViewRuntime.resolveModel(ob, { id: baseId, charset: fileCharset });
-    curNew = await ViewRuntime.resolveModel(nb, { id: compareId, charset: fileCharset });
+    curOld = await ViewRuntime.resolveModel(ob, { id: baseId, charset: fileCharset, name: fileName });
+    curNew = await ViewRuntime.resolveModel(nb, { id: compareId, charset: fileCharset, name: fileName });
     // 種別が一致し、そのビューが差分対応なら専用差分。さもなくばメタ比較へ。
     const sameKind = curOld.kind === curNew.kind;
     curPlugin = (sameKind && ViewRuntime.hasView(curOld.kind) && ViewRuntime.getView(curOld.kind).diff)
@@ -320,6 +324,7 @@ async function init() {
   }
   currentCommitId = file.current_commit;
   fileCharset = file.charset;
+  fileName = file.display_name;
   document.title = `yozist - ${file.display_name} の比較`;
   $('main').classList.remove('hidden');
   $('cmp-name').textContent = file.display_name;

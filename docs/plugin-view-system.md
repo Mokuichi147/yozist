@@ -307,6 +307,7 @@ if (o.kind === n.kind && views.get(o.kind)?.diff) {
 | 単一表示（`file_detail.html`）の runtime 統合 | ✅ 描画ディスパッチをビュープラグイン（`mount`）化。画像/動画/音声/PDF を `core/image`・`media/video`・`media/audio`・`doc/pdf` プラグインへ移植。テキストの仮想スクロール／巨大ファイル編集は温存（`core/text` の mount から既存 `renderTextContent` を呼ぶ）。ブラウザ実機で検証済 |
 | view-runtime の `base.html` への抽出（全ページ共有化） | ✅ 純粋レジストリ＋共有ヘルパ(`ViewRuntime.host`)を `base.html` へ。compare(diff) と file_detail(mount) が同一ランタイムを共有 |
 | 差分プラグインの**独立ファイル化**（`core/text`/`core/image`/`core/binary`） | ✅ `crates/yozist-api/assets/view-plugins/*.js` に分離。`GET /ui/plugins/:name` で配信（`include_str!` 埋め込み・ホワイトリスト）。各プラグインは IIFE で内部スコープを隔離し、`ViewRuntime.host` 経由でのみ共有ヘルパへ依存（ページ実装に非依存）。ブラウザ実機で検証済 |
+| 拡張性の実証: 新形式＋新ビュー種別の追加 | ✅ `view-plugins/table-csv.js` を**1ファイル追加**するだけで CSV/TSV を `table/csv` ビューとしてセル単位差分表示（行 LCS＋セルハイライト、独自モード「全行/変更のみ」）。コアは「解決ヒントに `name` を渡す」一度きりの汎用配線のみ。差分アルゴリズムがビュー固有（行ではなく表のセル）である実例。ブラウザ実機で検証済 |
 | 重い形式のバックエンド変換の実例（フロントから `/view` へ委譲する経路） | ⬜ 口は用意済み（`resolveModel` の差し替え点）。実形式は未追加 |
 
 > 注: バックエンドの全体ビルド（`yozist-server`）は vendor の `smb-server` が rustc 1.95 を要求する
