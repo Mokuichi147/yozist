@@ -1,0 +1,1165 @@
+// ファイル詳細ページ（/ui/files/:id）のロジック。file_detail.html のインライン
+// <script> から切り出した静的ファイル（issue #50）。/ui/pages/file_detail.js で配信される。
+const fileId = location.pathname.split('/').pop();
+let currentFile = null;
+let canEdit = false;          // 現在の content がテキスト編集可能か
+let contentObjectUrl = null;  // メディアプレビュー用の object URL
+let allTags = [];             // 全タグ（割り当て数の多い順）
+let assignedTags = [];        // このファイルに割り当て済みのタグ
+let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
+let seriesOptions = [];         // 候補シリーズ（自分が閲覧可能なもの。名前→ID 解決に使う）
+let fileSeries = [];            // このファイルが所属するシリーズ（コンテンツ両端の前後遷移に使う）
+
+// --- テキスト表示の状態 ---
+// 小さいファイル（TEXT_FULL_LOAD_MAX 以下）は全文を取得し読み取り専用 textarea で描画
+// （ネイティブの内部スクロール。スクロールバーが内容と完全一致）。
+// それ以上（GB 級も想定）は仮想スクロール: 枠自身のスクロールバーがファイル全体を
+// 表すよう、スクロール高を上限内に圧縮してバー位置⇔バイト位置を対応させる。
+// 表示中の前後チャンクのみ DOM に保持し、離れたものは解放（メモリ一定）。
+// ビューアはストレージの生 UTF-8 を読む（?utf8=1）。UTF-8 は継続バイトで文字境界を
+// 判定でき、チャンクを独立にデコード／解放／再ロードできるため。
+const TEXT_CHUNK_BYTES = 256 * 1024;        // 1 チャンクのバイト数
+// 全文ロード上限。textarea は長い折り返し行でサイズに対し極端に重くなる（カーソル
+// 移動でレイアウト再計算が走る）ため、編集が軽快な範囲に抑える。超過は仮想スクロール。
+const TEXT_FULL_LOAD_MAX = TEXT_CHUNK_BYTES;
+const TEXT_WINDOW_CHUNKS = 12;              // DOM に保持する最大チャンク数（≒3MB）
+// 部分編集 1 回あたりの最大バイト数。これを超えると編集 textarea が重くなり
+// カーソル移動すら困難になるため、表示位置から 64KB ずつ編集する。
+const EDIT_MAX_BYTES = 64 * 1024;
+const VIRT_SCROLL_MAX = 4 * 1000 * 1000;    // 仮想スクロール高の上限 px（ブラウザ上限内）
+let textVirtual = false;               // 仮想スクロール中か（巨大ファイル）
+let textFullContent = '';              // 全文ロード時の本文（編集用）
+let textTotalBytes = 0;                // content 全体のバイト数（UTF-8）
+let textNumChunks = 0;                 // 総チャンク数
+let textEstChunkH = 0;                 // 1 チャンクの推定ピクセル高（プレースホルダ予約高）
+// 仮想スクロールの内部状態
+let twBox = null;                      // スクロール枠
+let twTrack = null;                    // チャンク列（translateY で動かす）
+let twTrackOff = 0;                    // track 内の表示開始 px
+let twWinStart = 0;                    // DOM 上の先頭チャンク index
+let twWinEnd = 0;                      // DOM 上の末尾 +1（[start, end)）
+let twNodes = {};                      // チャンク index → DOM ノード（疎）
+let twAbort = {};                      // チャンク index → 取得中の AbortController
+let twLastST = 0;                      // 直前の scrollTop（相対/ジャンプ判定用）
+let twIgnoreScroll = 0;                // プログラム起因 scroll イベントの無視カウンタ
+let twPinBottom = false;               // 終端ジャンプ後、終端を表示し続ける
+let twScheduled = false;               // scroll の rAF スロットル
+let editRange = null;                  // 部分編集の置換範囲 {start,end}（null=全置換）
+let editOriginal = '';                 // 編集開始時の本文（未保存変更の判定用）
+
+// 拡張子 → MIME・種別判定（EXT_MIME/TEXT_EXT/extOf/mediaKind/viewerKind）は
+// file_commit.html と完全同一の実装だったため base.html の共有スクリプトへ一本化した
+// （判定ルールの変更が2箇所同時修正になり、片方だけ直すと乖離する問題への対処）。
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+}
+
+// レンダリングや Blob 生成に使う MIME を決める
+function effectiveMime() {
+  return currentFile.mime || EXT_MIME[extOf(currentFile.display_name)] || 'application/octet-stream';
+}
+
+// ===========================================================================
+// 単一表示は base.html の共有 ViewRuntime（docs/plugin-view-system.md）の
+// ビュープラグインで描画する。kind 判定は mime/拡張子から行う（巨大ファイルで
+// バイト取得を避けるため）。各 mount(container, ctx) は既存の描画関数を呼ぶ薄い
+// ラッパで、挙動は不変。新形式は viewerKind（base.html 共有）の対応付け＋ビュー
+// 登録だけで増やせる。
+// ===========================================================================
+
+// メディア系（image/video/audio/pdf）は共有プラグイン viewer-media.js が担う
+// （file_commit と共通。block script 冒頭で読み込み済み）。
+// テキスト/不明: 既存の分割取得ビューア（巨大ファイル対応・編集可）をそのまま使う。
+// renderTextContent が内部でバイナリ判定し、テキストなら canEdit を立てる。
+ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
+  await renderTextContent(cont, ctx.mediaKind);
+}});
+// バイナリのフォールバック（プレビュー不可）。getView の既定フォールバックも兼ねる。
+ViewRuntime.registerView({ kind: 'core/binary', mount(cont) { renderBinary(cont); } });
+
+async function init() {
+  const me = await requireAuth();
+  if (!me) return;
+  try {
+    currentFile = await json('/api/files/' + fileId);
+  } catch (e) {
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+  $('main').classList.remove('hidden');
+  document.title = 'yozist - ' + currentFile.display_name;
+  setupTouchNav();
+  await Promise.all([loadSeriesOptions(), loadDetail()]);
+}
+
+async function loadSeriesOptions() {
+  try {
+    seriesOptions = await json('/api/series');
+    $('fd-series-options').innerHTML =
+      seriesOptions.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+  } catch (e) { seriesOptions = []; }
+}
+
+// 削除済み（ゴミ箱内）ファイルの表示制御。閲覧は可能だが、削除済みへの
+// 変更・共有・権限操作は混乱を招くため無効化し、代わりに「復元」を出す。
+function applyDeletedState() {
+  const d = !!currentFile.deleted;
+  $('fd-deleted-banner').classList.toggle('hidden', !d);
+  $('fd-delete-btn').classList.toggle('hidden', d);
+  $('fd-restore-btn').classList.toggle('hidden', !d);
+  ['fd-update-btn', 'fd-share-btn', 'fd-perm-btn'].forEach(id => {
+    const el = $(id);
+    if (el) el.disabled = d;
+  });
+}
+
+async function restoreFile() {
+  const r = await api(`/api/files/${fileId}/restore`, { method: 'POST' });
+  if (!r.ok) { uiToast('復元に失敗しました: ' + await r.text(), 'error'); return; }
+  currentFile = await json('/api/files/' + fileId);
+  applyDeletedState();
+  renderContent();
+  uiToast('復元しました', 'success');
+}
+
+async function loadDetail() {
+  $('fd-name').textContent = currentFile.display_name;
+  applyDeletedState();
+  const metaRow = (label, value, mono) =>
+    `<div><dt class="opacity-50">${label}</dt>` +
+    `<dd class="break-all${mono ? ' font-mono' : ''}">${value}</dd></div>`;
+  $('fd-meta').innerHTML = `<dl class="space-y-2">
+    ${metaRow('サイズ', fmtSize(currentFile.size))}
+    ${metaRow('MIME', escapeHtml(currentFile.mime || '—'))}
+    ${currentFile.charset ? metaRow('文字コード', escapeHtml(currentFile.charset)) : ''}
+    ${metaRow('ID', escapeHtml(currentFile.id), true)}
+    ${metaRow('current_commit', escapeHtml(currentFile.current_commit), true)}
+  </dl>`;
+  $('fd-share').textContent = '';
+  await Promise.all([loadTags(), loadHistory(), loadFileSeries(), renderContent()]);
+}
+
+// 種別ごとのバッジ配色（files 一覧と統一。ダークでも視認できるよう塗りつぶし）
+function tagVariant(kind) {
+  return kind === 'system' ? 'badge-neutral'
+       : kind === 'ai' ? 'badge-warning'
+       : 'badge-primary';
+}
+function tagIcon(kind) {
+  return kind === 'system' ? ' ⚙' : kind === 'ai' ? ' 🤖' : '';
+}
+
+async function loadTags() {
+  assignedTags = await json(`/api/files/${fileId}/tags`);
+  assignedTagIds = new Set(assignedTags.map(t => t.id));
+  await loadTagCandidates();
+}
+
+// 全タグを割り当て数の多い順で取得し、タグ表示を再描画する。
+async function loadTagCandidates() {
+  try {
+    allTags = await json('/api/tags?sort=usage');
+  } catch (e) {
+    allTags = [];
+  }
+  renderTags();
+}
+
+// 割り当て済みタグ + 候補（未選択）を同じコンテナにまとめて描画する。
+// 候補は入力中の文字列でフィルターし、割り当て済みを除いて多い順で並べる。
+function renderTags() {
+  const box = $('fd-tags');
+  if (!box) return;
+  const q = $('fd-add-tag').value.trim().toLowerCase();
+
+  // 割り当て済み（選択済み）。システムタグ（ext:/type: 等）は自動付与で詳細情報に
+  // MIME 等として表示されるため、タグカードには出さない。
+  const assignedHtml = assignedTags
+    .filter(t => t.kind !== 'system')
+    .map(t =>
+      // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
+      `<button type="button" class="badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
+              title="クリックでタグを外す" onclick="detachTag('${t.id}')">
+        ${escapeHtml(t.name)}${tagIcon(t.kind)}
+        <span class="leading-none opacity-70">×</span>
+      </button>`
+    ).join('');
+
+  // 候補（未選択）。システムタグ・割り当て済みは除外し、入力でフィルター。
+  const cands = allTags.filter(t =>
+    t.kind !== 'system' &&
+    !assignedTagIds.has(t.id) &&
+    (q === '' || t.name.toLowerCase().includes(q))
+  );
+  const candHtml = cands.slice(0, 30).map(t =>
+    `<button type="button"
+             class="badge badge-sm badge-outline ${tagVariant(t.kind)} cursor-pointer hover:badge-soft"
+             title="このタグを割り当てる" onclick="assignExistingTag('${t.id}')">+ ${escapeHtml(t.name)}${tagIcon(t.kind)}</button>`
+  ).join('');
+
+  if (!assignedHtml && !candHtml) {
+    box.innerHTML = '<span class="opacity-50 text-xs">タグなし</span>';
+    return;
+  }
+  box.innerHTML = assignedHtml + candHtml;
+}
+
+// 既存タグを割り当てる（候補クリック時）。
+async function assignExistingTag(tagId) {
+  const r = await api(`/api/files/${fileId}/tags`, {
+    method: 'POST', body: JSON.stringify({ tag_id: tagId }),
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
+  $('fd-add-tag').value = '';
+  await loadTags();
+}
+
+async function loadHistory() {
+  const history = await json(`/api/files/${fileId}/history`);
+  const currentCommitId = currentFile.current_commit;
+  $('fd-history').innerHTML = history.length === 0
+    ? '<div class="opacity-50 text-xs">履歴なし</div>'
+    : history.map(c => {
+        const isCurrent = c.id === currentCommitId;
+        const time = fmtTs(c.timestamp);
+        const by = c.committed_by
+          ? `<span class="opacity-70">${escapeHtml(c.committed_by)}</span>`
+          : '<span class="opacity-40">不明</span>';
+        return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
+          <div class="truncate">
+            ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
+            <span class="opacity-70">${time}</span>
+            <span class="opacity-60">${escapeHtml(c.format_id)}</span>
+            <span class="opacity-50">·</span> ${by}
+            ${escapeHtml(c.message || '')}
+          </div>
+          <div class="flex gap-1 shrink-0">
+            <a class="btn btn-xs" href="/ui/files/${fileId}/compare?base=${c.id}&compare=${currentCommitId}" title="現在の内容と比較">Δ 比較</a>
+            <a class="btn btn-xs" href="/ui/files/${fileId}/histories/${c.id}">表示</a>
+            ${isCurrent ? '' : `<button class="btn btn-xs btn-warning btn-outline"
+              onclick="rollback('${c.id}','${time}')">戻す</button>`}
+          </div>
+        </div>`;
+      }).join('');
+}
+
+function revokeContentUrl() {
+  if (contentObjectUrl) { URL.revokeObjectURL(contentObjectUrl); contentObjectUrl = null; }
+}
+
+// 認証付きで content を取得し、正しい MIME を付与した object URL にする。
+// （Bearer 認証のため <img src> 等で直接参照できず、fetch + Blob が必要）
+async function fetchContentBytes() {
+  const r = await api(`/api/files/${fileId}/content`);
+  if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+  return r.arrayBuffer();
+}
+
+async function objectUrlFor(mime) {
+  const buf = await fetchContentBytes();
+  revokeContentUrl();
+  contentObjectUrl = URL.createObjectURL(new Blob([buf], { type: mime }));
+  return contentObjectUrl;
+}
+
+// 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）
+function looksBinary(buf) {
+  const bytes = new Uint8Array(buf.slice(0, 8192));
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) return true;
+  return false;
+}
+
+// content の [start, start+len) を Range リクエストで取得する。
+// utf8=true でストレージの生 UTF-8 を取得（仮想スクロール／編集用）。
+// 返り値 { buf, total }。total はサーバの Content-Range から得た全体バイト数
+// （Range 非対応サーバが 200 で全体を返した場合は本文長）。
+async function fetchContentRange(start, len, utf8, signal) {
+  const end = start + len - 1; // inclusive
+  const path = `/api/files/${fileId}/content` + (utf8 ? '?utf8=1' : '');
+  const r = await api(path, { headers: { Range: `bytes=${start}-${end}` }, signal });
+  if (!r.ok && r.status !== 206) {
+    throw new Error((await r.text().catch(() => '')) || r.statusText);
+  }
+  const buf = await r.arrayBuffer();
+  let total = buf.byteLength;
+  const cr = r.headers.get('Content-Range'); // "bytes start-end/total"
+  const m = cr && /\/(\d+)\s*$/.exec(cr);
+  if (m) total = parseInt(m[1], 10);
+  return { buf, total };
+}
+
+// チャンク i（UTF-8 ストレージ空間）を取得する。文字は「先頭バイトが属するチャンク」
+// 所有の規約で分割し、境界のマルチバイト文字を欠落・重複なく復元する（末尾を最大 3
+// バイト多めに読む）。返り値 { text, startByte, endByte }（編集の置換範囲にも使う）。
+async function fetchUtf8Chunk(i, signal) {
+  const start = i * TEXT_CHUNK_BYTES;
+  const chunkEnd = Math.min(start + TEXT_CHUNK_BYTES, textTotalBytes); // exclusive
+  const reqEnd = Math.min(chunkEnd + 3, textTotalBytes);              // 末尾文字の補完分
+  const { buf } = await fetchContentRange(start, reqEnd - start, true, signal);
+  const bytes = new Uint8Array(buf);
+  // 先頭: 継続バイト(0b10xxxxxx)は前チャンク所有の文字 → 読み飛ばす。
+  let s = 0;
+  while (s < bytes.length && (bytes[s] & 0xC0) === 0x80) s++;
+  // 末尾: chunkEnd 位置が継続バイトなら、その文字は本チャンク所有 → 完了まで含める。
+  let e = Math.min(chunkEnd - start, bytes.length);
+  while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  if (e < s) e = s;
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(s, e));
+  return { text, startByte: start + s, endByte: start + e };
+}
+
+// content をデータ種別に応じたビュープラグインで描画する
+async function renderContent() {
+  revokeContentUrl();
+  canEdit = false;
+  const cont = $('fd-content');
+  cont.classList.remove('hidden');  // 編集後の再描画時に表示専用欄を確実に復帰
+  cont.innerHTML = '<span class="opacity-50 text-xs">読み込み中…</span>';
+  const mk = mediaKind(currentFile.mime, currentFile.display_name);
+  const plugin = ViewRuntime.getView(viewerKind(currentFile.mime, currentFile.display_name));
+  // mount は既存描画関数を呼ぶ。objectUrlFor は contentObjectUrl を管理する共通経路。
+  const ctx = { file: currentFile, mime: effectiveMime(), mediaKind: mk, objectUrlFor };
+  try {
+    await plugin.mount(cont, ctx);
+  } catch (e) {
+    cont.innerHTML = `<span class="text-error text-xs">content の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
+  }
+  // 削除済みファイルはテキスト編集も無効化（復元してから編集する）
+  $('fd-edit-btn').classList.toggle('hidden', !canEdit || !!(currentFile && currentFile.deleted));
+}
+
+// テキスト/不明データを表示する。通常サイズは全文、巨大ファイルは仮想スクロール。
+async function renderTextContent(cont, kind) {
+  // 先頭チャンクを取得（バイナリ判定にも使う）。
+  const first = await fetchUtf8ChunkProbe();
+  if (kind === 'unknown' && !currentFile.charset && looksBinary(first.buf)) {
+    renderBinary(cont);
+    return;
+  }
+  canEdit = true;
+  textTotalBytes = first.total;
+  textFullContent = '';
+  // 直前の仮想スクローラが残っていれば後始末（再描画時）。
+  if (twBox) { twBox.removeEventListener('scroll', onVirtScroll); }
+  for (const k in twAbort) { try { twAbort[k].abort(); } catch (_) {} }
+  twBox = null; twTrack = null; twNodes = {}; twAbort = {};
+  twScheduled = false; twIgnoreScroll = 0; twPinBottom = false;
+
+  if (textTotalBytes <= TEXT_FULL_LOAD_MAX) {
+    await renderTextFull(cont, first);
+  } else {
+    renderTextVirtual(cont, first);
+  }
+}
+
+// 共通: 内容を内部スクロールさせる枠を作る（重要スタイルはインライン＝Tailwind 非依存）。
+function makeTextScrollBox() {
+  const box = document.createElement('div');
+  box.id = 'fd-text-scroll';
+  box.style.cssText =
+    'overflow:auto;border:1px solid rgba(127,127,127,0.25);' +
+    'border-radius:0.375rem;background:rgba(127,127,127,0.06)';
+  return box;
+}
+
+// 全文ロード: 全体を取得し、読み取り専用 <textarea> で表示する。
+// textarea はフォーム要素としてネイティブの内部スクロールを持つため、CSS の
+// overflow 解釈に依存せず必ず枠内でスクロールし、スクロールバーも内容と一致する。
+async function renderTextFull(cont, first) {
+  textVirtual = false;
+  let text;
+  if (textTotalBytes <= TEXT_CHUNK_BYTES) {
+    text = first.text;               // probe が全体を取得済み
+  } else {
+    // サーバは展開済みキャッシュを即返すので 1 リクエストで全文取得して問題ない。
+    const { buf } = await fetchContentRange(0, textTotalBytes, true);
+    text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+  }
+  textFullContent = text;            // 編集用
+  const ta = document.createElement('textarea');
+  ta.id = 'fd-text-view';
+  ta.readOnly = true;
+  ta.value = text;
+  ta.style.cssText =
+    'display:block;width:100%;box-sizing:border-box;margin:0;padding:0.5rem 0.75rem;' +
+    'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.75rem;line-height:1.2rem;' +
+    'border:1px solid rgba(127,127,127,0.25);border-radius:0.375rem;background:rgba(127,127,127,0.06);' +
+    'resize:vertical';
+  cont.replaceChildren(ta);
+  // 高さは常に 70vh（最大）に固定（内容の長短にかかわらず枠を最大化する）。
+  ta.style.height = Math.round(window.innerHeight * 0.7) + 'px';
+  // 診断: スクロール不能の切り分け用（問題報告時にコンソールを確認）。
+  console.log('[yozist] text view', {
+    bytes: textTotalBytes, mode: 'full',
+    height: ta.style.height, scrollHeight: ta.scrollHeight, clientHeight: ta.clientHeight,
+    scrollable: ta.scrollHeight > ta.clientHeight,
+  });
+}
+
+// ===== 仮想スクロール（巨大ファイル, GB 級可）=====
+// 枠自身のネイティブスクロールバーがファイル全体を表すよう、スクロール高を
+// ブラウザ上限内の値（VIRT_SCROLL_MAX 以下）に圧縮し、バー位置⇔バイト位置を
+// 線形対応させる。専用のスライダー等は設けない。
+//  - つまみのドラッグ＝ファイル全体の絶対位置ジャンプ（最下部＝終端が常に一致）
+//  - ホイール等の小さなスクロールは内容へ 1:1 で適用して滑らかに読め、処理後に
+//    scrollTop を真の位置へ再同期する（バーは常に実位置を指す）
+// 表示は sticky で viewport に固定した layer 内の track を translateY で動かす。
+// 全長の実高を DOM に持たないため、ブラウザの最大要素高には当たらない。
+function renderTextVirtual(cont, first) {
+  textVirtual = true;
+  textNumChunks = Math.max(1, Math.ceil(textTotalBytes / TEXT_CHUNK_BYTES));
+  twNodes = {};
+  twAbort = {};
+
+  const box = makeTextScrollBox();
+  box.style.height = Math.round(window.innerHeight * 0.7) + 'px';
+  box.style.position = 'relative';
+  box.style.overflowAnchor = 'none';   // 自前の scrollTop 操作と競合させない
+  box.style.overflowY = 'scroll';      // バーを常時表示（全体位置の指標）
+  const layer = document.createElement('div');
+  layer.style.cssText = 'position:sticky;top:0;height:100%;overflow:hidden';
+  const track = document.createElement('div');
+  layer.appendChild(track);
+  const spacer = document.createElement('div');
+  box.append(layer, spacer);
+  cont.replaceChildren(box);
+  twBox = box;
+  twTrack = track;
+
+  twWinStart = 0;
+  twWinEnd = 0;
+  twTrackOff = 0;
+  twLastST = 0;
+  twIgnoreScroll = 0;
+  twPinBottom = false;
+  appendChunkNode(0, first.text);                 // 先頭は probe 済みテキストで即描画
+  textEstChunkH = Math.max(40, twNodes[0].offsetHeight);
+
+  // スクロール高 = 推定実高（上限まで）。小さめのファイルでは実高に近く自然な
+  // バーになり、GB 級では圧縮される（layer が clientHeight 分の流れを占める）。
+  const h = Math.min(textNumChunks * textEstChunkH, VIRT_SCROLL_MAX);
+  spacer.style.height = Math.max(0, h - box.clientHeight) + 'px';
+
+  box.addEventListener('scroll', onVirtScroll);
+  settleWindow();
+}
+
+// チャンク用ノード（推定高プレースホルダ）。
+function twMakeNode(i) {
+  const d = document.createElement('div');
+  d.dataset.i = String(i);
+  d.style.minHeight = (textEstChunkH || 40) + 'px';
+  const ph = document.createElement('div');
+  ph.style.cssText = 'padding:0.4rem 0.75rem;opacity:0.4';
+  ph.textContent = '読み込み中…';
+  d.appendChild(ph);
+  twNodes[i] = d;
+  return d;
+}
+
+// ノードに本文を流し込む。表示位置より上のノードが伸縮したら trackOff を補正して
+// 見えている内容を保つ。
+function twFill(i, text) {
+  const d = twNodes[i];
+  if (!d) return;
+  const beforeH = d.offsetHeight;
+  const wasAbove = d.offsetTop + beforeH <= twTrackOff;
+  const pre = document.createElement('pre');
+  pre.style.cssText =
+    'margin:0;padding:0 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;' +
+    'font-size:0.75rem;line-height:1.2rem';
+  pre.appendChild(document.createTextNode(text));
+  d.replaceChildren(pre);
+  d.style.minHeight = '';
+  d.dataset.loaded = '1';
+  if (wasAbove) twTrackOff += d.offsetHeight - beforeH;
+  settleWindow();
+}
+
+// 末尾に追加。text 省略時はプレースホルダ + 非同期ロード。ロード完了の Promise を返す。
+function appendChunkNode(i, text) {
+  const d = twMakeNode(i);
+  twTrack.appendChild(d);
+  twWinEnd = i + 1;
+  if (text != null) { twFill(i, text); return Promise.resolve(); }
+  return twLoad(i);
+}
+
+// 先頭に追加。挿入分だけ trackOff を進めて見えている内容を保つ。
+function prependChunkNode(i) {
+  const d = twMakeNode(i);
+  twTrack.insertBefore(d, twTrack.firstChild);
+  twWinStart = i;
+  twTrackOff += d.offsetHeight;
+  twLoad(i);
+}
+
+// チャンクを非同期取得して流し込む。
+async function twLoad(i) {
+  const d = twNodes[i];
+  if (!d || d.dataset.loaded === '1' || twAbort[i]) return;
+  const ac = new AbortController();
+  twAbort[i] = ac;
+  try {
+    const { text } = await fetchUtf8Chunk(i, ac.signal);
+    if (twNodes[i]) twFill(i, text);   // 解放されていなければ反映
+  } catch (e) {
+    if (!e || e.name !== 'AbortError') console.error('chunk load failed:', i, e);
+  } finally {
+    delete twAbort[i];
+  }
+}
+
+function releaseChunkNode(i) {
+  const d = twNodes[i];
+  if (!d) return;
+  if (twAbort[i]) { twAbort[i].abort(); delete twAbort[i]; }
+  twTrack.removeChild(d);
+  delete twNodes[i];
+}
+
+function onVirtScroll() {
+  if (twIgnoreScroll > 0) { twIgnoreScroll--; twLastST = twBox.scrollTop; return; }
+  if (twScheduled) return;
+  twScheduled = true;
+  requestAnimationFrame(() => { twScheduled = false; handleVirtScroll(); });
+}
+
+function handleVirtScroll() {
+  if (!twBox) return;
+  const st = twBox.scrollTop;
+  const delta = st - twLastST;
+  twLastST = st;
+  if (delta === 0) return;
+  if (Math.abs(delta) > twBox.clientHeight * 3) {
+    // つまみドラッグ等の大移動 → バー位置に対応するファイル位置へジャンプ
+    const max = Math.max(1, twBox.scrollHeight - twBox.clientHeight);
+    virtJump(st / max);
+  } else {
+    // ホイール等 → 内容へ 1:1 適用（滑らかな連続スクロール）
+    twPinBottom = false;
+    twTrackOff += delta;
+    settleWindow();
+  }
+}
+
+// バー位置 frac (0..1) に対応するチャンクへウィンドウごと移動する。
+function virtJump(frac) {
+  frac = Math.min(1, Math.max(0, frac));
+  for (const k in twAbort) { try { twAbort[k].abort(); } catch (_) {} }
+  twAbort = {};
+  twNodes = {};
+  twTrack.replaceChildren();
+  const toEnd = frac >= 0.9995;
+  const t = toEnd ? textNumChunks - 1
+                  : Math.min(textNumChunks - 1, Math.floor(frac * textNumChunks));
+  twWinStart = t;
+  twWinEnd = t;
+  twTrackOff = 0;
+  twPinBottom = toEnd;                 // 最下部ドラッグはファイル終端を表示し続ける
+  applyTrack();
+  appendChunkNode(t).then(() => settleWindow());
+}
+
+function applyTrack() {
+  if (twTrack) twTrack.style.transform = `translateY(${-Math.round(twTrackOff)}px)`;
+}
+
+// 表示位置の前後にチャンクを補充し、窓を超えた側を解放し、trackOff をクランプして
+// 反映、バーを実位置へ再同期する。すべての変化はここに集約される。
+function settleWindow() {
+  if (!twBox || !twTrack) return;
+  const clientH = twBox.clientHeight, MARGIN = 800;
+  let guard = 0;
+  // 上方向の不足分を補充
+  while (twTrackOff < MARGIN && twWinStart > 0 && guard++ < 100) {
+    prependChunkNode(twWinStart - 1);
+  }
+  // 下方向の不足分を補充
+  guard = 0;
+  while (twTrack.offsetHeight - (twTrackOff + clientH) < MARGIN &&
+         twWinEnd < textNumChunks && guard++ < 100) {
+    appendChunkNode(twWinEnd);
+  }
+  // 窓のトリム: viewport から遠い側（余白が大きい側）を解放
+  while (twWinEnd - twWinStart > TEXT_WINDOW_CHUNKS) {
+    const topSlack = twTrackOff;
+    const botSlack = twTrack.offsetHeight - (twTrackOff + clientH);
+    if (topSlack >= botSlack) {
+      const h = twNodes[twWinStart].offsetHeight;
+      releaseChunkNode(twWinStart);
+      twWinStart++;
+      twTrackOff -= h;
+    } else {
+      twWinEnd--;
+      releaseChunkNode(twWinEnd);
+    }
+  }
+  // クランプ（ファイル端・窓端より外を見せない）
+  const maxOff = Math.max(0, twTrack.offsetHeight - clientH);
+  if (twPinBottom && twWinEnd >= textNumChunks) twTrackOff = maxOff;
+  if (twTrackOff < 0) twTrackOff = 0;
+  if (twWinEnd >= textNumChunks && twTrackOff > maxOff) twTrackOff = maxOff;
+  applyTrack();
+  syncBar();
+}
+
+// 表示先頭のファイル内割合を概算してバーを実位置へ再同期する。
+// 端は厳密に合わせる（先頭=0 / 終端=最大）ので、バー最下部＝テキスト終端が一致する。
+function syncBar() {
+  const max = Math.max(0, twBox.scrollHeight - twBox.clientHeight);
+  const want = Math.round(virtCurrentFrac() * max);
+  if (Math.abs(want - twBox.scrollTop) > 2) {
+    twIgnoreScroll++;
+    twBox.scrollTop = want;
+  }
+  twLastST = twBox.scrollTop;
+}
+
+function virtCurrentFrac() {
+  if (twWinStart === 0 && twTrackOff <= 0) return 0;
+  if (twWinEnd >= textNumChunks) {
+    const maxOff = Math.max(0, twTrack.offsetHeight - twBox.clientHeight);
+    if (twTrackOff >= maxOff - 1) return 1;
+  }
+  let acc = 0;
+  for (let i = twWinStart; i < twWinEnd; i++) {
+    const h = twNodes[i] ? twNodes[i].offsetHeight : textEstChunkH;
+    if (acc + h > twTrackOff) {
+      const w = (twTrackOff - acc) / Math.max(1, h);
+      return Math.min(1, (i + w) / textNumChunks);
+    }
+    acc += h;
+  }
+  return Math.min(1, twWinEnd / textNumChunks);
+}
+
+// 先頭チャンクの生バイト（バイナリ判定用）・total・トリム済みテキストを取得する。
+// チャンク 0 は先頭の読み飛ばしが不要で、末尾だけ次文字の途中で切らないよう詰める。
+async function fetchUtf8ChunkProbe() {
+  const { buf, total } = await fetchContentRange(0, TEXT_CHUNK_BYTES, true);
+  const bytes = new Uint8Array(buf);
+  let e = bytes.length;
+  // total が 1 チャンクより大きいときのみ末尾が途中の可能性がある。
+  if (total > TEXT_CHUNK_BYTES) {
+    e = Math.min(TEXT_CHUNK_BYTES, bytes.length);
+    while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  }
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, e));
+  return { buf, total, text };
+}
+
+function renderBinary(cont) {
+  cont.innerHTML = `
+    <div class="flex flex-col items-center gap-3 py-10 text-center">
+      <div class="text-4xl opacity-30">🗎</div>
+      <div class="text-sm opacity-70">このファイルはプレビューに対応していません。</div>
+      <div class="text-xs opacity-50 break-all">${escapeHtml(currentFile.mime || '不明な形式')} · ${fmtSize(currentFile.size)}</div>
+      <button class="btn btn-sm btn-primary" onclick="downloadContent()">ダウンロード</button>
+    </div>`;
+}
+
+async function downloadContent() {
+  try {
+    const blob = new Blob([await fetchContentBytes()], { type: effectiveMime() });
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = u;
+    a.download = currentFile.display_name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(u), 1000);
+  } catch (e) {
+    uiToast('ダウンロードに失敗しました: ' + e.message, 'error');
+  }
+}
+
+// ファイル名の見出しをその場で input に差し替えてインライン編集する。
+// Enter / フォーカス外しで確定、Escape で取り消し。
+let renaming = false;
+function startRename() {
+  if (renaming || !currentFile) return;
+  renaming = true;
+  const h = $('fd-name');
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = currentFile.display_name;
+  // daisyUI の .input は固定高さ・パディングを持ち見出しより下にずれるため使わない。
+  // 見出しの字形・位置をそのまま保つよう font を継承し、box model を打ち消す。
+  input.className = 'w-full';
+  input.style.cssText =
+    'font:inherit;color:inherit;width:100%;margin:0;padding:0;height:auto;line-height:inherit;' +
+    'background:transparent;border:0;border-bottom:1px solid currentColor;outline:none;border-radius:0';
+  let done = false;
+  const cancel = () => {
+    if (done) return;
+    done = true; renaming = false;
+    h.textContent = currentFile.display_name;
+  };
+  const commit = async () => {
+    if (done) return;
+    const name = input.value.trim();
+    if (!name || name === currentFile.display_name) { cancel(); return; }
+    done = true; renaming = false;
+    await commitRename(name);
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  };
+  input.onblur = commit;
+  h.replaceChildren(input);
+  input.focus();
+  // 拡張子を除いた本体部分を選択（拡張子はそのまま使い回しやすいように）。
+  const dot = input.value.lastIndexOf('.');
+  input.setSelectionRange(0, dot > 0 ? dot : input.value.length);
+}
+
+// 確定した新ファイル名を PATCH で保存し、表示を更新する。
+async function commitRename(name) {
+  try {
+    currentFile = await json(`/api/files/${fileId}`, {
+      method: 'PATCH', body: { display_name: name },
+    });
+    document.title = 'yozist - ' + currentFile.display_name;
+    uiToast('ファイル名を変更しました', 'success');
+    await loadDetail();
+  } catch (e) {
+    uiToast('ファイル名の変更に失敗しました: ' + e.message, 'error');
+    $('fd-name').textContent = currentFile.display_name;
+  }
+}
+
+async function rollback(commitId, time) {
+  if (!await uiConfirm(`"${currentFile.display_name}" を ${time} の時点に戻しますか？\n(新しいコミットとして記録されます)`, { danger: true, okText: '戻す' })) return;
+  const r = await api(
+    `/api/files/${fileId}/rollback/${commitId}?message=` +
+      encodeURIComponent(`rollback to ${time}`),
+    { method: 'POST' }
+  );
+  if (!r.ok) { uiToast('rollback に失敗しました: ' + await r.text(), 'error'); return; }
+  uiToast('指定バージョンに戻しました', 'success');
+  currentFile = await json('/api/files/' + fileId);
+  await loadDetail();
+}
+
+async function toggleEdit() {
+  if (!canEdit) { uiToast('このファイルはテキスト編集に対応していません', 'warning'); return; }
+  const ed = $('fd-editor');
+  const cont = $('fd-content');
+  if (ed.classList.contains('hidden')) {
+    const ta = $('fd-edit-textarea');
+    const note = $('fd-edit-note');
+    if (!textVirtual) {
+      // 全文ロード済み → そのまま全置換編集。
+      editRange = null;
+      ta.value = textFullContent;
+      note.classList.add('hidden');
+    } else {
+      // 巨大ファイル: 表示位置から EDIT_MAX_BYTES だけを編集対象とし、
+      // その前後はサーバ側でそのまま保持する（範囲置換 repl_start/repl_end）。
+      // textarea が大きいとカーソル移動すら重くなるため、編集対象は小さく保つ。
+      const btn = $('fd-edit-btn');
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '読み込み中…';
+      let w;
+      try {
+        w = await loadEditWindow(twVisibleStartByte());
+      } catch (e) {
+        uiToast('編集データの読み込みに失敗しました: ' + e.message, 'error');
+        return;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+      editRange = { start: w.start, end: w.end };
+      ta.value = w.text;
+      const isFull = w.start === 0 && w.end >= textTotalBytes;
+      if (!isFull) {
+        note.textContent = `※ 表示中の範囲のみ編集できます（前 ${fmtSize(w.start)} / 後 ${fmtSize(textTotalBytes - w.end)} はそのまま保持されます）。`;
+        note.classList.remove('hidden');
+      } else {
+        note.classList.add('hidden');
+      }
+    }
+    $('fd-edit-message').value = '';
+    // 表示専用欄と同じ 70vh（最大）で編集する。
+    ta.style.height = Math.round(window.innerHeight * 0.7) + 'px';
+    ed.classList.remove('hidden');
+    // 表示専用欄を隠し、編集ボックスとの2重表示を防ぐ
+    cont.classList.add('hidden');
+    editOriginal = ta.value;            // 未保存変更の判定基準
+    $('fd-edit-btn').textContent = '完了';
+    updateContentNav();                 // 編集モードではオーバーレイを隠す
+  } else {
+    await finishEdit();
+  }
+}
+
+// 編集モードを終了する。未保存の変更があれば保存／破棄／戻るを選ばせる。
+async function finishEdit() {
+  const dirty = $('fd-edit-textarea').value !== editOriginal;
+  if (dirty) {
+    const choice = await uiConfirm('保存していない変更があります。保存しますか？', {
+      title: '編集の終了',
+      okText: '保存',
+      extraText: '変更を破棄',
+      cancelText: '戻る',
+    });
+    if (choice === false) return;       // 戻る → 編集を継続
+    if (choice === true) { await saveEdit(true); return; }  // 保存して表示モードへ戻す
+    // choice === 'extra' → 変更を破棄してそのまま終了
+  }
+  exitEditMode();
+}
+
+// 編集ボックスを閉じて表示専用欄へ戻す（ボタン表示も「編集」に戻す）。
+function exitEditMode() {
+  $('fd-editor').classList.add('hidden');
+  $('fd-content').classList.remove('hidden');
+  $('fd-edit-btn').textContent = '編集';
+  updateContentNav();                   // 表示モードに戻ったらオーバーレイを復帰
+}
+
+// 画面に見えている表示先頭のファイル内バイト位置（概算）を返す（編集対象の決定用）。
+// 表示先頭が属するチャンクとチャンク内割合からバイト位置へ比例配分する。
+function twVisibleStartByte() {
+  let acc = 0;
+  for (let i = twWinStart; i < twWinEnd; i++) {
+    const h = twNodes[i] ? twNodes[i].offsetHeight : textEstChunkH;
+    if (acc + h > twTrackOff) {
+      const w = (twTrackOff - acc) / Math.max(1, h);
+      return Math.max(0, Math.min(textTotalBytes, Math.floor((i + w) * TEXT_CHUNK_BYTES)));
+    }
+    acc += h;
+  }
+  return Math.min(textTotalBytes, twWinStart * TEXT_CHUNK_BYTES);
+}
+
+// 編集対象としてバイト範囲 [startByte, startByte + EDIT_MAX_BYTES) を取得する。
+// UTF-8 文字境界に丸めて取得し、その正確なバイト範囲 {start,end} と本文を返す
+// （保存時 repl_start/repl_end に使う）。
+async function loadEditWindow(startByte) {
+  const reqStart = Math.max(0, Math.min(startByte, Math.max(0, textTotalBytes - 1)));
+  const wantEnd = Math.min(reqStart + EDIT_MAX_BYTES, textTotalBytes);
+  const padEnd = Math.min(wantEnd + 3, textTotalBytes);     // 末尾文字の補完分
+  const { buf } = await fetchContentRange(reqStart, Math.max(1, padEnd - reqStart), true);
+  const bytes = new Uint8Array(buf);
+  let s = 0;                                                 // 先頭の継続バイトは前所有
+  while (s < bytes.length && (bytes[s] & 0xC0) === 0x80) s++;
+  let e = Math.min(wantEnd - reqStart, bytes.length);        // 末尾は文字完了まで
+  while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  if (e < s) e = s;
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(s, e));
+  return { text, start: reqStart + s, end: reqStart + e };
+}
+
+// exit=true のときのみ保存後に表示モードへ戻す（完了ボタン経由）。
+// 保存ボタンから直接呼ぶ場合は編集モードを維持する。
+async function saveEdit(exit = false) {
+  const newContent = $('fd-edit-textarea').value;
+  const msg = $('fd-edit-message').value;
+  // 部分編集（editRange != null）のときは置換範囲を付けて前後の保持を依頼する。
+  const params = new URLSearchParams();
+  if (msg) params.set('message', msg);
+  if (editRange) {
+    params.set('repl_start', String(editRange.start));
+    params.set('repl_end', String(editRange.end));
+  }
+  const qs = params.toString();
+  const url = `/api/files/${fileId}/content` + (qs ? `?${qs}` : '');
+  // 大きいファイルはコミットに時間がかかるため、二重送信を防ぎ進行中を明示する。
+  const btn = $('fd-save-btn');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  const restoreByte = editRange ? editRange.start : null;
+  let r;
+  try {
+    r = await api(url, {
+      method: 'POST',
+      body: new TextEncoder().encode(newContent).buffer,
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+  if (!r.ok) { uiToast('保存に失敗しました: ' + await r.text(), 'error'); return; }
+  uiToast('保存しました', 'success');
+  currentFile = await json('/api/files/' + fileId);
+  if (exit) {
+    // 完了からの保存: 表示モードへ戻し、編集していた位置へ表示を戻す。
+    exitEditMode();
+    await loadDetail();
+    if (restoreByte != null && textVirtual && textTotalBytes > 0) {
+      virtJump(restoreByte / textTotalBytes);
+    }
+    return;
+  }
+  // 保存ボタンからの保存: 編集モードを維持する。
+  // 置換範囲は保存後の長さに合わせて更新（次回保存のズレ防止）。
+  if (editRange) editRange.end = editRange.start + new TextEncoder().encode(newContent).length;
+  editOriginal = newContent;                 // 未保存状態を解消
+  $('fd-edit-message').value = '';            // メッセージは保存ごとにクリア
+  await loadDetail();                         // メタ・履歴・表示内容を最新化
+  $('fd-content').classList.add('hidden');    // 編集継続のため表示専用欄は隠したまま
+}
+
+// アップロードしたファイルで content を置き換える（新しいコミットとして記録）。
+// name を渡すことで display_name を更新し、mime/charset はサーバが新しい名前＋
+// 内容から再判定する。
+async function uploadContent(file) {
+  const input = $('fd-upload-input');
+  if (!file) return;
+  try {
+    if (!await uiConfirm(
+      `"${currentFile.display_name}" の内容を "${file.name}" (${fmtSize(file.size)}) で更新しますか？\n(新しいコミットとして記録されます)`,
+      { okText: '更新' }
+    )) return;
+    const url = `/api/files/${fileId}/content?name=` +
+      encodeURIComponent(file.name) +
+      `&message=` + encodeURIComponent(`upload ${file.name}`);
+    const r = await api(url, {
+      method: 'POST',
+      body: await file.arrayBuffer(),
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+    if (!r.ok) { uiToast('更新に失敗しました: ' + await r.text(), 'error'); return; }
+    uiToast('更新しました', 'success');
+    currentFile = await json('/api/files/' + fileId);
+    exitEditMode();
+    await loadDetail();
+  } finally {
+    // 同じファイルを連続で選んでも change が発火するようリセット
+    input.value = '';
+  }
+}
+
+async function addTag() {
+  const name = $('fd-add-tag').value.trim();
+  if (!name) return;
+  const created = await json('/api/tags', { method: 'POST', body: { name } });
+  const r = await api(`/api/files/${fileId}/tags`, {
+    method: 'POST', body: JSON.stringify({ tag_id: created.id }),
+    headers: { 'content-type': 'application/json' },
+  });
+  if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
+  $('fd-add-tag').value = '';
+  await loadTags();
+}
+
+async function detachTag(tagId) {
+  const r = await api(`/api/files/${fileId}/tags/${tagId}`, { method: 'DELETE' });
+  if (!r.ok) { uiToast('タグの取り外しに失敗しました', 'error'); return; }
+  await loadTags();
+}
+
+async function addToSeries() {
+  const name = $('fd-add-series').value.trim();
+  if (!name) { uiToast('シリーズ名を入力してください', 'warning'); return; }
+  try {
+    // 入力名が既存（自分の）シリーズなら再利用し、なければ新規作成する。
+    let sid = (seriesOptions.find(s => s.name === name) || {}).id;
+    if (!sid) {
+      const created = await json('/api/series', { method: 'POST', body: { name } });
+      sid = created.id;
+    }
+    await json(`/api/series/${sid}/members`, { method: 'POST', body: { file_id: fileId } });
+    uiToast('シリーズに追加しました', 'success');
+    $('fd-add-series').value = '';
+    await Promise.all([loadSeriesOptions(), loadFileSeries()]);
+  } catch (e) {
+    uiToast('シリーズ追加に失敗しました: ' + e.message, 'error');
+  }
+}
+
+// このファイルが所属するシリーズと、各シリーズ内での前後ファイルへの遷移を描画する。
+async function loadFileSeries() {
+  let list = [];
+  try { list = await json(`/api/files/${fileId}/series`); }
+  catch (e) { list = []; }
+  fileSeries = list;
+  renderFileSeries(list);
+  updateContentNav();
+}
+
+function gotoFile(id) { location.href = '/ui/files/' + id; }
+
+// コンテンツ両端のオーバーレイ遷移先（先頭シリーズ基準の前後ファイル）。
+// 複数シリーズに所属する場合は最初のシリーズを採用する（全シリーズはカードに表示）。
+function contentNavTargets() {
+  const s = fileSeries[0];
+  if (!s) return { prev: null, next: null };
+  const idx = s.position - 1;            // position は 1 始まり、0 は不在
+  const total = s.members.length;
+  const prev = idx > 0 ? s.members[idx - 1] : null;
+  const next = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
+  return { prev, next };
+}
+
+// コンテンツ両端の前後ボタンを更新する。前後が無い・編集モード中は隠す
+// （表示自体は CSS の group-hover によりホバー時のみ）。
+function updateContentNav() {
+  const prevBtn = $('fd-nav-prev');
+  const nextBtn = $('fd-nav-next');
+  if (!prevBtn || !nextBtn) return;
+  const editing = !$('fd-editor').classList.contains('hidden');
+  // 編集モードに入ったらタッチ用の表示状態も解除する。
+  if (editing) { const c = $('fd-content-card'); if (c) c.classList.remove('nav-revealed'); }
+  const { prev, next } = contentNavTargets();
+  const apply = (btn, target, label) => {
+    if (editing || !target) {
+      btn.classList.add('hidden');
+      btn.onclick = null;
+      btn.removeAttribute('title');
+    } else {
+      btn.classList.remove('hidden');
+      btn.title = label + ': ' + target.display_name;
+      btn.onclick = () => gotoFile(target.file_id);
+    }
+  };
+  apply(prevBtn, prev, '前へ');
+  apply(nextBtn, next, '次へ');
+}
+
+// タッチ端末（ホバー不可）はホバーでオーバーレイを出せないため、2 段階にする。
+// 1 段階目: コンテンツのタップでオーバーレイを表示（.nav-revealed をトグル）。
+// 2 段階目: 表示中のボタンのタップで遷移（ボタンの onclick に任せる）。
+// ホバー端末では CSS の group-hover が表示を担うので何もしない。
+function setupTouchNav() {
+  if (!window.matchMedia('(hover: none)').matches) return;
+  const card = $('fd-content-card');
+  if (!card) return;
+  card.addEventListener('click', (e) => {
+    if (e.target.closest('#fd-nav-prev, #fd-nav-next')) return;  // ボタンは遷移
+    if (!$('fd-editor').classList.contains('hidden')) return;    // 編集モード中は無効
+    card.classList.toggle('nav-revealed');
+  });
+}
+
+async function removeFromSeries(seriesId) {
+  const r = await api(`/api/series/${seriesId}/members/${fileId}`, { method: 'DELETE' });
+  if (!r.ok) { uiToast('シリーズからの取り外しに失敗しました', 'error'); return; }
+  uiToast('シリーズから外しました', 'success');
+  await loadFileSeries();
+}
+
+// 所属シリーズごとに「名前 + 位置」と『最初/前/次/最後』への遷移ボタンを描画する。
+// members はシリーズ内の順序どおり。端ではその方向のボタンを無効化する。
+function renderFileSeries(list) {
+  const box = $('fd-series-list');
+  if (!box) return;
+  if (!list || list.length === 0) { box.innerHTML = ''; return; }
+
+  box.innerHTML = list.map(s => {
+    const total = s.members.length;
+    const pos = s.position;            // 1 始まり。0 = 見つからない
+    const idx = pos - 1;
+    const atStart = pos <= 1;
+    const atEnd = pos <= 0 || pos >= total;
+    const first = total ? s.members[0] : null;
+    const prev  = idx > 0 ? s.members[idx - 1] : null;
+    const next  = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
+    const last  = total ? s.members[total - 1] : null;
+
+    const navBtn = (label, target, title, disabled) => {
+      if (disabled || !target) {
+        return `<button type="button" class="btn btn-xs join-item" disabled>${label}</button>`;
+      }
+      return `<button type="button" class="btn btn-xs join-item"
+                 title="${escapeHtml(title + ': ' + target.display_name)}"
+                 onclick="gotoFile('${target.file_id}')">${label}</button>`;
+    };
+
+    return `
+      <div class="rounded bg-base-200/60 px-2 py-1.5">
+        <div class="flex items-center justify-between gap-2">
+          <a href="/ui/files?series=${encodeURIComponent(s.id)}"
+             class="text-sm font-medium link link-hover truncate"
+             title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</a>
+          <div class="flex items-center gap-1 shrink-0">
+            <span class="text-xs opacity-60 tabular-nums">${pos} / ${total}</span>
+            <a href="/ui/series/${encodeURIComponent(s.id)}"
+               class="btn btn-xs btn-ghost btn-square"
+               title="シリーズ設定（並び替え・名称変更）">⚙</a>
+          </div>
+        </div>
+        <div class="flex items-center gap-1 mt-1.5">
+          <div class="join">
+            ${navBtn('«', first, '最初へ', atStart)}
+            ${navBtn('&lt;', prev, '前へ', atStart)}
+            ${navBtn('&gt;', next, '次へ', atEnd)}
+            ${navBtn('»', last, '最後へ', atEnd)}
+          </div>
+          <button type="button" class="btn btn-xs btn-ghost ml-auto"
+                  title="このシリーズから外す" onclick="removeFromSeries('${s.id}')">×</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function issueShare() {
+  const r = await uiPrompt({
+    title: '共有URLの発行', okText: '発行',
+    fields: [{ name: 'ttl', label: '有効期限 (秒)', type: 'number', value: '3600' }],
+  });
+  if (!r) return;
+  const ttl = parseInt(r.ttl, 10);
+  if (!ttl) { uiToast('有効期限を正しく入力してください', 'warning'); return; }
+  try {
+    const res = await json(`/api/files/${fileId}/share`, { method: 'POST', body: { ttl_secs: ttl } });
+    const fullUrl = location.origin + res.url;
+    $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${escapeHtml(fullUrl)}</a>`;
+    await uiCopyUrl(fullUrl, 'ファイル共有URL');
+  } catch (e) {
+    uiToast('共有URL発行に失敗しました: ' + e.message, 'error');
+  }
+}
+
+async function grantPermission() {
+  let users;
+  try { users = await json('/api/users'); }
+  catch (e) { uiToast('ユーザー取得に失敗しました', 'error'); return; }
+  if (users.length === 0) { uiToast('ユーザーが存在しません', 'warning'); return; }
+  $('perm-user').innerHTML = users.map(u =>
+    `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
+  $('perm-modal').showModal();
+}
+
+$('perm-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const sel = $('perm-user');
+  const userId = sel.value;
+  const uname = sel.options[sel.selectedIndex].text;
+  const mask = parseInt($('perm-mask').value, 10);
+  const allow = document.querySelector('input[name="perm-allow"]:checked').value === 'allow';
+  try {
+    await json('/api/acl', {
+      method: 'POST',
+      body: { subject: `user:${userId}`, target: `file:${fileId}`, mask, allow, priority: 10 },
+    });
+    $('perm-modal').close();
+    uiToast(`${uname} に ${allow ? '許可' : '拒否'} (mask=${mask}) を付与しました`, 'success');
+  } catch (err) {
+    uiToast('権限付与に失敗しました: ' + err.message, 'error');
+  }
+};
+$('perm-cancel').onclick = () => $('perm-modal').close();
+
+async function deleteFile() {
+  if (!await uiConfirm(`"${currentFile.display_name}" を削除しますか？`, { danger: true, okText: '削除' })) return;
+  const r = await api(`/api/files/${fileId}`, { method: 'DELETE' });
+  if (!r.ok) { uiToast('削除に失敗しました: ' + await r.text(), 'error'); return; }
+  location.href = '/ui/files';
+}
+
+init();
