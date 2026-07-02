@@ -36,6 +36,10 @@
 {% endblock %}
 
 {% block script %}
+<!-- 単一表示の共有メディアビュープラグイン（image/video/audio/pdf）。file_detail と共通。
+     base.html の共有 ViewRuntime に自己登録する。テキスト/不明はこのページ固有の
+     分割取得ビューアを使う。 -->
+<script src="/ui/plugins/viewer-media.js"></script>
 <script>
 const parts = location.pathname.split('/').filter(Boolean);
 // /ui/files/:id/histories/:cid → ['ui','files',':id','histories',':cid']
@@ -76,22 +80,9 @@ let twIgnoreScroll = 0;                // プログラム起因 scroll イベン
 let twPinBottom = false;               // 終端ジャンプ後、終端を表示し続ける
 let twScheduled = false;               // scroll の rAF スロットル
 
-// 拡張子 → MIME（mime 未設定ファイルのフォールバック）
-const EXT_MIME = {
-  png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif',
-  webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp', ico:'image/x-icon', avif:'image/avif',
-  mp4:'video/mp4', webm:'video/webm', ogv:'video/ogg', mov:'video/quicktime', m4v:'video/x-m4v', mkv:'video/x-matroska',
-  mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg', flac:'audio/flac', m4a:'audio/mp4', aac:'audio/aac',
-  pdf:'application/pdf',
-};
-// 拡張子だけでテキストと判断できるもの（mime 未設定でもプレビューする）
-const TEXT_EXT = new Set([
-  'txt','md','markdown','json','xml','html','htm','css','js','mjs','ts','tsx','jsx',
-  'csv','tsv','yaml','yml','toml','ini','cfg','conf','log','sh','bash','zsh','py',
-  'rs','go','c','h','cpp','hpp','cc','java','kt','rb','php','sql','svg',
-]);
-
-function extOf(name) { return (name.split('.').pop() || '').toLowerCase(); }
+// 拡張子 → MIME・種別判定（EXT_MIME/TEXT_EXT/extOf/mediaKind/viewerKind）は
+// file_detail.html と完全同一の実装だったため base.html の共有スクリプトへ一本化した
+// （判定ルールの変更が2箇所同時修正になり、片方だけ直すと乖離する問題への対処）。
 
 function fmtSize(n) {
   n = Number(n) || 0;
@@ -101,20 +92,24 @@ function fmtSize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
 }
 
-// content の表示種別を判定（mime 優先、なければ拡張子）
-function mediaKind(mime, name) {
-  const m = (mime || '').toLowerCase();
-  const ext = extOf(name);
-  if (m.startsWith('image/') || /^(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/.test(ext)) return 'image';
-  if (m.startsWith('video/') || /^(mp4|webm|ogv|mov|m4v|mkv)$/.test(ext)) return 'video';
-  if (m.startsWith('audio/') || /^(mp3|wav|ogg|oga|flac|m4a|aac)$/.test(ext)) return 'audio';
-  if (m === 'application/pdf' || ext === 'pdf') return 'pdf';
-  if (m.startsWith('text/') || /(json|xml|javascript|csv|yaml|x-sh)/.test(m) || TEXT_EXT.has(ext)) return 'text';
-  return 'unknown';
-}
-
 function effectiveMime() {
   return file.mime || EXT_MIME[extOf(file.display_name)] || 'application/octet-stream';
+}
+
+// 単一コミット表示も file_detail と同じ共有 ViewRuntime のビュープラグインで描画する。
+// メディアは共有 viewer-media.js が担い、テキスト/不明はこのページ固有の分割取得
+// ビューア（renderTextContent）を呼ぶ。kind 判定は mediaKind/viewerKind（base.html
+// 共有、mime/拡張子ベース。巨大ファイルでバイト取得を避けるため）。
+ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
+  await renderTextContent(cont, ctx.mediaKind);
+} });
+// メディアプラグインの object URL 生成は各ページが注入する。ここでは当該コミットの
+// content 全体を取得して Blob URL にする（Bearer 認証のため fetch + Blob）。
+function commitObjectUrlFor(mime) {
+  return api(contentPath).then(async r => {
+    if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+    return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: mime }));
+  });
 }
 
 // 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）
@@ -178,34 +173,15 @@ async function fetchUtf8ChunkProbe() {
   return { buf, total, text };
 }
 
-// content をデータ種別に応じた要素で描画する
+// content をビュープラグインで描画する（file_detail と同じ共有 ViewRuntime 経由）。
 async function renderContent() {
   const cont = $('fc-content');
   cont.innerHTML = '<span class="opacity-50 text-xs">読み込み中…</span>';
-  const kind = mediaKind(file.mime, file.display_name);
-  const mime = effectiveMime();
+  const mk = mediaKind(file.mime, file.display_name);
+  const plugin = ViewRuntime.getView(viewerKind(file.mime, file.display_name));
+  const ctx = { file, mime: effectiveMime(), mediaKind: mk, objectUrlFor: commitObjectUrlFor };
   try {
-    if (kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf') {
-      // メディアは全体を取得して object URL で描画（Bearer 認証のため fetch + Blob）。
-      const r = await api(contentPath);
-      if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
-      const url = URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: mime }));
-      if (kind === 'image') {
-        cont.innerHTML = `<img src="${url}" alt="${escapeHtml(file.display_name)}"
-          class="max-w-full max-h-[70vh] object-contain mx-auto block rounded bg-base-300/30">`;
-      } else if (kind === 'video') {
-        cont.innerHTML = `<video src="${url}" controls
-          class="max-w-full max-h-[70vh] mx-auto block rounded bg-black"></video>`;
-      } else if (kind === 'audio') {
-        cont.innerHTML = `<audio src="${url}" controls class="w-full mt-2"></audio>`;
-      } else {
-        cont.innerHTML = `<iframe src="${url}" title="${escapeHtml(file.display_name)}"
-          class="w-full h-[70vh] rounded border border-base-300"></iframe>`;
-      }
-    } else {
-      // text / unknown: 分割取得で表示（巨大ファイル対策）。
-      await renderTextContent(cont, kind);
-    }
+    await plugin.mount(cont, ctx);
   } catch (e) {
     cont.innerHTML = `<span class="text-error text-xs">コミット内容の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
   }

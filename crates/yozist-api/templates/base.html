@@ -317,6 +317,234 @@ async function uiCopyUrl(url, title) {
     }
   }
 }
+
+// ===========================================================================
+// 共有ビューヘルパ（ホスト基盤）。プラグインはこれらをページ実装ではなく
+// base.html の共有関数として参照する（ページへの依存を断つ）。ViewRuntime.host
+// にも束ねて、将来 ES モジュール化したときの注入点を明示しておく。
+// ===========================================================================
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+}
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+// コミット単位の mime は保持していないため、実バイトから種別を判定する。
+function sniffImageMime(b) {
+  if (b.length >= 4 && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47) return 'image/png';
+  if (b.length >= 3 && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF) return 'image/jpeg';
+  if (b.length >= 4 && b[0]===0x47 && b[1]===0x49 && b[2]===0x46 && b[3]===0x38) return 'image/gif';
+  if (b.length >= 12 && b[0]===0x52 && b[1]===0x49 && b[2]===0x46 && b[3]===0x46 &&
+      b[8]===0x57 && b[9]===0x45 && b[10]===0x42 && b[11]===0x50) return 'image/webp';
+  if (b.length >= 2 && b[0]===0x42 && b[1]===0x4D) return 'image/bmp';
+  if (b.length >= 4 && b[0]===0x00 && b[1]===0x00 && b[2]===0x01 && b[3]===0x00) return 'image/x-icon';
+  const head = new TextDecoder('utf-8', { fatal: false }).decode(b.subarray(0, 512)).toLowerCase();
+  if (head.includes('<svg')) return 'image/svg+xml';
+  return null;
+}
+// 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）。
+function bytesLookBinary(b) {
+  const lim = Math.min(b.length, 8192);
+  for (let i = 0; i < lim; i++) if (b[i] === 0) return true;
+  return false;
+}
+// デコード済みテキストが実質バイナリ（制御文字比率が高い）かを判定する。
+// bytesLookBinary（ヌルバイトのみ）より強い判定で、ヌルバイトを含まない非UTF-8の
+// 破損データも弾く。text-diff.js / table-csv.js のバイナリ拒否ガードで共有する。
+function looksBinaryText(s) {
+  if (s.indexOf('\u0000') !== -1) return true;
+  let ctrl = 0;
+  const lim = Math.min(s.length, 4096);
+  for (let i = 0; i < lim; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 9 || (c > 13 && c < 32)) ctrl++;
+  }
+  return ctrl > lim * 0.1;
+}
+// ガード付き LCS（キー配列の対応付け）。中間領域の DP 行列が大きすぎる場合は
+// ブロック置換へ降格し、メモリ/CPU 爆発を防ぐ。
+function lcsDiffKeyed(a, b) {
+  const n = a.length, m = b.length;
+  const dp = [];
+  for (let i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    const row = dp[i], next = dp[i + 1];
+    for (let j = m - 1; j >= 0; j--) {
+      row[j] = a[i] === b[j] ? next[j + 1] + 1 : (next[j] >= row[j + 1] ? next[j] : row[j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) ops.push({ t: '=', a: i++, b: j++ });
+    else if (dp[i + 1][j] >= dp[i][j + 1]) ops.push({ t: '-', a: i++ });
+    else ops.push({ t: '+', b: j++ });
+  }
+  while (i < n) ops.push({ t: '-', a: i++ });
+  while (j < m) ops.push({ t: '+', b: j++ });
+  return ops;
+}
+// oldKeys/newKeys（比較用キー文字列の配列）から差分セグメント列を作る。
+// 共通プレフィックス/サフィックスを O(N) で除き、変化した中間だけ LCS で対応付ける。
+// 中間が大きすぎる（maxProduct 超）ならブロック置換に降格し、変更行数も
+// maxChangeRows で切り詰める（DOM・メモリ保護）。text-diff.js / table-csv.js で共有。
+// セグメントは「行そのもの」を持たず oldKeys/newKeys 上のインデックスだけを持つ。
+// 呼び出し側が索引を実データ（行テキストや行配列）に写像して描画する。
+function diffKeyed(oldKeys, newKeys, opts) {
+  const maxProduct = (opts && opts.maxProduct) || 4_000_000;
+  const maxChangeRows = (opts && opts.maxChangeRows) || 1000;
+  const n = oldKeys.length, m = newKeys.length;
+  const minLen = Math.min(n, m);
+  let p = 0;
+  while (p < minLen && oldKeys[p] === newKeys[p]) p++;
+  let s = 0;
+  while (s < minLen - p && oldKeys[n - 1 - s] === newKeys[m - 1 - s]) s++;
+
+  const segs = [];
+  let added = 0, removed = 0, coarse = false;
+  if (p > 0) segs.push({ type: 'equal', ao: 0, bo: 0, count: p });
+  const oMid = n - s - p, nMid = m - s - p;
+  if (oMid > 0 || nMid > 0) {
+    if (oMid * nMid > maxProduct) {
+      coarse = true;
+      const capD = Math.min(oMid, maxChangeRows), capA = Math.min(nMid, maxChangeRows);
+      const dels = [], adds = [];
+      for (let i = 0; i < capD; i++) dels.push(p + i);
+      for (let j = 0; j < capA; j++) adds.push(p + j);
+      segs.push({ type: 'change', dels, adds, moreDels: oMid - capD, moreAdds: nMid - capA });
+      removed += oMid; added += nMid;
+    } else {
+      const ops = lcsDiffKeyed(oldKeys.slice(p, n - s), newKeys.slice(p, m - s));
+      let i = 0;
+      while (i < ops.length) {
+        if (ops[i].t === '=') {
+          const ao = ops[i].a + p, bo = ops[i].b + p;
+          let count = 0;
+          while (i < ops.length && ops[i].t === '=') { count++; i++; }
+          segs.push({ type: 'equal', ao, bo, count });
+        } else {
+          const dels = [], adds = [];
+          while (i < ops.length && ops[i].t !== '=') {
+            if (ops[i].t === '-') { dels.push(ops[i].a + p); removed++; }
+            else { adds.push(ops[i].b + p); added++; }
+            i++;
+          }
+          segs.push({ type: 'change', dels, adds });
+        }
+      }
+    }
+  }
+  if (s > 0) segs.push({ type: 'equal', ao: n - s, bo: m - s, count: s });
+  return { segs, added, removed, coarse };
+}
+// 画像情報（object URL・寸法）。Bearer 認証のため <img src> 直参照ができず Blob を使う。
+const imgInfoCache = new Map(); // key(commitId) → { url, bytes, size, width, height }
+function loadImageMeta(url) {
+  return new Promise(resolve => {
+    const im = new Image();
+    im.onload = () => resolve({ width: im.naturalWidth, height: im.naturalHeight });
+    im.onerror = () => resolve({ width: 0, height: 0 });
+    im.src = url;
+  });
+}
+async function imageInfo(key, bytes, mime) {
+  if (key != null && imgInfoCache.has(key)) return imgInfoCache.get(key);
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
+  const meta = await loadImageMeta(url);
+  const info = { url, bytes, size: bytes.length, width: meta.width, height: meta.height };
+  if (key != null) imgInfoCache.set(key, info);
+  return info;
+}
+
+// ---------------------------------------------------------------------------
+// 単一表示（file_detail / file_commit）用の種別判定。両ページで完全に同一の実装を
+// 持っていた（判定ルールの変更に2箇所同時修正が必要だった）ため、ここに一本化する。
+// ---------------------------------------------------------------------------
+// 拡張子 → MIME（mime 未設定ファイルのフォールバック）
+const EXT_MIME = {
+  png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif',
+  webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp', ico:'image/x-icon', avif:'image/avif',
+  mp4:'video/mp4', webm:'video/webm', ogv:'video/ogg', mov:'video/quicktime', m4v:'video/x-m4v', mkv:'video/x-matroska',
+  mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg', flac:'audio/flac', m4a:'audio/mp4', aac:'audio/aac',
+  pdf:'application/pdf',
+};
+// 拡張子だけでテキストと判断できるもの（mime 未設定でもプレビューする）
+const TEXT_EXT = new Set([
+  'txt','md','markdown','json','xml','html','htm','css','js','mjs','ts','tsx','jsx',
+  'csv','tsv','yaml','yml','toml','ini','cfg','conf','log','sh','bash','zsh','py',
+  'rs','go','c','h','cpp','hpp','cc','java','kt','rb','php','sql','svg',
+]);
+function extOf(name) { return (name || '').split('.').pop().toLowerCase(); }
+// content の表示種別を判定（mime 優先、なければ拡張子）
+function mediaKind(mime, name) {
+  const m = (mime || '').toLowerCase();
+  const ext = extOf(name);
+  if (m.startsWith('image/') || /^(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/.test(ext)) return 'image';
+  if (m.startsWith('video/') || /^(mp4|webm|ogv|mov|m4v|mkv)$/.test(ext)) return 'video';
+  if (m.startsWith('audio/') || /^(mp3|wav|ogg|oga|flac|m4a|aac)$/.test(ext)) return 'audio';
+  if (m === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (m.startsWith('text/') || /(json|xml|javascript|csv|yaml|x-sh)/.test(m) || TEXT_EXT.has(ext)) return 'text';
+  return 'unknown';
+}
+// mediaKind を ViewRuntime のビュー種別（ViewKind）名へ写像する。単一表示は巨大
+// ファイルでのバイト取得を避けるため mime/拡張子だけで判定する（compare の
+// resolveModel とは異なり、内容スニッフィングは行わない）。
+function viewerKind(mime, name) {
+  switch (mediaKind(mime, name)) {
+    case 'image': return 'core/image';
+    case 'video': return 'media/video';
+    case 'audio': return 'media/audio';
+    case 'pdf':   return 'doc/pdf';
+    default:      return 'core/text'; // text / unknown（バイナリ判定は描画側）
+  }
+}
+
+// ===========================================================================
+// ビュー／変換プラグイン基盤の共有ランタイム（docs/plugin-view-system.md）。
+//   生バイト ──(変換プラグイン)──▶ ViewModel ──(ビュープラグイン)──▶ 表示/差分
+// ビュー（表示=mount / 差分=diff）と変換（形式→ViewModel）の登録・解決だけを担う
+// 純粋なレジストリ。DOM には触れない。各ページが必要なプラグインを登録して使う
+// （比較ページは diff、ファイル詳細は mount）。プラグイン未使用のページでは何も
+// しない（不活性）。新形式は変換＋ビューの登録だけで増やせる。
+const ViewRuntime = (() => {
+  const views = new Map();   // kind → ViewPlugin
+  const converters = [];     // フロント変換（順に detect、先勝ち）
+  function registerView(p) { views.set(p.kind, p); }
+  function registerConverter(c) { converters.push(c); }
+  function hasView(kind) { return views.has(kind); }
+  function getView(kind) { return views.get(kind) || views.get('core/binary'); }
+  // 生バイト → ViewModel。フロント変換を先勝ちで適用し、無ければ core/binary へ。
+  // 重い形式は将来 GET …/commits/:cid/view（X-View-Kind）でバックエンド変換へ
+  // 委譲する。その差し替え口がここ。
+  async function resolveModel(bytes, hint) {
+    hint = hint || {};
+    for (const c of converters) {
+      if (c.detect(bytes, hint)) {
+        const m = await c.convert(bytes, hint);
+        m.id = hint.id;
+        return m;
+      }
+    }
+    return { kind: 'core/binary', payload: bytes,
+             contentType: (hint.mime || 'application/octet-stream'), meta: {}, id: hint.id };
+  }
+  return { registerView, registerConverter, hasView, getView, resolveModel, views };
+})();
+// プラグインが参照する共有ヘルパ（注入点）。外部ファイルのプラグインは
+// ページ実装ではなくこのホスト基盤に依存する。
+ViewRuntime.host = {
+  escapeHtml, decodeBytes, $, fmtSize, bytesEqual,
+  sniffImageMime, bytesLookBinary, looksBinaryText, diffKeyed, imageInfo, loadImageMeta,
+  mediaKind, viewerKind,
+};
+// 外部プラグイン（/ui/plugins/*.js）からも参照できるよう公開する。
+window.ViewRuntime = ViewRuntime;
 </script>
 {% block script %}{% endblock %}
 </body>

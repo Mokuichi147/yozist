@@ -119,17 +119,9 @@
       <div class="flex items-center justify-between flex-wrap gap-2 mt-3">
         <div id="cmp-stats" class="text-xs"></div>
         <div class="flex items-center gap-2">
-          <span class="text-xs opacity-60">表示</span>
-          <div id="text-views" class="join">
-            <button id="view-unified" class="btn btn-xs join-item btn-active">unified</button>
-            <button id="view-split" class="btn btn-xs join-item">split</button>
-          </div>
-          <div id="image-views" class="join hidden">
-            <button id="view-side" class="btn btn-xs join-item btn-active">並べて</button>
-            <button id="view-swipe" class="btn btn-xs join-item">スライダー</button>
-            <button id="view-onion" class="btn btn-xs join-item">重ね合わせ</button>
-            <button id="view-diff" class="btn btn-xs join-item">差分</button>
-          </div>
+          <span id="view-modes-label" class="text-xs opacity-60 hidden">表示</span>
+          <!-- 表示モード切替はビュープラグインの diff.modes から汎用生成する -->
+          <div id="view-modes" class="join hidden"></div>
         </div>
       </div>
 
@@ -143,7 +135,25 @@
 {% endblock %}
 
 {% block script %}
+<!-- 差分ビュープラグインは個別ファイルとして配信し、ここで読み込む（/ui/plugins/*）。
+     各プラグインは IIFE で内部スコープを隔離し、base.html の共有 ViewRuntime に
+     自己登録する。コア（このページ）を改変せず、ファイル追加＋登録だけで増やせる。
+     classic script を順に読むため、下の本体スクリプトが走る前に登録が完了する。 -->
+<script src="/ui/plugins/text-diff.js"></script>
+<script src="/ui/plugins/image-diff.js"></script>
+<script src="/ui/plugins/binary-meta.js"></script>
+<!-- 拡張例: CSV/TSV をテーブルとしてセル単位で差分表示する追加プラグイン。
+     コア（このページ）を改変せず、ファイル追加＋登録だけで新ビュー種別が増える。 -->
+<script src="/ui/plugins/table-csv.js"></script>
 <script>
+// ===========================================================================
+// 比較ページ。ビュー／変換プラグイン基盤（docs/plugin-view-system.md）で駆動する。
+//   生バイト ──(変換プラグイン)──▶ ViewModel ──(ビュープラグイン)──▶ 差分描画
+// 種別判定・差分・画像描画はすべてプラグインに閉じ込め、ページ側は
+//   「2 コミットを解決 → 種別が一致すれば該当ビューへ、不一致ならメタ比較へ」
+// というオーケストレーションだけを担う。新形式は変換＋ビューの登録で増やせる。
+// ===========================================================================
+
 const parts = location.pathname.split('/').filter(Boolean);
 // /ui/files/:id/compare → ['ui','files',':id','compare']
 const fileId = parts[2];
@@ -151,58 +161,23 @@ const qs = new URLSearchParams(location.search);
 
 let history = [];
 let currentCommitId = null;
-let fileCharset = null; // 元エンコーディング。/commits 本文のデコードに使う。
-let viewMode = 'unified';
-const bytesCache = new Map(); // commitId → Uint8Array（生バイト。デコード/種別判定の共通源）
-const expanded = new Set(); // 展開済みの equal セグメント index
-
-// --- 画像差分 ---
-let imgMode = 'side';       // side | swipe | onion | diff
-let imgState = null;        // 直近に取得した {old, new} 画像情報（モード切替時の再描画用）
-const imgCache = new Map(); // commitId → { url, bytes, size, width, height }
-
-// コミット単位の mime はメタに保持していない（content の Content-Type も常に
-// 最新ファイルの mime になる）ため、各コミットの実バイトから種別を判定する。
-// これにより「内容を更新」で形式が変わっても旧/新を正しく扱える。
-function sniffImageMime(b) {
-  if (b.length >= 4 && b[0]===0x89 && b[1]===0x50 && b[2]===0x4E && b[3]===0x47) return 'image/png';
-  if (b.length >= 3 && b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF) return 'image/jpeg';
-  if (b.length >= 4 && b[0]===0x47 && b[1]===0x49 && b[2]===0x46 && b[3]===0x38) return 'image/gif';
-  if (b.length >= 12 && b[0]===0x52 && b[1]===0x49 && b[2]===0x46 && b[3]===0x46 &&
-      b[8]===0x57 && b[9]===0x45 && b[10]===0x42 && b[11]===0x50) return 'image/webp';
-  if (b.length >= 2 && b[0]===0x42 && b[1]===0x4D) return 'image/bmp';
-  if (b.length >= 4 && b[0]===0x00 && b[1]===0x00 && b[2]===0x01 && b[3]===0x00) return 'image/x-icon';
-  // SVG はテキストなのでマジックナンバーが無い。先頭付近に <svg があれば画像扱い。
-  const head = new TextDecoder('utf-8', { fatal: false }).decode(b.subarray(0, 512)).toLowerCase();
-  if (head.includes('<svg')) return 'image/svg+xml';
-  return null;
-}
-// 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）。
-function bytesLookBinary(b) {
-  const lim = Math.min(b.length, 8192);
-  for (let i = 0; i < lim; i++) if (b[i] === 0) return true;
-  return false;
-}
-function commitKind(bytes, imgMime) {
-  if (imgMime) return 'image';
-  return bytesLookBinary(bytes) ? 'binary' : 'text';
-}
-function fmtSize(n) {
-  n = Number(n) || 0;
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
-  return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
-}
-function bytesEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
+let fileCharset = null; // 元エンコーディング。テキスト payload のデコードに使う。
+// 表示名。変換プラグインが拡張子で種別判定する「候補の絞り込み」に使う。
+// 注意: これは現行の display_name であり、コミットごとの実ファイル名ではない。
+// リネームされたファイルを比較すると、旧コミット側にも新しい拡張子のヒントが渡る
+// （例: report.txt → report.csv 後に旧コミットを見ると .csv が渡る）。拡張子だけで
+// 種別を確定させると、旧コミットの散文テキストが誤って表形式と解釈されうるため、
+// 拡張子ベース判定を行うプラグイン（例: table-csv.js）は必ず内容も検証すること。
+let fileName = null;
+const bytesCache = new Map(); // commitId → Uint8Array（生バイト。変換/種別判定の共通源）
 
 const detailUrl = '/ui/files/' + fileId;
 $('back-detail').href = detailUrl;
 $('back-link').href = detailUrl;
+
+// ---------------------------------------------------------------------------
+// 共有ユーティリティ
+// ---------------------------------------------------------------------------
 
 async function fetchBytes(commitId) {
   if (bytesCache.has(commitId)) return bytesCache.get(commitId);
@@ -213,401 +188,66 @@ async function fetchBytes(commitId) {
   return bytes;
 }
 
-function looksBinary(s) {
-  if (s.indexOf('\u0000') !== -1) return true;
-  // 制御文字 (タブ/改行/復帰を除く) が多ければバイナリ扱い
-  let ctrl = 0;
-  const lim = Math.min(s.length, 4096);
-  for (let i = 0; i < lim; i++) {
-    const c = s.charCodeAt(i);
-    if (c < 9 || (c > 13 && c < 32)) ctrl++;
-  }
-  return ctrl > lim * 0.1;
-}
+// ===========================================================================
+// ビュー・ランタイムは base.html の共有 ViewRuntime を使う（このページは差分=diff）。
+// 比較ページはここで「変換プラグイン」と「差分対応ビュープラグイン」を登録する。
+// ===========================================================================
 
-// --- LCS ベースの行/文字差分 ---
-function lcsDiff(a, b) {
-  const n = a.length, m = b.length;
-  const dp = [];
-  for (let i = 0; i <= n; i++) dp.push(new Int32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) {
-    const row = dp[i], next = dp[i + 1];
-    for (let j = m - 1; j >= 0; j--) {
-      row[j] = a[i] === b[j] ? next[j + 1] + 1 : (next[j] >= row[j + 1] ? next[j] : row[j + 1]);
-    }
-  }
-  const ops = [];
-  let i = 0, j = 0;
-  while (i < n && j < m) {
-    if (a[i] === b[j]) ops.push({ t: '=', a: i++, b: j++ });
-    else if (dp[i + 1][j] >= dp[i][j + 1]) ops.push({ t: '-', a: i++ });
-    else ops.push({ t: '+', b: j++ });
-  }
-  while (i < n) ops.push({ t: '-', a: i++ });
-  while (j < m) ops.push({ t: '+', b: j++ });
-  return ops;
-}
+// ---- フロント変換（core 種別はすべて恒等変換）----------------------------
+// 画像はマジックナンバーで厳密に判定できるため先に試し、次にテキスト。
+ViewRuntime.registerConverter({
+  converterId: 'core/image', targetView: 'core/image',
+  detect: (bytes) => !!sniffImageMime(bytes),
+  convert: (bytes) => ({ kind: 'core/image', payload: bytes,
+                         contentType: sniffImageMime(bytes) || 'application/octet-stream', meta: {} }),
+});
+ViewRuntime.registerConverter({
+  converterId: 'core/text', targetView: 'core/text',
+  detect: (bytes) => !bytesLookBinary(bytes),
+  convert: (bytes) => ({ kind: 'core/text', payload: bytes, contentType: 'text/plain', meta: {} }),
+});
 
-// 1 行ペアの語句単位ハイライト
-function inlineDiff(oldStr, newStr) {
-  if (oldStr.length > 400 || newStr.length > 400) {
-    return {
-      oldHtml: `<span class="diff-del-inline">${escapeHtml(oldStr)}</span>`,
-      newHtml: `<span class="diff-add-inline">${escapeHtml(newStr)}</span>`,
-    };
-  }
-  const ops = lcsDiff([...oldStr], [...newStr]);
-  let oldHtml = '', newHtml = '';
-  let i = 0;
-  while (i < ops.length) {
-    const t = ops[i].t;
-    let buf = '';
-    while (i < ops.length && ops[i].t === t) {
-      buf += t === '+' ? newStr[ops[i].b] : (t === '-' ? oldStr[ops[i].a] : oldStr[ops[i].a]);
-      i++;
-    }
-    const esc = escapeHtml(buf);
-    if (t === '=') { oldHtml += esc; newHtml += esc; }
-    else if (t === '-') { oldHtml += `<span class="diff-del-inline">${esc}</span>`; }
-    else { newHtml += `<span class="diff-add-inline">${esc}</span>`; }
-  }
-  return { oldHtml, newHtml };
-}
+// ===========================================================================
+// ページのオーケストレーション
+// ===========================================================================
+let curPlugin = null, curOld = null, curNew = null;
+const curMode = {}; // kind → 選択中モード id（種別ごとに保持）
 
-// 中間領域に LCS を許す上限（行数の積）。これを超えるとブロック置換へ降格する。
-const LCS_MAX_PRODUCT = 4_000_000;
-// ブロック置換表示の上限行数（DOM 保護。超過分は省略行で示す）。
-const MAX_CHANGE_ROWS = 1000;
-
-// 行差分をセグメント列にする。まず共通プレフィックス/サフィックスを O(N) で除き、
-// 変化した中間だけを LCS で対応付ける。部分編集では中間が小さいため、巨大ファイル
-// でも詳細な差分を表示できる。中間も巨大な場合は LCS を諦めてブロック置換
-// （全削除+全追加）として必ず何らかの差分を表示する（拒否しない）。
-// equal セグメントは行を materialize せず {ao, bo, count} で持つ（メモリ保護）。
-function diffSegments(oldLines, newLines) {
-  const n = oldLines.length, m = newLines.length;
-  const minLen = Math.min(n, m);
-  let p = 0;
-  while (p < minLen && oldLines[p] === newLines[p]) p++;
-  let s = 0;
-  while (s < minLen - p && oldLines[n - 1 - s] === newLines[m - 1 - s]) s++;
-
-  const segs = [];
-  let added = 0, removed = 0, coarse = false;
-  if (p > 0) segs.push({ type: 'equal', ao: 0, bo: 0, count: p });
-  const oMid = n - s - p, nMid = m - s - p;
-  if (oMid > 0 || nMid > 0) {
-    if (oMid * nMid > LCS_MAX_PRODUCT) {
-      coarse = true;
-      const dels = [], adds = [];
-      const capD = Math.min(oMid, MAX_CHANGE_ROWS), capA = Math.min(nMid, MAX_CHANGE_ROWS);
-      for (let i = 0; i < capD; i++) dels.push({ old: p + i, text: oldLines[p + i] });
-      for (let j = 0; j < capA; j++) adds.push({ new: p + j, text: newLines[p + j] });
-      segs.push({ type: 'change', dels, adds, moreDels: oMid - capD, moreAdds: nMid - capA });
-      removed += oMid;
-      added += nMid;
-    } else {
-      const ops = lcsDiff(oldLines.slice(p, n - s), newLines.slice(p, m - s));
-      let i = 0;
-      while (i < ops.length) {
-        if (ops[i].t === '=') {
-          const ao = ops[i].a + p, bo = ops[i].b + p;
-          let count = 0;
-          while (i < ops.length && ops[i].t === '=') { count++; i++; }
-          segs.push({ type: 'equal', ao, bo, count });
-        } else {
-          const dels = [], adds = [];
-          while (i < ops.length && ops[i].t !== '=') {
-            if (ops[i].t === '-') { dels.push({ old: ops[i].a + p, text: oldLines[ops[i].a + p] }); removed++; }
-            else { adds.push({ new: ops[i].b + p, text: newLines[ops[i].b + p] }); added++; }
-            i++;
-          }
-          segs.push({ type: 'change', dels, adds });
-        }
-      }
-    }
-  }
-  if (s > 0) segs.push({ type: 'equal', ao: n - s, bo: m - s, count: s });
-  return { segs, added, removed, coarse };
-}
-
-const CONTEXT = 3;
-// equal 領域の展開上限。これを超える領域は展開ボタンを出さない（DOM 保護）。
-const MAX_EXPAND = 5000;
-
-function gapRow(count, segIdx) {
-  if (count > MAX_EXPAND) {
-    return `<tr class="diff-gap-static"><td colspan="4">⋯ ${count} 行（大きすぎるため展開省略）</td></tr>`;
-  }
-  return `<tr class="diff-gap" data-seg="${segIdx}">
-    <td colspan="4">⋯ ${count} 行を展開</td></tr>`;
-}
-// 変更セグメントの省略表示（ブロック置換の上限超過分）。
-function changeMoreRow(seg) {
-  if (!seg.moreDels && !seg.moreAdds) return '';
-  return `<tr class="diff-gap-static"><td colspan="4">⋯ 変更が大きいため残り ` +
-    `-${seg.moreDels || 0} / +${seg.moreAdds || 0} 行は省略</td></tr>`;
-}
-
-// equal セグメントの k 行目を組み立てる（行は materialize していない）。
-function equalLine(seg, k) {
-  return { old: seg.ao + k, new: seg.bo + k, text: lastOldLines[seg.ao + k] };
-}
-
-function renderEqualUnified(seg, segIdx, isFirst, isLast) {
-  const count = seg.count;
-  const full = expanded.has(segIdx) || count <= CONTEXT * 2 + 1;
-  let out = '';
-  const lineRow = ln =>
-    `<tr><td class="diff-ln">${ln.old + 1}</td><td class="diff-ln">${ln.new + 1}</td>` +
-    `<td class="diff-marker"> </td><td class="diff-code">${escapeHtml(ln.text)}</td></tr>`;
-  if (full) {
-    for (let k = 0; k < count; k++) out += lineRow(equalLine(seg, k));
-    return out;
-  }
-  const head = isFirst ? 0 : CONTEXT;
-  const tail = isLast ? 0 : CONTEXT;
-  for (let k = 0; k < head; k++) out += lineRow(equalLine(seg, k));
-  const hidden = count - head - tail;
-  if (hidden > 0) out += gapRow(hidden, segIdx);
-  for (let k = count - tail; k < count; k++) out += lineRow(equalLine(seg, k));
-  return out;
-}
-
-function renderChangeUnified(seg) {
-  let out = '';
-  const max = Math.max(seg.dels.length, seg.adds.length);
-  for (let k = 0; k < max; k++) {
-    const d = seg.dels[k], a = seg.adds[k];
-    let dHtml, aHtml;
-    if (d && a) { const r = inlineDiff(d.text, a.text); dHtml = r.oldHtml; aHtml = r.newHtml; }
-    else { dHtml = d ? escapeHtml(d.text) : null; aHtml = a ? escapeHtml(a.text) : null; }
-    if (d) out += `<tr class="diff-del"><td class="diff-ln">${d.old + 1}</td>` +
-      `<td class="diff-ln"></td><td class="diff-marker">-</td><td class="diff-code">${dHtml}</td></tr>`;
-    if (a) out += `<tr class="diff-add"><td class="diff-ln"></td>` +
-      `<td class="diff-ln">${a.new + 1}</td><td class="diff-marker">+</td><td class="diff-code">${aHtml}</td></tr>`;
-  }
-  out += changeMoreRow(seg);
-  return out;
-}
-
-function renderEqualSplit(seg, segIdx, isFirst, isLast) {
-  const count = seg.count;
-  const full = expanded.has(segIdx) || count <= CONTEXT * 2 + 1;
-  let out = '';
-  const lineRow = ln =>
-    `<tr><td class="diff-ln">${ln.old + 1}</td><td class="diff-code">${escapeHtml(ln.text)}</td>` +
-    `<td class="diff-ln">${ln.new + 1}</td><td class="diff-code">${escapeHtml(ln.text)}</td></tr>`;
-  if (full) {
-    for (let k = 0; k < count; k++) out += lineRow(equalLine(seg, k));
-    return out;
-  }
-  const head = isFirst ? 0 : CONTEXT;
-  const tail = isLast ? 0 : CONTEXT;
-  for (let k = 0; k < head; k++) out += lineRow(equalLine(seg, k));
-  const hidden = count - head - tail;
-  if (hidden > 0) out += gapRow(hidden, segIdx);
-  for (let k = count - tail; k < count; k++) out += lineRow(equalLine(seg, k));
-  return out;
-}
-
-function renderChangeSplit(seg) {
-  let out = '';
-  const max = Math.max(seg.dels.length, seg.adds.length);
-  for (let k = 0; k < max; k++) {
-    const d = seg.dels[k], a = seg.adds[k];
-    let dHtml, aHtml;
-    if (d && a) { const r = inlineDiff(d.text, a.text); dHtml = r.oldHtml; aHtml = r.newHtml; }
-    else { dHtml = d ? escapeHtml(d.text) : ''; aHtml = a ? escapeHtml(a.text) : ''; }
-    const left = d
-      ? `<td class="diff-ln">${d.old + 1}</td><td class="diff-code diff-del">${dHtml}</td>`
-      : `<td class="diff-ln diff-empty"></td><td class="diff-code diff-empty"></td>`;
-    const right = a
-      ? `<td class="diff-ln">${a.new + 1}</td><td class="diff-code diff-add">${aHtml}</td>`
-      : `<td class="diff-ln diff-empty"></td><td class="diff-code diff-empty"></td>`;
-    out += `<tr>${left}${right}</tr>`;
-  }
-  out += changeMoreRow(seg);
-  return out;
-}
-
-function renderDiff(segs) {
-  let body = '';
-  segs.forEach((seg, idx) => {
-    const isFirst = idx === 0, isLast = idx === segs.length - 1;
-    if (viewMode === 'unified') {
-      body += seg.type === 'equal'
-        ? renderEqualUnified(seg, idx, isFirst, isLast)
-        : renderChangeUnified(seg);
-    } else {
-      body += seg.type === 'equal'
-        ? renderEqualSplit(seg, idx, isFirst, isLast)
-        : renderChangeSplit(seg);
-    }
-  });
-  const colgroup = viewMode === 'unified'
-    ? `<colgroup><col style="width:3rem"><col style="width:3rem"><col style="width:1.5rem"><col></colgroup>`
-    : `<colgroup><col style="width:3rem"><col style="width:calc(50% - 3rem)"><col style="width:3rem"><col></colgroup>`;
-  $('cmp-diff').innerHTML = `<table class="diff-table">${colgroup}${body}</table>`;
-  $('cmp-diff').querySelectorAll('.diff-gap').forEach(el => {
-    el.onclick = () => { expanded.add(parseInt(el.dataset.seg, 10)); renderDiff(segs); };
-  });
-}
-
-// --- 画像差分の取得・描画 ---
-
-function loadImageMeta(url) {
-  return new Promise(resolve => {
-    const im = new Image();
-    im.onload = () => resolve({ width: im.naturalWidth, height: im.naturalHeight });
-    im.onerror = () => resolve({ width: 0, height: 0 });
-    im.src = url;
-  });
-}
-
-// 取得済みバイトと sniff した mime から画像情報（object URL・寸法）を組み立てる。
-// Bearer 認証のため <img src> で直接参照できず、Blob + object URL を使う。
-async function imageInfo(commitId, bytes, mime) {
-  if (imgCache.has(commitId)) return imgCache.get(commitId);
-  const url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
-  const meta = await loadImageMeta(url);
-  const info = { url, bytes, size: bytes.length, width: meta.width, height: meta.height };
-  imgCache.set(commitId, info);
-  return info;
-}
-
-function imgStageStyle(o, n) {
-  const w = Math.max(o.width, n.width) || 800;
-  const h = Math.max(o.height, n.height) || 600;
-  return `width:${w}px;aspect-ratio:${w}/${h};`;
-}
-
-function renderImgSide(cont, o, n) {
-  cont.innerHTML = `
-    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 p-3">
-      <div class="img-checker rounded p-1">
-        <img src="${o.url}" class="img-side-img" alt="旧">
-      </div>
-      <div class="img-checker rounded p-1">
-        <img src="${n.url}" class="img-side-img" alt="新">
-      </div>
-    </div>`;
-}
-
-function renderImgSwipe(cont, o, n) {
-  cont.innerHTML = `
-    <div class="p-3 space-y-2">
-      <div id="img-stage" class="img-stage img-swipe img-checker rounded" style="${imgStageStyle(o, n)}">
-        <img id="img-old" src="${o.url}" alt="旧">
-        <img id="img-new" src="${n.url}" alt="新">
-        <div id="img-handle" class="img-handle" style="left:50%;"></div>
-        <span class="img-tag diff-del" style="left:0.25rem;">旧</span>
-        <span class="img-tag diff-add" style="right:0.25rem;">新</span>
-      </div>
-      <p class="text-xs opacity-60">境界線をドラッグして旧/新を切り替えます。</p>
-    </div>`;
-  const stage = $('img-stage'), oldEl = $('img-old'), newEl = $('img-new'), handle = $('img-handle');
-  const apply = v => {
-    v = Math.max(0, Math.min(100, v));
-    // 旧と新を重ねず境界線で左右に切り分ける。重ねると透過画像で下の画像が
-    // 透けてしまうため、それぞれを自分の側だけに描画し透過部分は市松模様を見せる。
-    oldEl.style.clipPath = `inset(0 ${100 - v}% 0 0)`;
-    newEl.style.clipPath = `inset(0 0 0 ${v}%)`;
-    handle.style.left = v + '%';
-  };
-  const posFromEvent = e => {
-    const rect = stage.getBoundingClientRect();
-    return ((e.clientX - rect.left) / rect.width) * 100;
-  };
-  let dragging = false;
-  stage.addEventListener('pointerdown', e => {
-    dragging = true;
-    stage.setPointerCapture(e.pointerId);
-    apply(posFromEvent(e));
-    e.preventDefault();
-  });
-  stage.addEventListener('pointermove', e => { if (dragging) apply(posFromEvent(e)); });
-  const stop = e => {
-    if (!dragging) return;
-    dragging = false;
-    try { stage.releasePointerCapture(e.pointerId); } catch (_) {}
-  };
-  stage.addEventListener('pointerup', stop);
-  stage.addEventListener('pointercancel', stop);
-  apply(50);
-}
-
-function renderImgOnion(cont, o, n) {
-  cont.innerHTML = `
-    <div class="p-3 space-y-2">
-      <div class="img-stage img-checker rounded" style="${imgStageStyle(o, n)}">
-        <img id="img-old" src="${o.url}" alt="旧" style="opacity:0.5;">
-        <img id="img-new" src="${n.url}" alt="新" style="opacity:0.5;">
-      </div>
-      <input id="img-range" type="range" min="0" max="100" value="50" class="range range-xs range-primary">
-      <div class="flex justify-between text-xs">
-        <span class="diff-del px-1 rounded">旧</span>
-        <span class="diff-add px-1 rounded">新</span>
-      </div>
-    </div>`;
-  const range = $('img-range'), oldEl = $('img-old'), newEl = $('img-new');
-  // クロスフェード: 新を v、旧を 1-v にする。重ねた不透明度合算ではなく
-  // 一方を振り切れば他方が消えるため、透過画像でも下の画像が残らない。
-  range.oninput = () => {
-    const v = +range.value / 100;
-    newEl.style.opacity = v.toFixed(2);
-    oldEl.style.opacity = (1 - v).toFixed(2);
-  };
-}
-
-function renderImgDiff(cont, o, n) {
-  // 黒背景に新画像を mix-blend-mode:difference で重ねる。一致部分は黒く沈み、
-  // 変化した画素だけが明るく浮かび上がる。
-  cont.innerHTML = `
-    <div class="p-3 space-y-2">
-      <div class="img-stage rounded" style="${imgStageStyle(o, n)}background:#000;">
-        <img src="${o.url}" alt="旧">
-        <img src="${n.url}" alt="新" style="mix-blend-mode:difference;">
-      </div>
-      <p class="text-xs opacity-60">明るい部分が変化した画素です（一致部分は黒）。</p>
-    </div>`;
-}
-
-function renderImageDiff(o, n) {
-  imgState = { old: o, new: n };
-  const cont = $('cmp-diff');
-  const same = bytesEqual(o.bytes, n.bytes);
-  const dim = im => im.width ? `${im.width}×${im.height}` : '—';
-
-  if (same) {
-    $('cmp-stats').innerHTML = '<span class="opacity-60">差分はありません</span>';
-  } else {
-    $('cmp-stats').innerHTML =
-      `<span class="opacity-60">寸法</span> ` +
-      `<span class="font-mono">${dim(o)}</span> → <span class="font-mono">${dim(n)}</span>` +
-      `<span class="opacity-60 ml-3">サイズ</span> ` +
-      `<span class="text-error font-semibold">${fmtSize(o.size)}</span> → ` +
-      `<span class="text-success font-semibold">${fmtSize(n.size)}</span>`;
-  }
-
-  if (same) {
-    cont.innerHTML = `<div class="img-checker p-3 rounded">` +
-      `<img src="${o.url}" class="img-side-img" alt=""></div>`;
+// プラグインの diff.modes から表示モード切替ツールバーを汎用生成する。
+function buildModeToolbar(plugin) {
+  const box = $('view-modes'), label = $('view-modes-label');
+  const modes = (plugin.diff && plugin.diff.modes) || [];
+  if (modes.length <= 1) {
+    box.innerHTML = ''; box.classList.add('hidden'); label.classList.add('hidden');
     return;
   }
-  if (imgMode === 'side') renderImgSide(cont, o, n);
-  else if (imgMode === 'swipe') renderImgSwipe(cont, o, n);
-  else if (imgMode === 'onion') renderImgOnion(cont, o, n);
-  else renderImgDiff(cont, o, n);
+  box.classList.remove('hidden'); label.classList.remove('hidden');
+  if (!curMode[plugin.kind]) curMode[plugin.kind] = modes[0].id;
+  const sel = curMode[plugin.kind];
+  box.innerHTML = modes.map(m =>
+    `<button class="btn btn-xs join-item ${m.id === sel ? 'btn-active' : ''}" data-mode="${m.id}">${escapeHtml(m.label)}</button>`
+  ).join('');
+  box.querySelectorAll('button').forEach(b => b.onclick = () => {
+    curMode[plugin.kind] = b.dataset.mode;
+    buildModeToolbar(plugin);
+    renderCurrent();
+  });
 }
 
-let lastSegs = null;
-let lastOldLines = [];  // equal セグメントは行を持たず、ここから遅延参照する
-
-// 表示モード切替ツールバーをコミット種別に応じて出し分ける。
-function showViews(kind) {
-  $('text-views').classList.toggle('hidden', kind !== 'text');
-  $('image-views').classList.toggle('hidden', kind !== 'image');
+async function renderCurrent() {
+  const mode = curMode[curPlugin.kind] ||
+    (curPlugin.diff.modes[0] && curPlugin.diff.modes[0].id);
+  const ctx = { fileId, charset: fileCharset };
+  const stats = $('cmp-stats'), cont = $('cmp-diff'), msg = $('cmp-message');
+  msg.classList.add('hidden');
+  try {
+    const ret = await curPlugin.diff.render(cont, curOld, curNew, { mode, ctx, stats });
+    if (ret && ret.message) { msg.textContent = ret.message; msg.classList.remove('hidden'); }
+  } catch (e) {
+    stats.textContent = ''; cont.innerHTML = '';
+    msg.textContent = '差分の描画に失敗しました。';
+    msg.classList.remove('hidden');
+  }
 }
 
 function update() {
@@ -615,90 +255,26 @@ function update() {
   const compareId = $('sel-compare').value;
   const newUrl = `${location.pathname}?base=${baseId}&compare=${compareId}`;
   window.history.replaceState(null, '', newUrl);
-  expanded.clear();
   $('cmp-message').classList.add('hidden');
   $('cmp-stats').textContent = '';
   $('cmp-diff').innerHTML = '<span class="opacity-50 text-xs p-3 block">読み込み中…</span>';
 
-  Promise.all([fetchBytes(baseId), fetchBytes(compareId)]).then(([ob, nb]) => {
-    const oMime = sniffImageMime(ob), nMime = sniffImageMime(nb);
-    const oKind = commitKind(ob, oMime), nKind = commitKind(nb, nMime);
-
-    // 両方画像 / 両方テキストは専用の差分表示。形式（カテゴリ）をまたぐ場合や
-    // バイナリは行/画像差分が成立しないため、比較可能なメタ項目のみを表示する。
-    if (oKind === 'image' && nKind === 'image') {
-      showViews('image');
-      return Promise.all([imageInfo(baseId, ob, oMime), imageInfo(compareId, nb, nMime)])
-        .then(([o, n]) => renderImageDiff(o, n));
-    }
-    if (oKind === 'text' && nKind === 'text') {
-      showViews('text');
-      return renderTextDiff(ob, nb);
-    }
-    showViews('none');
-    return renderMetaOnly(baseId, ob, oKind, oMime, compareId, nb, nKind, nMime);
+  Promise.all([fetchBytes(baseId), fetchBytes(compareId)]).then(async ([ob, nb]) => {
+    curOld = await ViewRuntime.resolveModel(ob, { id: baseId, charset: fileCharset, name: fileName });
+    curNew = await ViewRuntime.resolveModel(nb, { id: compareId, charset: fileCharset, name: fileName });
+    // 種別が一致し、そのビューが差分対応なら専用差分。さもなくばメタ比較へ。
+    const sameKind = curOld.kind === curNew.kind;
+    curPlugin = (sameKind && ViewRuntime.hasView(curOld.kind) && ViewRuntime.getView(curOld.kind).diff)
+      ? ViewRuntime.getView(curOld.kind)
+      : ViewRuntime.getView('core/binary');
+    buildModeToolbar(curPlugin);
+    await renderCurrent();
   }).catch(() => {
     $('cmp-stats').textContent = '';
     $('cmp-diff').innerHTML = '';
     $('cmp-message').textContent = 'コミット内容の取得に失敗しました。';
     $('cmp-message').classList.remove('hidden');
   });
-}
-
-function renderTextDiff(ob, nb) {
-  // 元エンコーディング（fileCharset）でデコードする。
-  const oldText = decodeBytes(ob.buffer, fileCharset);
-  const newText = decodeBytes(nb.buffer, fileCharset);
-  if (looksBinary(oldText) || looksBinary(newText)) {
-    $('cmp-stats').textContent = '';
-    $('cmp-diff').innerHTML = '';
-    $('cmp-message').textContent = 'バイナリデータのため差分表示できません。';
-    $('cmp-message').classList.remove('hidden');
-    return;
-  }
-  if (oldText === newText) {
-    $('cmp-stats').innerHTML = '<span class="opacity-60">差分はありません</span>';
-    $('cmp-diff').innerHTML = '';
-    return;
-  }
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  const { segs, added, removed, coarse } = diffSegments(oldLines, newLines);
-  $('cmp-stats').innerHTML =
-    `<span class="text-success font-semibold">+${added}</span> ` +
-    `<span class="text-error font-semibold">-${removed}</span> ` +
-    `<span class="opacity-60">行</span>` +
-    (coarse ? ' <span class="opacity-60">（変更が大きいため行単位の対応付けは省略）</span>' : '');
-  lastOldLines = oldLines;
-  lastSegs = segs;
-  renderDiff(lastSegs);
-}
-
-// カテゴリをまたぐ更新・バイナリ: 比較可能なメタ項目のみを新旧で並べる。
-async function renderMetaOnly(baseId, ob, ok, om, compareId, nb, nk, nm) {
-  $('cmp-stats').textContent = '';
-  const kindLabel = k => k === 'image' ? '画像' : k === 'text' ? 'テキスト' : 'バイナリ';
-  const cell = async (commitId, b, k, mime) => {
-    let dim = '';
-    if (k === 'image') {
-      const info = await imageInfo(commitId, b, mime);
-      if (info.width) dim =
-        `<div><dt class="opacity-50">寸法</dt><dd class="font-mono">${info.width}×${info.height}</dd></div>`;
-    }
-    return `<dl class="space-y-2">
-      <div><dt class="opacity-50">種別</dt><dd>${kindLabel(k)}</dd></div>
-      <div><dt class="opacity-50">サイズ</dt><dd class="font-mono">${fmtSize(b.length)}</dd></div>
-      ${dim}
-    </dl>`;
-  };
-  const [oCell, nCell] = await Promise.all([
-    cell(baseId, ob, ok, om), cell(compareId, nb, nk, nm),
-  ]);
-  $('cmp-diff').innerHTML = `
-    <div class="grid grid-cols-2 gap-4 p-4 text-xs">
-      <div><span class="diff-del px-1 rounded inline-block mb-2 font-semibold">旧</span>${oCell}</div>
-      <div><span class="diff-add px-1 rounded inline-block mb-2 font-semibold">新</span>${nCell}</div>
-    </div>`;
 }
 
 function optionLabel(c) {
@@ -732,35 +308,6 @@ function buildSelectors() {
   $('sel-compare').onchange = update;
 }
 
-$('view-unified').onclick = () => {
-  if (viewMode === 'unified') return;
-  viewMode = 'unified';
-  $('view-unified').classList.add('btn-active');
-  $('view-split').classList.remove('btn-active');
-  if (lastSegs) renderDiff(lastSegs);
-};
-$('view-split').onclick = () => {
-  if (viewMode === 'split') return;
-  viewMode = 'split';
-  $('view-split').classList.add('btn-active');
-  $('view-unified').classList.remove('btn-active');
-  if (lastSegs) renderDiff(lastSegs);
-};
-
-const IMG_MODE_BTNS = { side: 'view-side', swipe: 'view-swipe', onion: 'view-onion', diff: 'view-diff' };
-function setImgMode(mode) {
-  if (imgMode === mode) return;
-  imgMode = mode;
-  for (const [m, id] of Object.entries(IMG_MODE_BTNS)) {
-    $(id).classList.toggle('btn-active', m === mode);
-  }
-  if (imgState) renderImageDiff(imgState.old, imgState.new);
-}
-$('view-side').onclick = () => setImgMode('side');
-$('view-swipe').onclick = () => setImgMode('swipe');
-$('view-onion').onclick = () => setImgMode('onion');
-$('view-diff').onclick = () => setImgMode('diff');
-
 async function init() {
   const me = await requireAuth();
   if (!me) return;
@@ -783,11 +330,11 @@ async function init() {
   }
   currentCommitId = file.current_commit;
   fileCharset = file.charset;
+  fileName = file.display_name;
   document.title = `yozist - ${file.display_name} の比較`;
   $('main').classList.remove('hidden');
   $('cmp-name').textContent = file.display_name;
 
-  // 表示モードのツールバーは比較ごとにコミット種別から決める（update 内 showViews）。
   buildSelectors();
   update();
 }

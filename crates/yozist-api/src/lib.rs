@@ -62,6 +62,9 @@ pub struct ApiState {
     /// 仮想スクロールが破綻する。直近に読んだ 1 ファイル分を保持し、同一コミットへの
     /// 連続した範囲取得で再展開を避ける。
     pub content_cache: Arc<ContentCache>,
+    /// プラガブルなビュー変換レジストリ（形式 → ViewModel）。
+    /// 表示・差分のビュー種別判定と、重い形式変換の追加点。
+    pub view_registry: Arc<yozist_view::ViewRegistry>,
 }
 
 /// 展開済み content の単一エントリキャッシュ（直近に読んだファイル）。
@@ -112,6 +115,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/files/:id/content", get(get_content).post(commit_file))
         .route("/api/files/:id/history", get(history))
         .route("/api/files/:id/commits/:cid", get(read_commit))
+        .route("/api/files/:id/commits/:cid/view", get(read_commit_view))
+        .route(
+            "/api/files/:id/commits/:cid/view-kind",
+            get(read_commit_view_kind),
+        )
         .route("/api/files/:id/rollback/:cid", post(rollback))
         .route(
             "/api/files/:id/tags",
@@ -1389,6 +1397,123 @@ async fn read_commit(
         let (ct, body) = encode_content(file.mime, file.charset, (*bytes).clone());
         Ok(range_response(ct, &body, range))
     }
+}
+
+/// commit の生バイトと `FileMeta` を取得する（`read_commit` と同じキャッシュ経路）。
+async fn load_commit_bytes(
+    s: &ApiState,
+    ctx: &AuthContext,
+    id: &str,
+    cid: &str,
+) -> Result<(FileMeta, Arc<Vec<u8>>), ApiError> {
+    let file_id = parse_file_id(id)?;
+    require_permission(&*s.authz, ctx, &Target::file(file_id), PermissionMask::READ).await?;
+    let commit_id = uuid::Uuid::parse_str(cid)
+        .map(yozist_core::CommitId::from_uuid)
+        .map_err(|e| ApiError::BadRequest(format!("commit id: {e}")))?;
+    let file = s
+        .meta
+        .get_file(&file_id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    let bytes = match s.content_cache.get(file_id, commit_id) {
+        Some(b) => b,
+        None => {
+            let raw = s
+                .engine
+                .read_at_commit(file_id, commit_id)
+                .await
+                .map_err(|e| match e {
+                    yozist_versioning::VersioningError::NotFound(_) => ApiError::NotFound,
+                    other => ApiError::Internal(other.to_string()),
+                })?;
+            let arc = Arc::new(raw);
+            s.content_cache.put(file_id, commit_id, arc.clone());
+            arc
+        }
+    };
+    Ok((file, bytes))
+}
+
+/// `FileMeta` と先頭バイトから変換レジストリ用の `FormatHint` を組み立てる。
+fn format_hint_for(file: &FileMeta, bytes: &[u8]) -> yozist_core::FormatHint {
+    let extension = file
+        .display_name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase());
+    yozist_core::FormatHint {
+        extension,
+        mime: file.mime.clone(),
+        first_bytes: Some(bytes[..bytes.len().min(8192)].to_vec()),
+        display_name: Some(file.display_name.clone()),
+    }
+}
+
+/// commit を解決した ViewModel として返す。`X-View-Kind` にビュー種別を付す。
+/// フロントの ViewPlugin はこのヘッダで描画プラグインを選ぶ。
+///
+/// NOTE: 現時点でこのエンドポイントを呼ぶフロントは無い（`compare.html`/
+/// `file_detail.html` は `/commits/:cid` から取得した生バイトをブラウザ側の
+/// converter で判定している）。バックエンド変換層（`yozist-view`）は将来
+/// フロントを実際にこちらへ切り替えるための土台として用意してある
+/// （docs/plugin-view-system.md 参照）。
+async fn read_commit_view(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((id, cid)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let (file, bytes) = load_commit_bytes(&s, &ctx, &id, &cid).await?;
+    let hint = format_hint_for(&file, &bytes);
+    let conv = s.view_registry.resolve(&hint);
+    let model = conv
+        .convert(&bytes, &hint)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let range = headers.get(axum::http::header::RANGE);
+    let mut resp = range_response(model.content_type, &model.payload, range);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&model.kind) {
+        resp.headers_mut().insert("x-view-kind", v);
+    }
+    // 診断用: どの変換器が採用されたか（ログ/キャッシュキーに使える値として ViewConverter
+    // が公開している converter_id）。
+    if let Ok(v) = axum::http::HeaderValue::from_str(conv.converter_id()) {
+        resp.headers_mut().insert("x-view-converter", v);
+    }
+    // commit は CAS で不変（同じ commit id は常に同じバイト列）。恒等変換
+    // （is_passthrough）なら payload は入力バイトそのものなので、長期キャッシュしても
+    // 安全。
+    if conv.is_passthrough() {
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
+    Ok(resp)
+}
+
+/// commit のビュー種別だけを返すプローブ。
+///
+/// NOTE: 現状は `load_commit_bytes` でコミットの全内容を読んでから種別を決めており
+/// 「巨大 payload を取得せず」というほど軽量ではない。`format_hint_for` は先頭 8KB
+/// しか使わないため理想は範囲読み込みだが、`BlobStore`/`VersioningEngine` に部分読み
+/// 出しの API が無く、この PR の範囲では追加していない（既知の制限。TODO: 対応する
+/// ストレージ層の range read をサポートしたら本エンドポイントを切り替える）。
+async fn read_commit_view_kind(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path((id, cid)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let (file, bytes) = load_commit_bytes(&s, &ctx, &id, &cid).await?;
+    let hint = format_hint_for(&file, &bytes);
+    let conv = s.view_registry.resolve(&hint);
+    let body = Json(serde_json::json!({ "kind": conv.target_view() }));
+    let mut resp = body.into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(conv.converter_id()) {
+        resp.headers_mut().insert("x-view-converter", v);
+    }
+    Ok(resp)
 }
 
 #[derive(Deserialize)]
@@ -3660,6 +3785,7 @@ mod tests {
                 share_admin,
                 smb_creds: None,
                 content_cache: Arc::new(ContentCache::default()),
+                view_registry: Arc::new(yozist_view::ViewRegistry::with_defaults()),
             },
             dir,
         )
@@ -3679,6 +3805,69 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn read_commit_view_sets_diagnostic_and_cache_headers() {
+        let (state, _td) = make_state().await;
+        let (file, commit) = state
+            .engine
+            .create_file(
+                "hello.txt",
+                b"hello world",
+                ActorId::new(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = read_commit_view(
+            State(state),
+            AuthCtx(AuthContext::System),
+            Path((file.id.to_string(), commit.id.to_string())),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        // core/text は恒等変換（is_passthrough）なので、commit の不変性（CAS）を
+        // 前提に長期キャッシュしてよい。
+        assert_eq!(resp.headers().get("x-view-kind").unwrap(), "core/text");
+        assert_eq!(resp.headers().get("x-view-converter").unwrap(), "core/text");
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_commit_view_kind_reports_converter_diagnostic_header() {
+        let (state, _td) = make_state().await;
+        let (file, commit) = state
+            .engine
+            .create_file(
+                "hello.txt",
+                b"hello world",
+                ActorId::new(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resp = read_commit_view_kind(
+            State(state),
+            AuthCtx(AuthContext::System),
+            Path((file.id.to_string(), commit.id.to_string())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.headers().get("x-view-converter").unwrap(), "core/text");
     }
 
     #[tokio::test]

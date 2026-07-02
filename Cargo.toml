@@ -6,6 +6,7 @@ members = [
     "crates/yozist-storage",
     "crates/yozist-db",
     "crates/yozist-versioning",
+    "crates/yozist-view",
     "crates/yozist-tagging",
     "crates/yozist-auth",
     "crates/yozist-ai",
@@ -26,6 +27,7 @@ yozist-core = { path = "crates/yozist-core" }
 yozist-storage = { path = "crates/yozist-storage" }
 yozist-db = { path = "crates/yozist-db" }
 yozist-versioning = { path = "crates/yozist-versioning" }
+yozist-view = { path = "crates/yozist-view" }
 yozist-tagging = { path = "crates/yozist-tagging" }
 yozist-auth = { path = "crates/yozist-auth" }
 yozist-ai = { path = "crates/yozist-ai" }
