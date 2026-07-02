@@ -1,0 +1,485 @@
+// 単一コミット表示ページ（/ui/files/:id/histories/:cid）のロジック。file_commit.html の
+// インライン <script> から切り出した静的ファイル（issue #50）。/ui/pages/file_commit.js で配信される。
+const parts = location.pathname.split('/').filter(Boolean);
+// /ui/files/:id/histories/:cid → ['ui','files',':id','histories',':cid']
+const fileId = parts[2];
+const commitId = parts[4];
+const contentPath = `/api/files/${fileId}/commits/${commitId}`;
+let file = null;
+
+const detailUrl = '/ui/files/' + fileId;
+$('back-detail').href = detailUrl;
+$('back-link').href = detailUrl;
+$('fc-raw').href = contentPath;
+
+// --- テキスト表示（file_detail.html の仮想スクロールビューアの読み取り専用版） ---
+// 小さいファイル（1 チャンク以下）は全文を読み取り専用 textarea で描画。
+// それ以上（GB 級も想定）は仮想スクロール: 枠自身のスクロールバーがファイル全体を
+// 表すよう、スクロール高を上限内に圧縮してバー位置⇔バイト位置を対応させる。
+// 表示中の前後チャンクのみ DOM に保持し、離れたものは解放（メモリ一定）。
+// ビューアはストレージの生 UTF-8 を読む（?utf8=1）。UTF-8 は継続バイトで文字境界を
+// 判定でき、チャンクを独立にデコード／解放／再ロードできるため。
+const TEXT_CHUNK_BYTES = 256 * 1024;        // 1 チャンクのバイト数
+const TEXT_FULL_LOAD_MAX = TEXT_CHUNK_BYTES;
+const TEXT_WINDOW_CHUNKS = 12;              // DOM に保持する最大チャンク数（≒3MB）
+const VIRT_SCROLL_MAX = 4 * 1000 * 1000;    // 仮想スクロール高の上限 px（ブラウザ上限内）
+let textTotalBytes = 0;                // content 全体のバイト数（UTF-8）
+let textNumChunks = 0;                 // 総チャンク数
+let textEstChunkH = 0;                 // 1 チャンクの推定ピクセル高（プレースホルダ予約高）
+// 仮想スクロールの内部状態
+let twBox = null;                      // スクロール枠
+let twTrack = null;                    // チャンク列（translateY で動かす）
+let twTrackOff = 0;                    // track 内の表示開始 px
+let twWinStart = 0;                    // DOM 上の先頭チャンク index
+let twWinEnd = 0;                      // DOM 上の末尾 +1（[start, end)）
+let twNodes = {};                      // チャンク index → DOM ノード（疎）
+let twAbort = {};                      // チャンク index → 取得中の AbortController
+let twLastST = 0;                      // 直前の scrollTop（相対/ジャンプ判定用）
+let twIgnoreScroll = 0;                // プログラム起因 scroll イベントの無視カウンタ
+let twPinBottom = false;               // 終端ジャンプ後、終端を表示し続ける
+let twScheduled = false;               // scroll の rAF スロットル
+
+// 拡張子 → MIME・種別判定（EXT_MIME/TEXT_EXT/extOf/mediaKind/viewerKind）は
+// file_detail.html と完全同一の実装だったため base.html の共有スクリプトへ一本化した
+// （判定ルールの変更が2箇所同時修正になり、片方だけ直すと乖離する問題への対処）。
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+}
+
+function effectiveMime() {
+  return file.mime || EXT_MIME[extOf(file.display_name)] || 'application/octet-stream';
+}
+
+// 単一コミット表示も file_detail と同じ共有 ViewRuntime のビュープラグインで描画する。
+// メディアは共有 viewer-media.js が担い、テキスト/不明はこのページ固有の分割取得
+// ビューア（renderTextContent）を呼ぶ。kind 判定は mediaKind/viewerKind（base.html
+// 共有、mime/拡張子ベース。巨大ファイルでバイト取得を避けるため）。
+ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
+  await renderTextContent(cont, ctx.mediaKind);
+} });
+// メディアプラグインの object URL 生成は各ページが注入する。ここでは当該コミットの
+// content 全体を取得して Blob URL にする（Bearer 認証のため fetch + Blob）。
+function commitObjectUrlFor(mime) {
+  return api(contentPath).then(async r => {
+    if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+    return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type: mime }));
+  });
+}
+
+// 先頭にヌルバイトを含むものはバイナリとみなす（UTF-8/ASCII テキストは含まない）
+function looksBinary(buf) {
+  const bytes = new Uint8Array(buf.slice(0, 8192));
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) return true;
+  return false;
+}
+
+// このコミットの content の [start, start+len) を Range リクエストで取得する。
+// utf8=true でストレージの生 UTF-8 を取得（仮想スクロール用）。
+// 返り値 { buf, total }。total はサーバの Content-Range から得た全体バイト数
+// （Range 非対応サーバが 200 で全体を返した場合は本文長）。
+async function fetchContentRange(start, len, utf8, signal) {
+  const end = start + len - 1; // inclusive
+  const path = contentPath + (utf8 ? '?utf8=1' : '');
+  const r = await api(path, { headers: { Range: `bytes=${start}-${end}` }, signal });
+  if (!r.ok && r.status !== 206) {
+    throw new Error((await r.text().catch(() => '')) || r.statusText);
+  }
+  const buf = await r.arrayBuffer();
+  let total = buf.byteLength;
+  const cr = r.headers.get('Content-Range'); // "bytes start-end/total"
+  const m = cr && /\/(\d+)\s*$/.exec(cr);
+  if (m) total = parseInt(m[1], 10);
+  return { buf, total };
+}
+
+// チャンク i（UTF-8 ストレージ空間）を取得する。文字は「先頭バイトが属するチャンク」
+// 所有の規約で分割し、境界のマルチバイト文字を欠落・重複なく復元する（末尾を最大 3
+// バイト多めに読む）。
+async function fetchUtf8Chunk(i, signal) {
+  const start = i * TEXT_CHUNK_BYTES;
+  const chunkEnd = Math.min(start + TEXT_CHUNK_BYTES, textTotalBytes); // exclusive
+  const reqEnd = Math.min(chunkEnd + 3, textTotalBytes);              // 末尾文字の補完分
+  const { buf } = await fetchContentRange(start, reqEnd - start, true, signal);
+  const bytes = new Uint8Array(buf);
+  // 先頭: 継続バイト(0b10xxxxxx)は前チャンク所有の文字 → 読み飛ばす。
+  let s = 0;
+  while (s < bytes.length && (bytes[s] & 0xC0) === 0x80) s++;
+  // 末尾: chunkEnd 位置が継続バイトなら、その文字は本チャンク所有 → 完了まで含める。
+  let e = Math.min(chunkEnd - start, bytes.length);
+  while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  if (e < s) e = s;
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(s, e));
+  return { text };
+}
+
+// 先頭チャンクの生バイト（バイナリ判定用）・total・トリム済みテキストを取得する。
+// チャンク 0 は先頭の読み飛ばしが不要で、末尾だけ次文字の途中で切らないよう詰める。
+async function fetchUtf8ChunkProbe() {
+  const { buf, total } = await fetchContentRange(0, TEXT_CHUNK_BYTES, true);
+  const bytes = new Uint8Array(buf);
+  let e = bytes.length;
+  // total が 1 チャンクより大きいときのみ末尾が途中の可能性がある。
+  if (total > TEXT_CHUNK_BYTES) {
+    e = Math.min(TEXT_CHUNK_BYTES, bytes.length);
+    while (e < bytes.length && (bytes[e] & 0xC0) === 0x80) e++;
+  }
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, e));
+  return { buf, total, text };
+}
+
+// content をビュープラグインで描画する（file_detail と同じ共有 ViewRuntime 経由）。
+async function renderContent() {
+  const cont = $('fc-content');
+  cont.innerHTML = '<span class="opacity-50 text-xs">読み込み中…</span>';
+  const mk = mediaKind(file.mime, file.display_name);
+  const plugin = ViewRuntime.getView(viewerKind(file.mime, file.display_name));
+  const ctx = { file, mime: effectiveMime(), mediaKind: mk, objectUrlFor: commitObjectUrlFor };
+  try {
+    await plugin.mount(cont, ctx);
+  } catch (e) {
+    cont.innerHTML = `<span class="text-error text-xs">コミット内容の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+// テキスト/不明データを表示する。通常サイズは全文、巨大ファイルは仮想スクロール。
+async function renderTextContent(cont, kind) {
+  // 先頭チャンクを取得（バイナリ判定にも使う）。
+  const first = await fetchUtf8ChunkProbe();
+  if (kind === 'unknown' && !file.charset && looksBinary(first.buf)) {
+    cont.innerHTML = `
+      <div class="flex flex-col items-center gap-3 py-10 text-center">
+        <div class="text-4xl opacity-30">🗎</div>
+        <div class="text-sm opacity-70">このファイルはプレビューに対応していません。</div>
+        <div class="text-xs opacity-50 break-all">${escapeHtml(file.mime || '不明な形式')} · ${fmtSize(first.total)}</div>
+      </div>`;
+    return;
+  }
+  textTotalBytes = first.total;
+  if (textTotalBytes <= TEXT_FULL_LOAD_MAX) {
+    renderTextFull(cont, first.text);
+  } else {
+    renderTextVirtual(cont, first);
+  }
+}
+
+// 共通: 内容を内部スクロールさせる枠を作る（重要スタイルはインライン＝Tailwind 非依存）。
+function makeTextScrollBox() {
+  const box = document.createElement('div');
+  box.id = 'fc-text-scroll';
+  box.style.cssText =
+    'overflow:auto;border:1px solid rgba(127,127,127,0.25);' +
+    'border-radius:0.375rem;background:rgba(127,127,127,0.06)';
+  return box;
+}
+
+// 全文ロード: 読み取り専用 <textarea> で表示する。
+// textarea はフォーム要素としてネイティブの内部スクロールを持つため、CSS の
+// overflow 解釈に依存せず必ず枠内でスクロールし、スクロールバーも内容と一致する。
+function renderTextFull(cont, text) {
+  const ta = document.createElement('textarea');
+  ta.id = 'fc-text-view';
+  ta.readOnly = true;
+  ta.value = text;
+  ta.style.cssText =
+    'display:block;width:100%;box-sizing:border-box;margin:0;padding:0.5rem 0.75rem;' +
+    'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.75rem;line-height:1.2rem;' +
+    'border:1px solid rgba(127,127,127,0.25);border-radius:0.375rem;background:rgba(127,127,127,0.06);' +
+    'resize:vertical';
+  cont.replaceChildren(ta);
+  // 内容高 or 70vh の小さい方に高さを明示（短い内容はぴったり、長い内容は枠内スクロール）。
+  const cap = Math.round(window.innerHeight * 0.7);
+  ta.style.height = Math.min(ta.scrollHeight + 2, cap) + 'px';
+}
+
+// ===== 仮想スクロール（巨大ファイル, GB 級可）=====
+// 枠自身のネイティブスクロールバーがファイル全体を表すよう、スクロール高を
+// ブラウザ上限内の値（VIRT_SCROLL_MAX 以下）に圧縮し、バー位置⇔バイト位置を
+// 線形対応させる（file_detail.html と同方式）。
+function renderTextVirtual(cont, first) {
+  textNumChunks = Math.max(1, Math.ceil(textTotalBytes / TEXT_CHUNK_BYTES));
+  twNodes = {};
+  twAbort = {};
+
+  const box = makeTextScrollBox();
+  box.style.height = Math.round(window.innerHeight * 0.7) + 'px';
+  box.style.position = 'relative';
+  box.style.overflowAnchor = 'none';   // 自前の scrollTop 操作と競合させない
+  box.style.overflowY = 'scroll';      // バーを常時表示（全体位置の指標）
+  const layer = document.createElement('div');
+  layer.style.cssText = 'position:sticky;top:0;height:100%;overflow:hidden';
+  const track = document.createElement('div');
+  layer.appendChild(track);
+  const spacer = document.createElement('div');
+  box.append(layer, spacer);
+  cont.replaceChildren(box);
+  twBox = box;
+  twTrack = track;
+
+  twWinStart = 0;
+  twWinEnd = 0;
+  twTrackOff = 0;
+  twLastST = 0;
+  twIgnoreScroll = 0;
+  twPinBottom = false;
+  appendChunkNode(0, first.text);                 // 先頭は probe 済みテキストで即描画
+  textEstChunkH = Math.max(40, twNodes[0].offsetHeight);
+
+  // スクロール高 = 推定実高（上限まで）。小さめのファイルでは実高に近く自然な
+  // バーになり、GB 級では圧縮される（layer が clientHeight 分の流れを占める）。
+  const h = Math.min(textNumChunks * textEstChunkH, VIRT_SCROLL_MAX);
+  spacer.style.height = Math.max(0, h - box.clientHeight) + 'px';
+
+  box.addEventListener('scroll', onVirtScroll);
+  settleWindow();
+}
+
+// チャンク用ノード（推定高プレースホルダ）。
+function twMakeNode(i) {
+  const d = document.createElement('div');
+  d.dataset.i = String(i);
+  d.style.minHeight = (textEstChunkH || 40) + 'px';
+  const ph = document.createElement('div');
+  ph.style.cssText = 'padding:0.4rem 0.75rem;opacity:0.4';
+  ph.textContent = '読み込み中…';
+  d.appendChild(ph);
+  twNodes[i] = d;
+  return d;
+}
+
+// ノードに本文を流し込む。表示位置より上のノードが伸縮したら trackOff を補正して
+// 見えている内容を保つ。
+function twFill(i, text) {
+  const d = twNodes[i];
+  if (!d) return;
+  const beforeH = d.offsetHeight;
+  const wasAbove = d.offsetTop + beforeH <= twTrackOff;
+  const pre = document.createElement('pre');
+  pre.style.cssText =
+    'margin:0;padding:0 0.75rem;white-space:pre-wrap;overflow-wrap:anywhere;' +
+    'font-size:0.75rem;line-height:1.2rem';
+  pre.appendChild(document.createTextNode(text));
+  d.replaceChildren(pre);
+  d.style.minHeight = '';
+  d.dataset.loaded = '1';
+  if (wasAbove) twTrackOff += d.offsetHeight - beforeH;
+  settleWindow();
+}
+
+// 末尾に追加。text 省略時はプレースホルダ + 非同期ロード。ロード完了の Promise を返す。
+function appendChunkNode(i, text) {
+  const d = twMakeNode(i);
+  twTrack.appendChild(d);
+  twWinEnd = i + 1;
+  if (text != null) { twFill(i, text); return Promise.resolve(); }
+  return twLoad(i);
+}
+
+// 先頭に追加。挿入分だけ trackOff を進めて見えている内容を保つ。
+function prependChunkNode(i) {
+  const d = twMakeNode(i);
+  twTrack.insertBefore(d, twTrack.firstChild);
+  twWinStart = i;
+  twTrackOff += d.offsetHeight;
+  twLoad(i);
+}
+
+// チャンクを非同期取得して流し込む。
+async function twLoad(i) {
+  const d = twNodes[i];
+  if (!d || d.dataset.loaded === '1' || twAbort[i]) return;
+  const ac = new AbortController();
+  twAbort[i] = ac;
+  try {
+    const { text } = await fetchUtf8Chunk(i, ac.signal);
+    if (twNodes[i]) twFill(i, text);   // 解放されていなければ反映
+  } catch (e) {
+    if (!e || e.name !== 'AbortError') console.error('chunk load failed:', i, e);
+  } finally {
+    delete twAbort[i];
+  }
+}
+
+function releaseChunkNode(i) {
+  const d = twNodes[i];
+  if (!d) return;
+  if (twAbort[i]) { twAbort[i].abort(); delete twAbort[i]; }
+  twTrack.removeChild(d);
+  delete twNodes[i];
+}
+
+function onVirtScroll() {
+  if (twIgnoreScroll > 0) { twIgnoreScroll--; twLastST = twBox.scrollTop; return; }
+  if (twScheduled) return;
+  twScheduled = true;
+  requestAnimationFrame(() => { twScheduled = false; handleVirtScroll(); });
+}
+
+function handleVirtScroll() {
+  if (!twBox) return;
+  const st = twBox.scrollTop;
+  const delta = st - twLastST;
+  twLastST = st;
+  if (delta === 0) return;
+  if (Math.abs(delta) > twBox.clientHeight * 3) {
+    // つまみドラッグ等の大移動 → バー位置に対応するファイル位置へジャンプ
+    const max = Math.max(1, twBox.scrollHeight - twBox.clientHeight);
+    virtJump(st / max);
+  } else {
+    // ホイール等 → 内容へ 1:1 適用（滑らかな連続スクロール）
+    twPinBottom = false;
+    twTrackOff += delta;
+    settleWindow();
+  }
+}
+
+// バー位置 frac (0..1) に対応するチャンクへウィンドウごと移動する。
+function virtJump(frac) {
+  frac = Math.min(1, Math.max(0, frac));
+  for (const k in twAbort) { try { twAbort[k].abort(); } catch (_) {} }
+  twAbort = {};
+  twNodes = {};
+  twTrack.replaceChildren();
+  const toEnd = frac >= 0.9995;
+  const t = toEnd ? textNumChunks - 1
+                  : Math.min(textNumChunks - 1, Math.floor(frac * textNumChunks));
+  twWinStart = t;
+  twWinEnd = t;
+  twTrackOff = 0;
+  twPinBottom = toEnd;                 // 最下部ドラッグはファイル終端を表示し続ける
+  applyTrack();
+  appendChunkNode(t).then(() => settleWindow());
+}
+
+function applyTrack() {
+  if (twTrack) twTrack.style.transform = `translateY(${-Math.round(twTrackOff)}px)`;
+}
+
+// 表示位置の前後にチャンクを補充し、窓を超えた側を解放し、trackOff をクランプして
+// 反映、バーを実位置へ再同期する。すべての変化はここに集約される。
+function settleWindow() {
+  if (!twBox || !twTrack) return;
+  const clientH = twBox.clientHeight, MARGIN = 800;
+  let guard = 0;
+  // 上方向の不足分を補充
+  while (twTrackOff < MARGIN && twWinStart > 0 && guard++ < 100) {
+    prependChunkNode(twWinStart - 1);
+  }
+  // 下方向の不足分を補充
+  guard = 0;
+  while (twTrack.offsetHeight - (twTrackOff + clientH) < MARGIN &&
+         twWinEnd < textNumChunks && guard++ < 100) {
+    appendChunkNode(twWinEnd);
+  }
+  // 窓のトリム: viewport から遠い側（余白が大きい側）を解放
+  while (twWinEnd - twWinStart > TEXT_WINDOW_CHUNKS) {
+    const topSlack = twTrackOff;
+    const botSlack = twTrack.offsetHeight - (twTrackOff + clientH);
+    if (topSlack >= botSlack) {
+      const h = twNodes[twWinStart].offsetHeight;
+      releaseChunkNode(twWinStart);
+      twWinStart++;
+      twTrackOff -= h;
+    } else {
+      twWinEnd--;
+      releaseChunkNode(twWinEnd);
+    }
+  }
+  // クランプ（ファイル端・窓端より外を見せない）
+  const maxOff = Math.max(0, twTrack.offsetHeight - clientH);
+  if (twPinBottom && twWinEnd >= textNumChunks) twTrackOff = maxOff;
+  if (twTrackOff < 0) twTrackOff = 0;
+  if (twWinEnd >= textNumChunks && twTrackOff > maxOff) twTrackOff = maxOff;
+  applyTrack();
+  syncBar();
+}
+
+// 表示先頭のファイル内割合を概算してバーを実位置へ再同期する。
+// 端は厳密に合わせる（先頭=0 / 終端=最大）ので、バー最下部＝テキスト終端が一致する。
+function syncBar() {
+  const max = Math.max(0, twBox.scrollHeight - twBox.clientHeight);
+  const want = Math.round(virtCurrentFrac() * max);
+  if (Math.abs(want - twBox.scrollTop) > 2) {
+    twIgnoreScroll++;
+    twBox.scrollTop = want;
+  }
+  twLastST = twBox.scrollTop;
+}
+
+function virtCurrentFrac() {
+  if (twWinStart === 0 && twTrackOff <= 0) return 0;
+  if (twWinEnd >= textNumChunks) {
+    const maxOff = Math.max(0, twTrack.offsetHeight - twBox.clientHeight);
+    if (twTrackOff >= maxOff - 1) return 1;
+  }
+  let acc = 0;
+  for (let i = twWinStart; i < twWinEnd; i++) {
+    const h = twNodes[i] ? twNodes[i].offsetHeight : textEstChunkH;
+    if (acc + h > twTrackOff) {
+      const w = (twTrackOff - acc) / Math.max(1, h);
+      return Math.min(1, (i + w) / textNumChunks);
+    }
+    acc += h;
+  }
+  return Math.min(1, twWinEnd / textNumChunks);
+}
+
+async function init() {
+  const me = await requireAuth();
+  if (!me) return;
+
+  let history;
+  try {
+    [file, history] = await Promise.all([
+      json('/api/files/' + fileId),
+      json(`/api/files/${fileId}/history`),
+    ]);
+  } catch (e) {
+    $('not-found-msg').textContent = 'ファイルが見つかりません、または閲覧権限がありません。';
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+  const commit = history.find(c => c.id === commitId);
+  if (!commit) {
+    $('not-found-msg').textContent = 'このファイルにそのコミットは存在しません。';
+    $('not-found').classList.remove('hidden');
+    return;
+  }
+
+  document.title = `yozist - ${file.display_name} @${commitId.slice(0, 8)}`;
+  $('main').classList.remove('hidden');
+  $('fc-name').textContent = file.display_name;
+
+  const isCurrent = file.current_commit === commitId;
+  const time = fmtTs(commit.timestamp);
+  const badge = isCurrent
+    ? '<span class="badge badge-warning badge-sm ml-1">★ current</span>'
+    : '';
+  $('fc-meta').innerHTML =
+    `commit <span class="font-mono">${escapeHtml(commit.format_id || commitId.slice(0, 8))}</span> ${badge}<br>
+     <span class="opacity-70">${time}</span>
+     ${commit.message ? ' — ' + escapeHtml(commit.message) : ''}`;
+
+  if (!isCurrent) {
+    const btn = $('fc-rollback');
+    btn.classList.remove('hidden');
+    btn.onclick = async () => {
+      if (!await uiConfirm(`"${file.display_name}" をこのバージョン (${time}) に戻しますか？\n(新しいコミットとして記録されます)`, { danger: true, okText: '戻す' })) return;
+      const r = await api(
+        `/api/files/${fileId}/rollback/${commitId}?message=` +
+          encodeURIComponent(`rollback to ${time}`),
+        { method: 'POST' }
+      );
+      if (!r.ok) { uiToast('rollback に失敗しました: ' + await r.text(), 'error'); return; }
+      location.href = detailUrl;
+    };
+  }
+
+  await renderContent();
+}
+
+init();
