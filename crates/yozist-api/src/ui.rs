@@ -255,6 +255,30 @@ mod tests {
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     }
 
+    #[test]
+    fn page_asset_manifest_lists_known_pages() {
+        // build.rs が assets/pages/*.js を列挙して生成するマニフェスト。
+        // テンプレートから切り出したページ JS が配信対象に含まれることの回帰テスト。
+        let names: Vec<&str> = PAGE_ASSETS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "file_detail.js",
+            "file_commit.js",
+            "files.js",
+            "compare.js",
+        ] {
+            assert!(names.contains(&expected), "missing page script: {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn page_asset_serves_known_and_404s_unknown() {
+        let known = page_asset(axum::extract::Path("file_detail.js".to_string())).await;
+        assert_eq!(known.status(), StatusCode::OK);
+
+        let unknown = page_asset(axum::extract::Path("does-not-exist.js".to_string())).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn common_js_asset_serves_shared_utilities() {
         let res = common_js_asset().await;
