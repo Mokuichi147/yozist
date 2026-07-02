@@ -300,16 +300,46 @@ if (o.kind === n.kind && views.get(o.kind)?.diff) {
 | 項目 | 状態 |
 |------|------|
 | `yozist-view` クレート（`ViewKind`/`ViewModel`/`ViewConverter`/`ViewRegistry`＋Text/Image/Binary 変換、検出ヘルパ、ユニットテスト） | ✅ 実装・テスト済 |
-| REST `GET …/commits/:cid/view`（`X-View-Kind` 付き）／`…/view-kind`（軽量プローブ） | ✅ 実装（`ApiState.view_registry` 経由でプラガブル） |
+| REST `GET …/commits/:cid/view`（`X-View-Kind` 付き）／`…/view-kind` | ✅ 実装（`ApiState.view_registry` 経由でプラガブル）。⚠ `…/view-kind` は「軽量プローブ」と称しているが、`BlobStore`/`VersioningEngine` に範囲読み出しが無く現状はコミット全内容を読んでから種別だけ返す（下記「既知の制限と対応」参照）。フロントからは未接続（§11 末尾） |
 | フロント view-runtime（`registerView`/`registerConverter`/`resolveModel`／汎用モードツールバー） | ✅ `compare.html` に実装 |
 | 第一者ビュープラグイン `core/text`・`core/image`・`core/binary`（既存の行差分・画像4モード・メタ比較を移植） | ✅ 挙動を保って移植 |
 | 比較ページのオーケストレーション（2 コミット解決 → 同種は専用差分／異種はメタ比較） | ✅ ハードコード分岐を撤去 |
 | 単一表示（`file_detail.html`）の runtime 統合 | ✅ 描画ディスパッチをビュープラグイン（`mount`）化。テキストの仮想スクロール／巨大ファイル編集は温存（`core/text` の mount から既存 `renderTextContent` を呼ぶ）。ブラウザ実機で検証済 |
 | 単一コミット表示（`file_commit.html`）の runtime 統合 | ✅ 旧来のハードコード分岐を撤去し共有 ViewRuntime 駆動へ。`file_detail` と重複していたメディア描画を共有プラグイン `viewer-media.js`（image/video/audio/pdf）に集約し、両ページで `ctx.objectUrlFor` 注入で共用。テキスト/不明は各ページ固有の分割取得ビューアを `core/text` の mount から呼ぶ。ブラウザ実機で検証済 |
 | view-runtime の `base.html` への抽出（全ページ共有化） | ✅ 純粋レジストリ＋共有ヘルパ(`ViewRuntime.host`)を `base.html` へ。compare(diff) と file_detail(mount) が同一ランタイムを共有 |
-| 差分プラグインの**独立ファイル化**（`core/text`/`core/image`/`core/binary`） | ✅ `crates/yozist-api/assets/view-plugins/*.js` に分離。`GET /ui/plugins/:name` で配信（`include_str!` 埋め込み・ホワイトリスト）。各プラグインは IIFE で内部スコープを隔離し、`ViewRuntime.host` 経由でのみ共有ヘルパへ依存（ページ実装に非依存）。ブラウザ実機で検証済 |
-| 拡張性の実証: 新形式＋新ビュー種別の追加 | ✅ `view-plugins/table-csv.js` を**1ファイル追加**するだけで CSV/TSV を `table/csv` ビューとしてセル単位差分表示（行 LCS＋セルハイライト、独自モード「全行/変更のみ」）。コアは「解決ヒントに `name` を渡す」一度きりの汎用配線のみ。差分アルゴリズムがビュー固有（行ではなく表のセル）である実例。ブラウザ実機で検証済 |
-| 重い形式のバックエンド変換の実例（フロントから `/view` へ委譲する経路） | ⬜ 口は用意済み（`resolveModel` の差し替え点）。実形式は未追加 |
+| 差分プラグインの**独立ファイル化**（`core/text`/`core/image`/`core/binary`） | ✅ `crates/yozist-api/assets/view-plugins/*.js` に分離。`GET /ui/plugins/:name` で配信。配信対象は `build.rs` が `assets/view-plugins/*.js` を列挙して生成するマニフェスト（`ui.rs` にホワイトリストの match アームは無く、ディレクトリに `.js` を置くだけで配信対象になる）。各プラグインは IIFE で内部スコープを隔離し、`ViewRuntime.host` 経由でのみ共有ヘルパへ依存（ページ実装に非依存）。ブラウザ実機で検証済 |
+| 拡張性の実証: 新形式＋新ビュー種別の追加 | ✅ `view-plugins/table-csv.js` で CSV/TSV を `table/csv` ビューとしてセル単位差分表示（行 LCS＋セルハイライト、独自モード「全行/変更のみ」）。差分アルゴリズムがビュー固有（行ではなく表のセル）である実例。**訂正**: 「1 ファイル追加だけ」は配信面（上記マニフェスト）に限った話で、実際にはそのプラグインを使うページのテンプレートへ `<script src="/ui/plugins/…">` を追加する配線が別途必要（`compare.html` は差分専用プラグインだけを読み、単一表示ページは読まない、など読み込む組み合わせがページごとに異なるため）。§7 の「解決ヒントに `name` を渡す」は拡張子ベース判定の**候補選定**にしか使わない設計に修正した（下記「既知の制限と対応」参照）。ブラウザ実機で検証済 |
+| 単一表示のメディア種別判定（`mediaKind`/`viewerKind`/`EXT_MIME`/`TEXT_EXT`/`extOf`） | ✅ `file_detail.html`/`file_commit.html` に同一実装が重複していたのを `base.html` の共有スクリプトへ一本化（判定ルール変更が2箇所同時修正になり片方だけ直すと乖離する問題への対処）。ただし compare 画面の `resolveModel`（内容スニッフィング）とは別経路のままで、単一表示は依然 mime/拡張子だけで判定する（巨大メディアで内容取得を避けるため） |
+| 重い形式のバックエンド変換の実例（フロントから `/view` へ委譲する経路） | ⬜ 口は用意済み（`resolveModel` の差し替え点）だが、現時点でこの REST エンドポイントを呼ぶフロントは無い。フロントを実際に切り替えるか、この層を後続 PR に切り出すかは未決定 |
+
+### 既知の制限と対応（レビュー起因）
+
+- **拡張子ベース判定はコミット単位のリネームに弱い**: `compare.html` はコミット時点の
+  ファイル名を持たず、常に現行 `display_name` を変換ヒントとして両コミットへ渡す。
+  そのため `table-csv.js` の `detect()` は拡張子を「候補の絞り込み」にしか使わず、
+  実際の採否は内容が区切り文字付きの表形式かどうか（`looksTabular`）で決める。
+- **CSV 行差分にも `text-diff.js` と同じ DOM/メモリ安全弁を適用**: ガード付き LCS＋
+  ブロック置換フォールバックを `base.html` の `ViewRuntime.host.diffKeyed` に共通化し、
+  `text-diff.js`/`table-csv.js` の双方から使う。列数計算も `Math.max(1, ...rows.map(...))`
+  の引数展開（行数が多いと `RangeError`）をループに置き換えた。
+- **バイナリ拒否は制御文字率でも判定**: `bytesLookBinary`（ヌルバイトのみ）に加え、
+  `looksBinaryText`（制御文字率）を `table-csv.js` の `detect()` にも適用し、
+  ヌルバイトを含まない破損データの誤表示を防ぐ。
+- **種別ラベルはレジストリ参照に変更**: `binary-meta.js` のメタ比較フォールバックが
+  `core/image`/`core/text` 以外を一律「バイナリ」と誤表示していた問題を、各ビューが
+  自身の `label` を登録しそれを参照する方式に変更した。
+- **`/view`・`/view-kind` は未接続のまま、既存の未使用フィールドに実用途を与えた**:
+  フロントを接続するか層を切り出すかの判断はこの PR ではまだ行わず（デッドコードで
+  あること自体は変わらない）、`ViewConverter::converter_id()` を診断用レスポンス
+  ヘッダ（`X-View-Converter`）に、`is_passthrough()` を長期キャッシュ判定
+  （commit は CAS で不変なので恒等変換の応答は `Cache-Control: immutable` にできる）に
+  それぞれ使うようにし、テスト済みだが呼び出し箇所ゼロだった状態を解消した。
+  `…/view-kind` の全内容読み込みは `BlobStore` に範囲読み出し API が無いための制限で、
+  この PR の範囲では対応していない（追加の設計・実装が必要な別スコープ）。
+- **プラグイン配信の match アームを撤去**: `ui.rs` の許可名ホワイトリストを
+  `build.rs` 生成のマニフェスト参照に置き換えた（上記表参照）。テンプレートの
+  `<script src>` 配線は引き続き手動（ページごとに必要なプラグインの組み合わせが
+  異なるため）。
 
 > 注: バックエンドの全体ビルド（`yozist-server`）は vendor の `smb-server` が rustc 1.95 を要求する
 > 既存制約のため本環境では通らない。本変更に関係する `yozist-view` / `yozist-api` は

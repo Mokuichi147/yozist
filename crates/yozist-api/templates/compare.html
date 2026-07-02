@@ -162,7 +162,13 @@ const qs = new URLSearchParams(location.search);
 let history = [];
 let currentCommitId = null;
 let fileCharset = null; // 元エンコーディング。テキスト payload のデコードに使う。
-let fileName = null;    // 表示名。変換プラグインが拡張子で種別判定するのに使う。
+// 表示名。変換プラグインが拡張子で種別判定する「候補の絞り込み」に使う。
+// 注意: これは現行の display_name であり、コミットごとの実ファイル名ではない。
+// リネームされたファイルを比較すると、旧コミット側にも新しい拡張子のヒントが渡る
+// （例: report.txt → report.csv 後に旧コミットを見ると .csv が渡る）。拡張子だけで
+// 種別を確定させると、旧コミットの散文テキストが誤って表形式と解釈されうるため、
+// 拡張子ベース判定を行うプラグイン（例: table-csv.js）は必ず内容も検証すること。
+let fileName = null;
 const bytesCache = new Map(); // commitId → Uint8Array（生バイト。変換/種別判定の共通源）
 
 const detailUrl = '/ui/files/' + fileId;

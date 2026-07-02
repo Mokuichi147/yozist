@@ -16,6 +16,10 @@ use axum::{
     Router,
 };
 
+// `assets/view-plugins/*.js` から build.rs が生成する `VIEW_PLUGIN_ASSETS`（`&[(&str, &str)]`）。
+// 新しいプラグイン JS はディレクトリへ追加するだけで配信対象になり、ここを編集する必要はない。
+include!(concat!(env!("OUT_DIR"), "/view_plugin_manifest.rs"));
+
 pub fn router() -> Router<crate::ApiState> {
     Router::new()
         .route("/", get(index))
@@ -33,19 +37,21 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/plugins/:name", get(view_plugin_asset))
 }
 
-/// ビュープラグインの JS を配信する。各プラグインは独立ファイルで、バイナリへ
-/// 埋め込んで（`include_str!`）配信する。第一者組込みのため許可名はホワイトリスト。
+/// ビュープラグインの JS を配信する。各プラグインは `assets/view-plugins/` 配下の
+/// 独立ファイルで、バイナリへ埋め込んで（`include_str!`）配信する。配信対象は
+/// `build.rs` が生成する `VIEW_PLUGIN_ASSETS` から引く（ディレクトリ内の全 `.js` が
+/// 自動的に候補になり、このハンドラを編集する必要はない）。
 /// 共有 ViewRuntime（base.html）へ自己登録する classic script として読み込まれる。
+///
+/// NOTE: どのページがどのプラグインを読み込むかはテンプレート側の `<script src>` が
+/// 決める（差分専用プラグインを単一表示ページへ不要に読ませない等の理由で、
+/// ページごとに必要な組み合わせが異なる）。プラグイン追加時にテンプレートの
+/// 配線は別途必要（docs/plugin-view-system.md 参照）。
 async fn view_plugin_asset(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let body: &'static str = match name.as_str() {
-        "text-diff.js" => include_str!("../assets/view-plugins/text-diff.js"),
-        "image-diff.js" => include_str!("../assets/view-plugins/image-diff.js"),
-        "binary-meta.js" => include_str!("../assets/view-plugins/binary-meta.js"),
-        "table-csv.js" => include_str!("../assets/view-plugins/table-csv.js"),
-        "viewer-media.js" => include_str!("../assets/view-plugins/viewer-media.js"),
-        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    let Some(&(_, body)) = VIEW_PLUGIN_ASSETS.iter().find(|(n, _)| *n == name) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
     };
     (
         [(
@@ -188,4 +194,35 @@ async fn file_commit_page() -> Response {
 
 async fn series_settings_page() -> Response {
     render(SeriesSettingsTemplate { active: "" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_plugin_manifest_lists_known_plugins() {
+        // build.rs が assets/view-plugins/*.js を列挙して生成するマニフェスト。
+        // ディレクトリに .js を追加するだけで、このリストと配信ハンドラの両方が
+        // 自動的に更新されることの回帰テスト。
+        let names: Vec<&str> = VIEW_PLUGIN_ASSETS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "text-diff.js",
+            "image-diff.js",
+            "binary-meta.js",
+            "table-csv.js",
+            "viewer-media.js",
+        ] {
+            assert!(names.contains(&expected), "missing plugin: {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn view_plugin_asset_serves_known_and_404s_unknown() {
+        let known = view_plugin_asset(axum::extract::Path("text-diff.js".to_string())).await;
+        assert_eq!(known.status(), StatusCode::OK);
+
+        let unknown = view_plugin_asset(axum::extract::Path("does-not-exist.js".to_string())).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
 }

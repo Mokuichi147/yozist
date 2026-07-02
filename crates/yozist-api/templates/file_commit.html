@@ -80,22 +80,9 @@ let twIgnoreScroll = 0;                // プログラム起因 scroll イベン
 let twPinBottom = false;               // 終端ジャンプ後、終端を表示し続ける
 let twScheduled = false;               // scroll の rAF スロットル
 
-// 拡張子 → MIME（mime 未設定ファイルのフォールバック）
-const EXT_MIME = {
-  png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif',
-  webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp', ico:'image/x-icon', avif:'image/avif',
-  mp4:'video/mp4', webm:'video/webm', ogv:'video/ogg', mov:'video/quicktime', m4v:'video/x-m4v', mkv:'video/x-matroska',
-  mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg', flac:'audio/flac', m4a:'audio/mp4', aac:'audio/aac',
-  pdf:'application/pdf',
-};
-// 拡張子だけでテキストと判断できるもの（mime 未設定でもプレビューする）
-const TEXT_EXT = new Set([
-  'txt','md','markdown','json','xml','html','htm','css','js','mjs','ts','tsx','jsx',
-  'csv','tsv','yaml','yml','toml','ini','cfg','conf','log','sh','bash','zsh','py',
-  'rs','go','c','h','cpp','hpp','cc','java','kt','rb','php','sql','svg',
-]);
-
-function extOf(name) { return (name.split('.').pop() || '').toLowerCase(); }
+// 拡張子 → MIME・種別判定（EXT_MIME/TEXT_EXT/extOf/mediaKind/viewerKind）は
+// file_detail.html と完全同一の実装だったため base.html の共有スクリプトへ一本化した
+// （判定ルールの変更が2箇所同時修正になり、片方だけ直すと乖離する問題への対処）。
 
 function fmtSize(n) {
   n = Number(n) || 0;
@@ -105,35 +92,14 @@ function fmtSize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(1) + ' GB';
 }
 
-// content の表示種別を判定（mime 優先、なければ拡張子）
-function mediaKind(mime, name) {
-  const m = (mime || '').toLowerCase();
-  const ext = extOf(name);
-  if (m.startsWith('image/') || /^(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/.test(ext)) return 'image';
-  if (m.startsWith('video/') || /^(mp4|webm|ogv|mov|m4v|mkv)$/.test(ext)) return 'video';
-  if (m.startsWith('audio/') || /^(mp3|wav|ogg|oga|flac|m4a|aac)$/.test(ext)) return 'audio';
-  if (m === 'application/pdf' || ext === 'pdf') return 'pdf';
-  if (m.startsWith('text/') || /(json|xml|javascript|csv|yaml|x-sh)/.test(m) || TEXT_EXT.has(ext)) return 'text';
-  return 'unknown';
-}
-
 function effectiveMime() {
   return file.mime || EXT_MIME[extOf(file.display_name)] || 'application/octet-stream';
 }
 
 // 単一コミット表示も file_detail と同じ共有 ViewRuntime のビュープラグインで描画する。
 // メディアは共有 viewer-media.js が担い、テキスト/不明はこのページ固有の分割取得
-// ビューア（renderTextContent）を呼ぶ。kind 判定は mime/拡張子（巨大ファイルでバイト
-// 取得を避けるため）。
-function viewerKind(mime, name) {
-  switch (mediaKind(mime, name)) {
-    case 'image': return 'core/image';
-    case 'video': return 'media/video';
-    case 'audio': return 'media/audio';
-    case 'pdf':   return 'doc/pdf';
-    default:      return 'core/text'; // text / unknown（バイナリ判定は描画側）
-  }
-}
+// ビューア（renderTextContent）を呼ぶ。kind 判定は mediaKind/viewerKind（base.html
+// 共有、mime/拡張子ベース。巨大ファイルでバイト取得を避けるため）。
 ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
   await renderTextContent(cont, ctx.mediaKind);
 } });

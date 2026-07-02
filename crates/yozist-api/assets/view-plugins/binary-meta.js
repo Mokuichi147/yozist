@@ -3,12 +3,18 @@
   const { fmtSize, imageInfo } = ViewRuntime.host;
 ViewRuntime.registerView({
   kind: 'core/binary',
+  label: 'バイナリ',
   diff: {
     modes: [],
     async render(container, oldModel, newModel, { stats }) {
       stats.textContent = '';
-      const kindLabel = k =>
-        k === 'core/image' ? '画像' : k === 'core/text' ? 'テキスト' : 'バイナリ';
+      // 開いた名前空間の設計に合わせ、種別ラベルは各ビューの登録情報（label）から
+      // 引く。未登録の種別（このページで読み込んでいないプラグイン）だけ種別キー
+      // そのものを見せる（誤って「バイナリ」と表示しない）。
+      const kindLabel = k => {
+        const v = ViewRuntime.views.get(k);
+        return (v && v.label) || k;
+      };
       const cell = async (model) => {
         let dim = '';
         if (model.kind === 'core/image') {

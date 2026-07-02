@@ -102,6 +102,7 @@ ViewRuntime.registerView((() => {
 
   return {
     kind: 'core/image',
+    label: '画像',
     diff: {
       modes: [
         { id: 'side', label: '並べて' }, { id: 'swipe', label: 'スライダー' },
