@@ -1,5 +1,8 @@
+// @ts-check
 // 管理ページ（/ui/manage）のロジック。manage.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/manage.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 async function init() {
   const me = await requireAuth();
   if (!me) return;
@@ -44,7 +47,7 @@ async function manageGroupMembers(groupId, groupName) {
   gmGroupId = groupId;
   $('gm-name').textContent = groupName;
   await renderGroupMembers();
-  $('gm-modal').showModal();
+  /** @type {HTMLDialogElement} */ ($('gm-modal')).showModal();
 }
 
 async function renderGroupMembers() {
@@ -63,16 +66,16 @@ async function renderGroupMembers() {
   // 追加候補 = 未所属ユーザー
   const memberSet = new Set(members);
   const candidates = users.filter(u => !memberSet.has(u.id));
-  const sel = $('gm-add-select');
+  const sel = /** @type {HTMLSelectElement} */ ($('gm-add-select'));
   sel.innerHTML = candidates.length === 0
     ? '<option value="">(追加できるユーザーなし)</option>'
     : candidates.map(u => `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
   sel.disabled = candidates.length === 0;
-  $('gm-add-btn').disabled = candidates.length === 0;
+  /** @type {HTMLButtonElement} */ ($('gm-add-btn')).disabled = candidates.length === 0;
 }
 
 async function addMember() {
-  const uid = $('gm-add-select').value;
+  const uid = /** @type {HTMLSelectElement} */ ($('gm-add-select')).value;
   if (!uid) return;
   try {
     await api(`/api/groups/${gmGroupId}/members`, {
@@ -142,6 +145,12 @@ async function loadAudit() {
   } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
 }
 
-$('gm-close').onclick = () => $('gm-modal').close();
+$('gm-close').onclick = () => /** @type {HTMLDialogElement} */ ($('gm-modal')).close();
 $('gm-add-btn').onclick = addMember;
 init();
+
+// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
+Object.assign(window, {
+  createGroup, loadShares, loadAudit, manageGroupMembers, removeMember, revokeShare,
+});
+})();

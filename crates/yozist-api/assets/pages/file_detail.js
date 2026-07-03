@@ -1,5 +1,8 @@
+// @ts-check
 // ファイル詳細ページ（/ui/files/:id）のロジック。file_detail.html のインライン
 // <script> から切り出した静的ファイル（issue #50）。/ui/pages/file_detail.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const fileId = location.pathname.split('/').pop();
 let currentFile = null;
 let canEdit = false;          // 現在の content がテキスト編集可能か
@@ -113,7 +116,7 @@ function applyDeletedState() {
   $('fd-delete-btn').classList.toggle('hidden', d);
   $('fd-restore-btn').classList.toggle('hidden', !d);
   ['fd-update-btn', 'fd-share-btn', 'fd-perm-btn'].forEach(id => {
-    const el = $(id);
+    const el = /** @type {HTMLButtonElement} */ ($(id));
     if (el) el.disabled = d;
   });
 }
@@ -175,7 +178,7 @@ async function loadTagCandidates() {
 function renderTags() {
   const box = $('fd-tags');
   if (!box) return;
-  const q = $('fd-add-tag').value.trim().toLowerCase();
+  const q = /** @type {HTMLInputElement} */ ($('fd-add-tag')).value.trim().toLowerCase();
 
   // 割り当て済み（選択済み）。システムタグ（ext:/type: 等）は自動付与で詳細情報に
   // MIME 等として表示されるため、タグカードには出さない。
@@ -216,7 +219,7 @@ async function assignExistingTag(tagId) {
     headers: { 'content-type': 'application/json' },
   });
   if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
-  $('fd-add-tag').value = '';
+  /** @type {HTMLInputElement} */ ($('fd-add-tag')).value = '';
   await loadTags();
 }
 
@@ -755,7 +758,7 @@ async function toggleEdit() {
   const ed = $('fd-editor');
   const cont = $('fd-content');
   if (ed.classList.contains('hidden')) {
-    const ta = $('fd-edit-textarea');
+    const ta = /** @type {HTMLTextAreaElement} */ ($('fd-edit-textarea'));
     const note = $('fd-edit-note');
     if (!textVirtual) {
       // 全文ロード済み → そのまま全置換編集。
@@ -766,7 +769,7 @@ async function toggleEdit() {
       // 巨大ファイル: 表示位置から EDIT_MAX_BYTES だけを編集対象とし、
       // その前後はサーバ側でそのまま保持する（範囲置換 repl_start/repl_end）。
       // textarea が大きいとカーソル移動すら重くなるため、編集対象は小さく保つ。
-      const btn = $('fd-edit-btn');
+      const btn = /** @type {HTMLButtonElement} */ ($('fd-edit-btn'));
       const label = btn.textContent;
       btn.disabled = true;
       btn.textContent = '読み込み中…';
@@ -790,7 +793,7 @@ async function toggleEdit() {
         note.classList.add('hidden');
       }
     }
-    $('fd-edit-message').value = '';
+    /** @type {HTMLInputElement} */ ($('fd-edit-message')).value = '';
     // 表示専用欄と同じ 70vh（最大）で編集する。
     ta.style.height = Math.round(window.innerHeight * 0.7) + 'px';
     ed.classList.remove('hidden');
@@ -806,7 +809,7 @@ async function toggleEdit() {
 
 // 編集モードを終了する。未保存の変更があれば保存／破棄／戻るを選ばせる。
 async function finishEdit() {
-  const dirty = $('fd-edit-textarea').value !== editOriginal;
+  const dirty = /** @type {HTMLTextAreaElement} */ ($('fd-edit-textarea')).value !== editOriginal;
   if (dirty) {
     const choice = await uiConfirm('保存していない変更があります。保存しますか？', {
       title: '編集の終了',
@@ -865,8 +868,8 @@ async function loadEditWindow(startByte) {
 // exit=true のときのみ保存後に表示モードへ戻す（完了ボタン経由）。
 // 保存ボタンから直接呼ぶ場合は編集モードを維持する。
 async function saveEdit(exit = false) {
-  const newContent = $('fd-edit-textarea').value;
-  const msg = $('fd-edit-message').value;
+  const newContent = /** @type {HTMLTextAreaElement} */ ($('fd-edit-textarea')).value;
+  const msg = /** @type {HTMLInputElement} */ ($('fd-edit-message')).value;
   // 部分編集（editRange != null）のときは置換範囲を付けて前後の保持を依頼する。
   const params = new URLSearchParams();
   if (msg) params.set('message', msg);
@@ -877,7 +880,7 @@ async function saveEdit(exit = false) {
   const qs = params.toString();
   const url = `/api/files/${fileId}/content` + (qs ? `?${qs}` : '');
   // 大きいファイルはコミットに時間がかかるため、二重送信を防ぎ進行中を明示する。
-  const btn = $('fd-save-btn');
+  const btn = /** @type {HTMLButtonElement} */ ($('fd-save-btn'));
   const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = '保存中…';
@@ -909,7 +912,7 @@ async function saveEdit(exit = false) {
   // 置換範囲は保存後の長さに合わせて更新（次回保存のズレ防止）。
   if (editRange) editRange.end = editRange.start + new TextEncoder().encode(newContent).length;
   editOriginal = newContent;                 // 未保存状態を解消
-  $('fd-edit-message').value = '';            // メッセージは保存ごとにクリア
+  /** @type {HTMLInputElement} */ ($('fd-edit-message')).value = '';       // メッセージは保存ごとにクリア
   await loadDetail();                         // メタ・履歴・表示内容を最新化
   $('fd-content').classList.add('hidden');    // 編集継続のため表示専用欄は隠したまま
 }
@@ -918,7 +921,7 @@ async function saveEdit(exit = false) {
 // name を渡すことで display_name を更新し、mime/charset はサーバが新しい名前＋
 // 内容から再判定する。
 async function uploadContent(file) {
-  const input = $('fd-upload-input');
+  const input = /** @type {HTMLInputElement} */ ($('fd-upload-input'));
   if (!file) return;
   try {
     if (!await uiConfirm(
@@ -945,7 +948,7 @@ async function uploadContent(file) {
 }
 
 async function addTag() {
-  const name = $('fd-add-tag').value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('fd-add-tag')).value.trim();
   if (!name) return;
   const created = await json('/api/tags', { method: 'POST', body: { name } });
   const r = await api(`/api/files/${fileId}/tags`, {
@@ -953,7 +956,7 @@ async function addTag() {
     headers: { 'content-type': 'application/json' },
   });
   if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
-  $('fd-add-tag').value = '';
+  /** @type {HTMLInputElement} */ ($('fd-add-tag')).value = '';
   await loadTags();
 }
 
@@ -964,7 +967,7 @@ async function detachTag(tagId) {
 }
 
 async function addToSeries() {
-  const name = $('fd-add-series').value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('fd-add-series')).value.trim();
   if (!name) { uiToast('シリーズ名を入力してください', 'warning'); return; }
   try {
     // 入力名が既存（自分の）シリーズなら再利用し、なければ新規作成する。
@@ -975,7 +978,7 @@ async function addToSeries() {
     }
     await json(`/api/series/${sid}/members`, { method: 'POST', body: { file_id: fileId } });
     uiToast('シリーズに追加しました', 'success');
-    $('fd-add-series').value = '';
+    /** @type {HTMLInputElement} */ ($('fd-add-series')).value = '';
     await Promise.all([loadSeriesOptions(), loadFileSeries()]);
   } catch (e) {
     uiToast('シリーズ追加に失敗しました: ' + e.message, 'error');
@@ -1040,7 +1043,7 @@ function setupTouchNav() {
   const card = $('fd-content-card');
   if (!card) return;
   card.addEventListener('click', (e) => {
-    if (e.target.closest('#fd-nav-prev, #fd-nav-next')) return;  // ボタンは遷移
+    if (/** @type {HTMLElement} */ (e.target).closest('#fd-nav-prev, #fd-nav-next')) return;  // ボタンは遷移
     if (!$('fd-editor').classList.contains('hidden')) return;    // 編集モード中は無効
     card.classList.toggle('nav-revealed');
   });
@@ -1132,28 +1135,29 @@ async function grantPermission() {
   if (users.length === 0) { uiToast('ユーザーが存在しません', 'warning'); return; }
   $('perm-user').innerHTML = users.map(u =>
     `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
-  $('perm-modal').showModal();
+  /** @type {HTMLDialogElement} */ ($('perm-modal')).showModal();
 }
 
 $('perm-form').onsubmit = async (e) => {
   e.preventDefault();
-  const sel = $('perm-user');
+  const sel = /** @type {HTMLSelectElement} */ ($('perm-user'));
   const userId = sel.value;
   const uname = sel.options[sel.selectedIndex].text;
-  const mask = parseInt($('perm-mask').value, 10);
-  const allow = document.querySelector('input[name="perm-allow"]:checked').value === 'allow';
+  const mask = parseInt(/** @type {HTMLSelectElement} */ ($('perm-mask')).value, 10);
+  const allow = /** @type {HTMLInputElement} */
+    (document.querySelector('input[name="perm-allow"]:checked')).value === 'allow';
   try {
     await json('/api/acl', {
       method: 'POST',
       body: { subject: `user:${userId}`, target: `file:${fileId}`, mask, allow, priority: 10 },
     });
-    $('perm-modal').close();
+    /** @type {HTMLDialogElement} */ ($('perm-modal')).close();
     uiToast(`${uname} に ${allow ? '許可' : '拒否'} (mask=${mask}) を付与しました`, 'success');
   } catch (err) {
     uiToast('権限付与に失敗しました: ' + err.message, 'error');
   }
 };
-$('perm-cancel').onclick = () => $('perm-modal').close();
+$('perm-cancel').onclick = () => /** @type {HTMLDialogElement} */ ($('perm-modal')).close();
 
 async function deleteFile() {
   if (!await uiConfirm(`"${currentFile.display_name}" を削除しますか？`, { danger: true, okText: '削除' })) return;
@@ -1163,3 +1167,13 @@ async function deleteFile() {
 }
 
 init();
+
+// テンプレート／生成 HTML のインライン onclick 等から参照される関数を明示的に公開する。
+Object.assign(window, {
+  startRename, toggleEdit, saveEdit, uploadContent, downloadContent,
+  deleteFile, restoreFile, rollback,
+  renderTags, addTag, detachTag, assignExistingTag,
+  addToSeries, removeFromSeries, gotoFile,
+  issueShare, grantPermission,
+});
+})();

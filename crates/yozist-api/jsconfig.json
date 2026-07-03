@@ -1,0 +1,11 @@
+{
+  "//": "assets/ 配下の静的 JS の型チェック設定（issue #53）。checkJs: false のため // @ts-check を付けたファイルだけがチェックされる（段階適用）。TS 6 は strict がデフォルトなので非 strict を明示する。検証: npx -y -p typescript tsc --noEmit -p crates/yozist-api/jsconfig.json",
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "checkJs": false,
+    "strict": false,
+    "noEmit": true
+  },
+  "include": ["assets/**/*.js"]
+}

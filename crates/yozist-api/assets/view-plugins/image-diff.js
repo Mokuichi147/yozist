@@ -1,3 +1,4 @@
+// @ts-check
 // core/image ビュープラグイン（並べて / スライダー / 重ね合わせ / 差分）。
 ViewRuntime.registerView((() => {
   const { $, fmtSize, bytesEqual, imageInfo } = ViewRuntime.host;

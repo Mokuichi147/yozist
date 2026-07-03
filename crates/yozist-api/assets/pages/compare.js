@@ -1,3 +1,4 @@
+// @ts-check
 // 比較ページ（/ui/files/:id/compare）のロジック。compare.html のインライン <script> から
 // 切り出した静的ファイル（issue #50）。/ui/pages/compare.js で配信される。
 // ===========================================================================
@@ -7,6 +8,8 @@
 //   「2 コミットを解決 → 種別が一致すれば該当ビューへ、不一致ならメタ比較へ」
 // というオーケストレーションだけを担う。新形式は変換＋ビューの登録で増やせる。
 // ===========================================================================
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 
 const parts = location.pathname.split('/').filter(Boolean);
 // /ui/files/:id/compare → ['ui','files',':id','compare']
@@ -26,8 +29,8 @@ let fileName = null;
 const bytesCache = new Map(); // commitId → Uint8Array（生バイト。変換/種別判定の共通源）
 
 const detailUrl = '/ui/files/' + fileId;
-$('back-detail').href = detailUrl;
-$('back-link').href = detailUrl;
+/** @type {HTMLAnchorElement} */ ($('back-detail')).href = detailUrl;
+/** @type {HTMLAnchorElement} */ ($('back-link')).href = detailUrl;
 
 // ---------------------------------------------------------------------------
 // 共有ユーティリティ
@@ -105,8 +108,8 @@ async function renderCurrent() {
 }
 
 function update() {
-  const baseId = $('sel-base').value;
-  const compareId = $('sel-compare').value;
+  const baseId = /** @type {HTMLSelectElement} */ ($('sel-base')).value;
+  const compareId = /** @type {HTMLSelectElement} */ ($('sel-compare')).value;
   const newUrl = `${location.pathname}?base=${baseId}&compare=${compareId}`;
   window.history.replaceState(null, '', newUrl);
   $('cmp-message').classList.add('hidden');
@@ -141,8 +144,10 @@ function optionLabel(c) {
 function buildSelectors() {
   const opts = history.map(c =>
     `<option value="${c.id}">${escapeHtml(optionLabel(c))}</option>`).join('');
-  $('sel-base').innerHTML = opts;
-  $('sel-compare').innerHTML = opts;
+  const selBase = /** @type {HTMLSelectElement} */ ($('sel-base'));
+  const selCompare = /** @type {HTMLSelectElement} */ ($('sel-compare'));
+  selBase.innerHTML = opts;
+  selCompare.innerHTML = opts;
 
   // 既定: compare = current、base = それより 1 つ古いコミット
   const sorted = history.slice().sort((a, b) =>
@@ -152,14 +157,14 @@ function buildSelectors() {
   const defBase = (curIdx >= 0 && sorted[curIdx + 1]) ? sorted[curIdx + 1].id
     : (sorted[1] ? sorted[1].id : defCompare);
 
-  $('sel-base').value = qs.get('base') || defBase || '';
-  $('sel-compare').value = qs.get('compare') || defCompare || '';
+  selBase.value = qs.get('base') || defBase || '';
+  selCompare.value = qs.get('compare') || defCompare || '';
   // 値が history に無い場合のフォールバック
-  if (!$('sel-base').value && history[0]) $('sel-base').value = history[0].id;
-  if (!$('sel-compare').value && history[0]) $('sel-compare').value = history[0].id;
+  if (!selBase.value && history[0]) selBase.value = history[0].id;
+  if (!selCompare.value && history[0]) selCompare.value = history[0].id;
 
-  $('sel-base').onchange = update;
-  $('sel-compare').onchange = update;
+  selBase.onchange = update;
+  selCompare.onchange = update;
 }
 
 async function init() {
@@ -194,3 +199,4 @@ async function init() {
 }
 
 init();
+})();

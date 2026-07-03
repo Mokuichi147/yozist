@@ -1,5 +1,8 @@
+// @ts-check
 // タグ一覧ページ（/ui/tags）のロジック。tags.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/tags.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 let tags = [];
 // 選択中タグ ID の集合（合流対象）
 const selected = new Set();
@@ -37,8 +40,8 @@ async function loadTags() {
 
 // 選択中の基準・方向で tags を並べ替える。件数が同じ場合は名前で安定させる。
 function sortTags() {
-  const key = $('sort-key').value;
-  const sign = $('sort-dir').value === 'desc' ? -1 : 1;
+  const key = /** @type {HTMLSelectElement} */ ($('sort-key')).value;
+  const sign = /** @type {HTMLSelectElement} */ ($('sort-dir')).value === 'desc' ? -1 : 1;
   tags.sort((a, b) => {
     let d;
     if (key === 'count') d = a.count - b.count;
@@ -51,7 +54,8 @@ function sortTags() {
 // 基準変更時は方向を既定値（名前→昇順 / 件数→降順）に合わせてから並べ替える。
 // 方向はその後ユーザーが手動で上書きできる。
 function onSortKeyChange() {
-  $('sort-dir').value = $('sort-key').value === 'count' ? 'desc' : 'asc';
+  /** @type {HTMLSelectElement} */ ($('sort-dir')).value =
+    /** @type {HTMLSelectElement} */ ($('sort-key')).value === 'count' ? 'desc' : 'asc';
   applySort();
 }
 
@@ -98,12 +102,12 @@ function clearSelection() {
 function updateMergeBar() {
   const bar = $('merge-bar');
   const active = selected.size > 0;
-  $('merge-count').textContent = selected.size;
+  $('merge-count').textContent = String(selected.size);
   bar.classList.toggle('hidden', !active);
   // 固定バーが最下行に重ならないよう、表示中はコンテナ下部に余白を確保する
   $('main').classList.toggle('pb-24', active);
   // 合流は 2 件以上で有効
-  $('merge-btn').disabled = selected.size < 2;
+  /** @type {HTMLButtonElement} */ ($('merge-btn')).disabled = selected.size < 2;
 }
 
 // ---- 追加 ----
@@ -164,11 +168,11 @@ function openMerge() {
       <span class="badge badge-sm ${tagVariant(t.kind)} gap-1">${escapeHtml(t.name)}${tagIcon(t.kind)}</span>
       <span class="text-xs opacity-50">${t.count} 件</span>
     </label>`).join('');
-  $('merge-modal').showModal();
+  /** @type {HTMLDialogElement} */ ($('merge-modal')).showModal();
 }
 
 async function confirmMerge() {
-  const sel = document.querySelector('input[name="merge-target"]:checked');
+  const sel = /** @type {HTMLInputElement|null} */ (document.querySelector('input[name="merge-target"]:checked'));
   if (!sel) return;
   const targetId = sel.value;
   const sourceIds = [...selected].filter(id => id !== targetId);
@@ -178,7 +182,7 @@ async function confirmMerge() {
       method: 'POST',
       body: { source_ids: sourceIds, target_id: targetId },
     });
-    $('merge-modal').close();
+    /** @type {HTMLDialogElement} */ ($('merge-modal')).close();
     const target = tagById(targetId);
     uiToast(`${sourceIds.length} 件のタグを「${target ? target.name : ''}」に合流しました`, 'success');
     selected.clear();
@@ -186,6 +190,13 @@ async function confirmMerge() {
   } catch (e) { uiToast('合流に失敗しました: ' + e.message, 'error'); }
 }
 
-$('merge-cancel').onclick = () => $('merge-modal').close();
+$('merge-cancel').onclick = () => /** @type {HTMLDialogElement} */ ($('merge-modal')).close();
 $('merge-confirm').onclick = confirmMerge;
 init();
+
+// テンプレート／生成 HTML のインライン onclick/onchange から参照される関数を明示的に公開する。
+Object.assign(window, {
+  loadTags, onSortKeyChange, applySort, toggleSelect, clearSelection,
+  createTag, renameTag, deleteTag, openMerge,
+});
+})();

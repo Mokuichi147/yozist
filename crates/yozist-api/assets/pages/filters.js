@@ -1,6 +1,9 @@
+// @ts-check
 // フィルター一覧ページ（/ui/filters）のロジック。filters.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/filters.js で配信される。
 // 作成者本人のみ編集・削除を許可（サーバ側でも検証）。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 let myUserId = null;
 let editingId = null;
 
@@ -174,15 +177,16 @@ function makeRow(c) {
     <select class="q-field select select-bordered select-sm w-48 shrink-0">${FIELD_OPTIONS}</select>
     <span class="q-controls flex items-center gap-2 flex-1 min-w-0"></span>
     <button type="button" class="btn btn-sm btn-square btn-ghost q-del shrink-0" title="この条件を削除">−</button>`;
-  const fieldSel = row.querySelector('.q-field');
+  const fieldSel = /** @type {HTMLSelectElement} */ (row.querySelector('.q-field'));
   fieldSel.value = c.field;
-  row.querySelector('.q-controls').innerHTML = renderControls(type, c.op, c.value, c.unit, c.field);
+  row.querySelector('.q-controls').innerHTML =
+    renderControls(type, c.op, c.value, c.unit, c.field);
   // 属性変更時は演算子・値コントロール（タグ候補の参照先含む）を作り直す。
   fieldSel.onchange = () => {
     const t = FIELD_TYPE[fieldSel.value] || 'tag';
     row.querySelector('.q-controls').innerHTML = renderControls(t, null, '', null, fieldSel.value);
   };
-  row.querySelector('.q-del').onclick = () => {
+  /** @type {HTMLElement} */ (row.querySelector('.q-del')).onclick = () => {
     const rows = $('q-rows');
     if (rows.children.length > 1) row.remove();
     else row.replaceWith(makeRow()); // 最後の1行は空にリセット
@@ -203,14 +207,14 @@ function setRows(q) {
 function collectConditions() {
   const conditions = [];
   $('q-rows').querySelectorAll('.q-row').forEach(row => {
-    const field = row.querySelector('.q-field').value;
+    const field = /** @type {HTMLSelectElement} */ (row.querySelector('.q-field')).value;
     const type = FIELD_TYPE[field] || 'tag';
-    const op = row.querySelector('.q-op').value;
-    const valEl = row.querySelector('.q-val');
+    const op = /** @type {HTMLSelectElement} */ (row.querySelector('.q-op')).value;
+    const valEl = /** @type {HTMLInputElement|HTMLSelectElement} */ (row.querySelector('.q-val'));
     const value = (valEl.value || '').trim();
     if (!value) return; // 値が空の行は無視
     const c = { field, op, value };
-    if (type === 'date') c.unit = row.querySelector('.q-unit').value;
+    if (type === 'date') c.unit = /** @type {HTMLSelectElement} */ (row.querySelector('.q-unit')).value;
     conditions.push(c);
   });
   return conditions;
@@ -224,29 +228,29 @@ async function openQueryModal(mode, id) {
     let q;
     try { q = await json(`/api/filters/${id}`); }
     catch (e) { uiToast('取得に失敗しました', 'error'); return; }
-    $('q-name').value = q.name;
-    $('q-desc').value = q.description || '';
-    $('q-match').value = q.definition.match_mode || 'all';
+    /** @type {HTMLInputElement} */ ($('q-name')).value = q.name;
+    /** @type {HTMLTextAreaElement} */ ($('q-desc')).value = q.description || '';
+    /** @type {HTMLSelectElement} */ ($('q-match')).value = q.definition.match_mode || 'all';
     setRows(q.definition);
   } else {
-    $('q-name').value = '';
-    $('q-desc').value = '';
-    $('q-match').value = 'all';
+    /** @type {HTMLInputElement} */ ($('q-name')).value = '';
+    /** @type {HTMLTextAreaElement} */ ($('q-desc')).value = '';
+    /** @type {HTMLSelectElement} */ ($('q-match')).value = 'all';
     setRows({});
   }
-  $('q-modal').showModal();
+  /** @type {HTMLDialogElement} */ ($('q-modal')).showModal();
   $('q-name').focus();
 }
 
 async function saveQuery() {
-  const name = $('q-name').value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('q-name')).value.trim();
   if (!name) { uiToast('フィルター名を入力してください', 'warning'); return; }
-  const desc = $('q-desc').value.trim();
+  const desc = /** @type {HTMLTextAreaElement} */ ($('q-desc')).value.trim();
   // すべて conditions で表現し、レガシー tags_* はクリアする。
   const body = {
     name,
     description: desc || null,
-    match_mode: $('q-match').value,
+    match_mode: /** @type {HTMLSelectElement} */ ($('q-match')).value,
     conditions: collectConditions(),
     tags_and: [],
     tags_not: [],
@@ -259,7 +263,7 @@ async function saveQuery() {
       await json('/api/filters', { method: 'POST', body });
       uiToast('フィルターを作成しました', 'success');
     }
-    $('q-modal').close();
+    /** @type {HTMLDialogElement} */ ($('q-modal')).close();
     await loadQueries();
   } catch (e) { uiToast('保存に失敗しました: ' + e.message, 'error'); }
 }
@@ -288,6 +292,10 @@ async function shareQuery(id, name) {
 }
 
 $('q-add-row').onclick = () => $('q-rows').appendChild(makeRow());
-$('q-cancel').onclick = () => $('q-modal').close();
+$('q-cancel').onclick = () => /** @type {HTMLDialogElement} */ ($('q-modal')).close();
 $('q-save').onclick = saveQuery;
 init();
+
+// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
+Object.assign(window, { openQueryModal, deleteQuery, shareQuery });
+})();

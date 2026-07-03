@@ -1,3 +1,4 @@
+// @ts-check
 // core/binary ビュープラグイン（メタ比較・フォールバック・種別不一致の受け皿）。
 (() => {
   const { fmtSize, imageInfo } = ViewRuntime.host;

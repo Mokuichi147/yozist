@@ -1,5 +1,8 @@
+// @ts-check
 // ファイル一覧ページ（/ui/files）のロジック。files.html のインライン <script> から
 // 切り出した静的ファイル（issue #50）。/ui/pages/files.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const PAGE = 100;
 
 let allTags = [];
@@ -30,7 +33,7 @@ async function loadTags() {
 
 function renderTags() {
   const el = $('f-tags');
-  const filter = ($('f-tag-search').value || '').trim().toLowerCase();
+  const filter = (/** @type {HTMLInputElement} */ ($('f-tag-search')).value || '').trim().toLowerCase();
   // 選択中タグは絞り込みに関わらず常に先頭へ（解除手段を見失わないように）
   const visible = allTags.filter(t =>
     selectedTags.has(t.name) || !filter || t.name.toLowerCase().includes(filter));
@@ -40,7 +43,7 @@ function renderTags() {
     return;
   }
   visible.sort((a, b) =>
-    (selectedTags.has(b.name) - selectedTags.has(a.name)) || a.name.localeCompare(b.name));
+    (Number(selectedTags.has(b.name)) - Number(selectedTags.has(a.name))) || a.name.localeCompare(b.name));
   el.innerHTML = '';
   visible.forEach(t => {
     const active = selectedTags.has(t.name);
@@ -90,23 +93,23 @@ function applyFiltersDebounced() {
 }
 
 function resetFilters() {
-  $('f-search').value = '';
-  $('f-name').value = '';
-  $('f-series').value = '';
-  $('f-filter').value = '';
+  /** @type {HTMLInputElement} */ ($('f-search')).value = '';
+  /** @type {HTMLInputElement} */ ($('f-name')).value = '';
+  /** @type {HTMLSelectElement} */ ($('f-series')).value = '';
+  /** @type {HTMLSelectElement} */ ($('f-filter')).value = '';
   selectedTags.clear();
   renderTags();
   applyFilters();
 }
 
-function sortVal() { return $('f-sort').value || 'updated_desc'; }
+function sortVal() { return /** @type {HTMLSelectElement} */ ($('f-sort')).value || 'updated_desc'; }
 
 function saveFiltersToUrl() {
   const params = new URLSearchParams();
-  const q = $('f-search').value.trim();
-  const name = $('f-name').value.trim();
-  const series = $('f-series').value;
-  const filter = $('f-filter').value;
+  const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
+  const series = /** @type {HTMLSelectElement} */ ($('f-series')).value;
+  const filter = /** @type {HTMLSelectElement} */ ($('f-filter')).value;
   if (q) params.set('q', q);
   if (name) params.set('name', name);
   if (series) params.set('series', series);
@@ -119,12 +122,12 @@ function saveFiltersToUrl() {
 
 function restoreFiltersFromUrl() {
   const p = new URLSearchParams(location.search);
-  if (p.get('q')) $('f-search').value = p.get('q');
-  if (p.get('name')) $('f-name').value = p.get('name');
-  if (p.get('series')) $('f-series').value = p.get('series');
-  if (p.get('filter')) $('f-filter').value = p.get('filter');
+  if (p.get('q')) /** @type {HTMLInputElement} */ ($('f-search')).value = p.get('q');
+  if (p.get('name')) /** @type {HTMLInputElement} */ ($('f-name')).value = p.get('name');
+  if (p.get('series')) /** @type {HTMLSelectElement} */ ($('f-series')).value = p.get('series');
+  if (p.get('filter')) /** @type {HTMLSelectElement} */ ($('f-filter')).value = p.get('filter');
   if (p.get('tags')) p.get('tags').split(',').filter(Boolean).forEach(t => selectedTags.add(t));
-  if (p.get('sort')) $('f-sort').value = p.get('sort');
+  if (p.get('sort')) /** @type {HTMLSelectElement} */ ($('f-sort')).value = p.get('sort');
   renderTags();
 }
 
@@ -132,10 +135,10 @@ function restoreFiltersFromUrl() {
 
 async function applyFilters() {
   saveFiltersToUrl();
-  const q = $('f-search').value.trim();
-  const name = $('f-name').value.trim();
-  const seriesId = $('f-series').value;
-  const filterId = $('f-filter').value;
+  const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
+  const seriesId = /** @type {HTMLSelectElement} */ ($('f-series')).value;
+  const filterId = /** @type {HTMLSelectElement} */ ($('f-filter')).value;
   const tags = [...selectedTags];
 
   browseMode = !q && tags.length === 0 && !seriesId && !name && !filterId;
@@ -225,7 +228,7 @@ async function fetchBrowsePage() {
 }
 
 async function loadMore() {
-  const btn = $('load-more');
+  const btn = /** @type {HTMLButtonElement} */ ($('load-more'));
   btn.disabled = true;
   btn.textContent = '読み込み中…';
   try { await fetchBrowsePage(); }
@@ -257,7 +260,7 @@ async function fetchTagsFor(ids) {
     } catch (e) { return; }
   }
   // 取得済みタグを表示中の行へ反映
-  document.querySelectorAll('[data-tags-for]').forEach(el => {
+  /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-tags-for]')).forEach(el => {
     renderRowTags(el, el.dataset.tagsFor);
   });
 }
@@ -312,12 +315,12 @@ function fileIcon(f) {
 function renderActiveFilters() {
   const el = $('active-filters');
   const chips = [];
-  const q = $('f-search').value.trim();
-  const name = $('f-name').value.trim();
-  const sel = $('f-series');
-  const fil = $('f-filter');
-  if (q) chips.push({ label: `検索: "${q}"`, clear: () => { $('f-search').value = ''; } });
-  if (name) chips.push({ label: `名前: "${name}"`, clear: () => { $('f-name').value = ''; } });
+  const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
+  const sel = /** @type {HTMLSelectElement} */ ($('f-series'));
+  const fil = /** @type {HTMLSelectElement} */ ($('f-filter'));
+  if (q) chips.push({ label: `検索: "${q}"`, clear: () => { /** @type {HTMLInputElement} */ ($('f-search')).value = ''; } });
+  if (name) chips.push({ label: `名前: "${name}"`, clear: () => { /** @type {HTMLInputElement} */ ($('f-name')).value = ''; } });
   if (sel.value) chips.push({
     label: 'シリーズ: ' + sel.options[sel.selectedIndex].text,
     clear: () => { sel.value = ''; },
@@ -369,7 +372,8 @@ function renderFiles() {
       </li>
     `).join('');
     // 取得済みタグがあれば即時反映
-    el.querySelectorAll('[data-tags-for]').forEach(t => renderRowTags(t, t.dataset.tagsFor));
+    /** @type {NodeListOf<HTMLElement>} */ (el.querySelectorAll('[data-tags-for]'))
+      .forEach(t => renderRowTags(t, t.dataset.tagsFor));
   }
 
   $('load-more-wrap').classList.toggle('hidden', !(browseMode && hasMore));
@@ -377,7 +381,8 @@ function renderFiles() {
 
 // 行内のタグチップはイベントデリゲーションで処理（クリックで絞り込みトグル）
 $('file-list').addEventListener('click', e => {
-  const tagBtn = e.target.closest('[data-tag]');
+  const tagBtn = /** @type {HTMLElement|null} */
+    (/** @type {HTMLElement} */ (e.target).closest('[data-tag]'));
   if (!tagBtn) return;
   e.preventDefault();
   toggleTag(tagBtn.dataset.tag);
@@ -457,10 +462,17 @@ async function newFile() {
 // "/" で検索ボックスへフォーカス
 document.addEventListener('keydown', e => {
   if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
-  const t = e.target;
+  const t = /** @type {HTMLElement} */ (e.target);
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
   e.preventDefault();
   $('f-search').focus();
 });
 
 init();
+
+// テンプレートのインライン onclick/onchange/oninput から参照される関数を明示的に公開する。
+Object.assign(window, {
+  applyFilters, applyFiltersDebounced, resetFilters, renderTags,
+  loadMore, uploadFiles, newFile,
+});
+})();

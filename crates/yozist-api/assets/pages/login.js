@@ -1,5 +1,8 @@
 // ログインページ（/ui/login）のロジック。login.html のインライン <script> から切り出した静的ファイル（issue #50）。
+// @ts-check
 // /ui/pages/login.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 function nextUrl() {
   const p = new URLSearchParams(location.search).get('next');
   if (p && p.startsWith('/ui')) return p;
@@ -14,8 +17,8 @@ function showError(msg) {
 
 async function doLogin() {
   $('lf-error').classList.add('hidden');
-  const username = $('lf-user').value;
-  const password = $('lf-pw').value;
+  const username = /** @type {HTMLInputElement} */ ($('lf-user')).value;
+  const password = /** @type {HTMLInputElement} */ ($('lf-pw')).value;
   try {
     const r = await fetch('/api/auth/login', {
       method: 'POST',
@@ -26,7 +29,9 @@ async function doLogin() {
     const d = await r.json();
     localStorage.setItem('yozist_token', d.token);
     // ブラウザのパスワードマネージャーに保存をリクエスト
-    if (window.PasswordCredential) {
+    // （PasswordCredential は lib.dom に型定義が無いため window 経由で参照する）
+    const PasswordCredential = /** @type {*} */ (window).PasswordCredential;
+    if (PasswordCredential) {
       try {
         const cred = new PasswordCredential({ id: username, password, name: username });
         await navigator.credentials.store(cred);
@@ -41,8 +46,8 @@ async function doLogin() {
 
 async function doRegister() {
   $('lf-error').classList.add('hidden');
-  const username = $('lf-user').value;
-  const password = $('lf-pw').value;
+  const username = /** @type {HTMLInputElement} */ ($('lf-user')).value;
+  const password = /** @type {HTMLInputElement} */ ($('lf-pw')).value;
   if (!username || !password) { showError('username / password を入力してください'); return; }
   try {
     const r = await fetch('/api/auth/register', {
@@ -70,4 +75,5 @@ $('register-btn').addEventListener('click', (e) => { e.preventDefault(); doRegis
     const me = await r.json();
     if (!me.anonymous) location.href = nextUrl();
   } catch (_) {}
+})();
 })();

@@ -1,3 +1,4 @@
+// @ts-check
 // core/text ビュープラグイン（行差分: unified / split）。
 // base.html 共有 ViewRuntime に登録。内部関数は IIFE スコープに隔離され、
 // 外部とはホスト基盤(ViewRuntime.host)と registerView のみで接続する。

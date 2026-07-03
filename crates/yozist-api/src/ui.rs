@@ -292,6 +292,7 @@ mod tests {
         let res = common_js_asset().await;
         assert_eq!(res.status(), StatusCode::OK);
         // base.html から切り出した共有ユーティリティが埋め込まれていること。
-        assert!(COMMON_JS.contains("window.ViewRuntime = ViewRuntime;"));
+        // （#53 で window への代入に JSDoc キャストが付いたため後方一致で検証する）
+        assert!(COMMON_JS.contains("(window).ViewRuntime = ViewRuntime;"));
     }
 }
