@@ -8,12 +8,9 @@ function showMsg(el, text, ok) {
   el.className = 'text-sm mt-2 ' + (ok ? 'text-success' : 'text-error');
 }
 
-let currentUser = null;
-
 async function init() {
   const me = await requireAuth();
   if (!me) return;
-  currentUser = me.user;
   $('acc-username').textContent = me.user.username;
   /** @type {HTMLInputElement} */ ($('dn-input')).value = me.user.display_name || '';
 
@@ -39,7 +36,6 @@ async function saveDisplayName() {
   /** @type {HTMLButtonElement} */ ($('dn-save')).disabled = true;
   try {
     const user = await json('/api/auth/me', { method: 'PATCH', body: { display_name } });
-    currentUser = user;
     $('me').textContent = user.display_name || user.username;
     showMsg(el, 'ユーザー名を変更しました。', true);
   } catch (e) {
