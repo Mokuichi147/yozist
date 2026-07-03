@@ -32,29 +32,26 @@ async function loadTags() {
 }
 
 function renderTags() {
-  const el = $('f-tags');
+  const box = $('f-tags');
   const filter = (/** @type {HTMLInputElement} */ ($('f-tag-search')).value || '').trim().toLowerCase();
   // 選択中タグは絞り込みに関わらず常に先頭へ（解除手段を見失わないように）
   const visible = allTags.filter(t =>
     selectedTags.has(t.name) || !filter || t.name.toLowerCase().includes(filter));
   if (visible.length === 0) {
-    el.innerHTML = '<span class="text-xs opacity-50">' +
-      (allTags.length === 0 ? 'タグなし' : '該当するタグなし') + '</span>';
+    box.replaceChildren(el('span', { class: 'text-xs opacity-50' },
+      allTags.length === 0 ? 'タグなし' : '該当するタグなし'));
     return;
   }
   visible.sort((a, b) =>
     (Number(selectedTags.has(b.name)) - Number(selectedTags.has(a.name))) || a.name.localeCompare(b.name));
-  el.innerHTML = '';
-  visible.forEach(t => {
+  box.replaceChildren(...visible.map(t => {
     const active = selectedTags.has(t.name);
-    const btn = document.createElement('button');
-    btn.className = 'badge badge-sm cursor-pointer ' +
-      (active ? 'badge-primary' : 'badge-outline');
     const icon = t.kind === 'system' ? ' ⚙' : t.kind === 'ai' ? ' 🤖' : '';
-    btn.textContent = t.name + icon;
-    btn.onclick = () => toggleTag(t.name);
-    el.appendChild(btn);
-  });
+    return el('button', {
+      class: 'badge badge-sm cursor-pointer ' + (active ? 'badge-primary' : 'badge-outline'),
+      onclick: () => toggleTag(t.name),
+    }, t.name + icon);
+  }));
 }
 
 function toggleTag(name) {
@@ -67,9 +64,10 @@ function toggleTag(name) {
 async function loadSeries() {
   try {
     const list = await json('/api/series');
-    const sel = $('f-series');
-    sel.innerHTML = '<option value="">(指定なし)</option>' +
-      list.map(s => `<option value="${s.id}">${escapeHtml(s.name)}</option>`).join('');
+    $('f-series').replaceChildren(
+      el('option', { value: '' }, '(指定なし)'),
+      ...list.map(s => el('option', { value: s.id }, s.name)),
+    );
   } catch (e) {}
 }
 
@@ -78,9 +76,10 @@ async function loadSeries() {
 async function loadFilters() {
   try {
     const list = await json('/api/filters');
-    const sel = $('f-filter');
-    sel.innerHTML = '<option value="">(指定なし)</option>' +
-      list.map(q => `<option value="${q.id}">${escapeHtml(q.name)}</option>`).join('');
+    $('f-filter').replaceChildren(
+      el('option', { value: '' }, '(指定なし)'),
+      ...list.map(q => el('option', { value: q.id }, q.name)),
+    );
   } catch (e) {}
 }
 
@@ -260,24 +259,26 @@ async function fetchTagsFor(ids) {
     } catch (e) { return; }
   }
   // 取得済みタグを表示中の行へ反映
-  /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-tags-for]')).forEach(el => {
-    renderRowTags(el, el.dataset.tagsFor);
+  /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-tags-for]')).forEach(node => {
+    renderRowTags(node, node.dataset.tagsFor);
   });
 }
 
-function renderRowTags(el, fileId) {
+function renderRowTags(box, fileId) {
   // システムタグ (ext:* / type:*) は拡張子から自明なので行には出さない
   const tags = (tagsByFile[fileId] || []).filter(t => t.kind !== 'system');
-  if (tags.length === 0) { el.innerHTML = ''; return; }
+  if (tags.length === 0) { box.replaceChildren(); return; }
   const MAX = 4;
-  const shown = tags.slice(0, MAX);
-  el.innerHTML = shown.map(t => {
-    const active = selectedTags.has(t.name);
-    return `<button class="badge badge-xs ${active ? 'badge-primary' : 'badge-ghost'}"
-                    data-tag="${escapeHtml(t.name)}"
-                    title="このタグで絞り込み">${escapeHtml(t.name)}</button>`;
-  }).join('') +
-  (tags.length > MAX ? `<span class="badge badge-xs badge-ghost opacity-60">+${tags.length - MAX}</span>` : '');
+  box.replaceChildren();
+  elAppend(box, [
+    tags.slice(0, MAX).map(t => el('button', {
+      class: `badge badge-xs ${selectedTags.has(t.name) ? 'badge-primary' : 'badge-ghost'}`,
+      'data-tag': t.name,
+      title: 'このタグで絞り込み',
+    }, t.name)),
+    tags.length > MAX &&
+      el('span', { class: 'badge badge-xs badge-ghost opacity-60' }, `+${tags.length - MAX}`),
+  ]);
 }
 
 // ---- 一覧描画 ----
@@ -291,9 +292,10 @@ function fmtSize(n) {
 }
 
 // 更新者（なければ作成者）を「 · name」形式で返す。未記録（旧データ・SMB 経由）は空。
+// テキストノードとして挿入する（el() ヘルパー）ためエスケープ不要。
 function actorLabel(f) {
   const who = f.updated_by || f.created_by;
-  return who ? ` · ${escapeHtml(who)}` : '';
+  return who ? ` · ${who}` : '';
 }
 
 function fileIcon(f) {
@@ -313,7 +315,7 @@ function fileIcon(f) {
 }
 
 function renderActiveFilters() {
-  const el = $('active-filters');
+  const box = $('active-filters');
   const chips = [];
   const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
   const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
@@ -333,15 +335,11 @@ function renderActiveFilters() {
     label: 'タグ: ' + t,
     clear: () => { selectedTags.delete(t); renderTags(); },
   }));
-  el.innerHTML = '';
-  chips.forEach(c => {
-    const b = document.createElement('button');
-    b.className = 'badge badge-sm badge-outline gap-1 cursor-pointer hover:badge-error';
-    b.title = 'このフィルタを解除';
-    b.textContent = c.label + ' ×';
-    b.onclick = () => { c.clear(); applyFilters(); };
-    el.appendChild(b);
-  });
+  box.replaceChildren(...chips.map(c => el('button', {
+    class: 'badge badge-sm badge-outline gap-1 cursor-pointer hover:badge-error',
+    title: 'このフィルタを解除',
+    onclick: () => { c.clear(); applyFilters(); },
+  }, c.label + ' ×')));
 }
 
 function renderFiles() {
@@ -349,30 +347,28 @@ function renderFiles() {
   $('files-count').textContent = `(${allFiles.length}${browseMode && hasMore ? '+' : ''})`;
   renderActiveFilters();
 
-  const el = $('file-list');
+  const list = $('file-list');
   if (allFiles.length === 0) {
-    el.innerHTML = browseMode
-      ? '<li class="px-2 py-8 opacity-60 text-sm text-center">ファイルがありません。「アップロード」または「新規テキスト」で追加できます。</li>'
-      : '<li class="px-2 py-8 opacity-60 text-sm text-center">該当ファイルなし — フィルタ条件を見直してください。</li>';
+    list.replaceChildren(el('li', { class: 'px-2 py-8 opacity-60 text-sm text-center' },
+      browseMode
+        ? 'ファイルがありません。「アップロード」または「新規テキスト」で追加できます。'
+        : '該当ファイルなし — フィルタ条件を見直してください。'));
   } else {
-    el.innerHTML = allFiles.map(f => `
-      <li>
-        <a href="/ui/files/${f.id}" class="flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200">
-          <span class="text-lg shrink-0" aria-hidden="true">${fileIcon(f)}</span>
-          <span class="min-w-0 flex-1">
-            <span class="font-semibold truncate block">${escapeHtml(f.display_name)}</span>
-            <span class="flex flex-wrap gap-1 mt-0.5 empty:hidden" data-tags-for="${f.id}"></span>
-          </span>
-          <!-- base.html の .hidden は !important なので sm:block で上書きできない。max-sm:hidden を使う -->
-          <span class="text-xs opacity-60 shrink-0 text-right block max-sm:hidden w-32">
-            <span class="block" title="更新日時">${fmtTs(f.updated_at)}</span>
-            <span class="block">${fmtSize(f.size)}${actorLabel(f)}</span>
-          </span>
-        </a>
-      </li>
-    `).join('');
+    list.replaceChildren(...allFiles.map(f =>
+      el('li', {}, el('a', { href: `/ui/files/${f.id}`, class: 'flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200' }, [
+        el('span', { class: 'text-lg shrink-0', 'aria-hidden': 'true' }, fileIcon(f)),
+        el('span', { class: 'min-w-0 flex-1' }, [
+          el('span', { class: 'font-semibold truncate block' }, f.display_name),
+          el('span', { class: 'flex flex-wrap gap-1 mt-0.5 empty:hidden', 'data-tags-for': f.id }),
+        ]),
+        // base.html の .hidden は !important なので sm:block で上書きできない。max-sm:hidden を使う
+        el('span', { class: 'text-xs opacity-60 shrink-0 text-right block max-sm:hidden w-32' }, [
+          el('span', { class: 'block', title: '更新日時' }, fmtTs(f.updated_at)),
+          el('span', { class: 'block' }, fmtSize(f.size) + actorLabel(f)),
+        ]),
+      ]))));
     // 取得済みタグがあれば即時反映
-    /** @type {NodeListOf<HTMLElement>} */ (el.querySelectorAll('[data-tags-for]'))
+    /** @type {NodeListOf<HTMLElement>} */ (list.querySelectorAll('[data-tags-for]'))
       .forEach(t => renderRowTags(t, t.dataset.tagsFor));
   }
 
