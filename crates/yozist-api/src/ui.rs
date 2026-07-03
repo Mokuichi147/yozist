@@ -265,6 +265,14 @@ mod tests {
             "file_commit.js",
             "files.js",
             "compare.js",
+            "index.js",
+            "login.js",
+            "settings.js",
+            "manage.js",
+            "tags.js",
+            "filters.js",
+            "trash.js",
+            "series_settings.js",
         ] {
             assert!(names.contains(&expected), "missing page script: {expected}");
         }
