@@ -16,9 +16,14 @@ use axum::{
     Router,
 };
 
-// `assets/view-plugins/*.js` から build.rs が生成する `VIEW_PLUGIN_ASSETS`（`&[(&str, &str)]`）。
-// 新しいプラグイン JS はディレクトリへ追加するだけで配信対象になり、ここを編集する必要はない。
+// `assets/view-plugins/*.js` / `assets/pages/*.js` から build.rs が生成する
+// `VIEW_PLUGIN_ASSETS` / `PAGE_ASSETS`（いずれも `&[(&str, &str)]`）。
+// 新しい JS はディレクトリへ追加するだけで配信対象になり、ここを編集する必要はない。
 include!(concat!(env!("OUT_DIR"), "/view_plugin_manifest.rs"));
+include!(concat!(env!("OUT_DIR"), "/page_asset_manifest.rs"));
+
+// 全ページ共有のユーティリティ（base.html から読み込む）。
+static COMMON_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/common.js"));
 
 pub fn router() -> Router<crate::ApiState> {
     Router::new()
@@ -35,6 +40,37 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/files/:id/histories/:cid", get(file_commit_page))
         .route("/series/:id", get(series_settings_page))
         .route("/plugins/:name", get(view_plugin_asset))
+        .route("/pages/:name", get(page_asset))
+        .route("/assets/common.js", get(common_js_asset))
+}
+
+/// JS レスポンスを組み立てる（バイナリ埋め込みの静的ファイル配信）。
+fn js_response(body: &'static str) -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/javascript; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// 全ページ共有ユーティリティ（`assets/common.js`）を配信する。base.html が読み込む。
+/// テンプレート内のインライン JS を静的ファイルへ切り出したもの（issue #50）。
+async fn common_js_asset() -> Response {
+    js_response(COMMON_JS)
+}
+
+/// ページ固有ロジックの JS（`assets/pages/*.js`）を配信する。各ページテンプレートの
+/// `{% block script %}` が `<script src="/ui/pages/…">` で読み込む。配信対象は
+/// build.rs が生成する `PAGE_ASSETS` から引く（ディレクトリ内の全 `.js` が自動的に
+/// 候補になり、このハンドラを編集する必要はない）。
+async fn page_asset(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
+    let Some(&(_, body)) = PAGE_ASSETS.iter().find(|(n, _)| *n == name) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    js_response(body)
 }
 
 /// ビュープラグインの JS を配信する。各プラグインは `assets/view-plugins/` 配下の
@@ -53,14 +89,7 @@ async fn view_plugin_asset(
     let Some(&(_, body)) = VIEW_PLUGIN_ASSETS.iter().find(|(n, _)| *n == name) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/javascript; charset=utf-8",
-        )],
-        body,
-    )
-        .into_response()
+    js_response(body)
 }
 
 /// askama テンプレートを描画して HTML レスポンスにする。
@@ -224,5 +253,45 @@ mod tests {
 
         let unknown = view_plugin_asset(axum::extract::Path("does-not-exist.js".to_string())).await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn page_asset_manifest_lists_known_pages() {
+        // build.rs が assets/pages/*.js を列挙して生成するマニフェスト。
+        // テンプレートから切り出したページ JS が配信対象に含まれることの回帰テスト。
+        let names: Vec<&str> = PAGE_ASSETS.iter().map(|(n, _)| *n).collect();
+        for expected in [
+            "file_detail.js",
+            "file_commit.js",
+            "files.js",
+            "compare.js",
+            "index.js",
+            "login.js",
+            "settings.js",
+            "manage.js",
+            "tags.js",
+            "filters.js",
+            "trash.js",
+            "series_settings.js",
+        ] {
+            assert!(names.contains(&expected), "missing page script: {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn page_asset_serves_known_and_404s_unknown() {
+        let known = page_asset(axum::extract::Path("file_detail.js".to_string())).await;
+        assert_eq!(known.status(), StatusCode::OK);
+
+        let unknown = page_asset(axum::extract::Path("does-not-exist.js".to_string())).await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn common_js_asset_serves_shared_utilities() {
+        let res = common_js_asset().await;
+        assert_eq!(res.status(), StatusCode::OK);
+        // base.html から切り出した共有ユーティリティが埋め込まれていること。
+        assert!(COMMON_JS.contains("window.ViewRuntime = ViewRuntime;"));
     }
 }
