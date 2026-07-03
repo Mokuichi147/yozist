@@ -1,5 +1,7 @@
 // ファイル一覧ページ（/ui/files）のロジック。files.html のインライン <script> から
 // 切り出した静的ファイル（issue #50）。/ui/pages/files.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const PAGE = 100;
 
 let allTags = [];
@@ -464,3 +466,10 @@ document.addEventListener('keydown', e => {
 });
 
 init();
+
+// テンプレートのインライン onclick/onchange/oninput から参照される関数を明示的に公開する。
+Object.assign(window, {
+  applyFilters, applyFiltersDebounced, resetFilters, renderTags,
+  loadMore, uploadFiles, newFile,
+});
+})();

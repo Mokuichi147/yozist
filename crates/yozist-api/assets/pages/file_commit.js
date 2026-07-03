@@ -1,5 +1,7 @@
 // 単一コミット表示ページ（/ui/files/:id/histories/:cid）のロジック。file_commit.html の
 // インライン <script> から切り出した静的ファイル（issue #50）。/ui/pages/file_commit.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const parts = location.pathname.split('/').filter(Boolean);
 // /ui/files/:id/histories/:cid → ['ui','files',':id','histories',':cid']
 const fileId = parts[2];
@@ -483,3 +485,4 @@ async function init() {
 }
 
 init();
+})();

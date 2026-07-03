@@ -1,5 +1,7 @@
 // 管理ページ（/ui/manage）のロジック。manage.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/manage.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 async function init() {
   const me = await requireAuth();
   if (!me) return;
@@ -145,3 +147,9 @@ async function loadAudit() {
 $('gm-close').onclick = () => $('gm-modal').close();
 $('gm-add-btn').onclick = addMember;
 init();
+
+// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
+Object.assign(window, {
+  createGroup, loadShares, loadAudit, manageGroupMembers, removeMember, revokeShare,
+});
+})();

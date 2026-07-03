@@ -1,5 +1,7 @@
 // タグ一覧ページ（/ui/tags）のロジック。tags.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/tags.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 let tags = [];
 // 選択中タグ ID の集合（合流対象）
 const selected = new Set();
@@ -189,3 +191,10 @@ async function confirmMerge() {
 $('merge-cancel').onclick = () => $('merge-modal').close();
 $('merge-confirm').onclick = confirmMerge;
 init();
+
+// テンプレート／生成 HTML のインライン onclick/onchange から参照される関数を明示的に公開する。
+Object.assign(window, {
+  loadTags, onSortKeyChange, applySort, toggleSelect, clearSelection,
+  createTag, renameTag, deleteTag, openMerge,
+});
+})();

@@ -1,6 +1,8 @@
 // フィルター一覧ページ（/ui/filters）のロジック。filters.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/filters.js で配信される。
 // 作成者本人のみ編集・削除を許可（サーバ側でも検証）。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 let myUserId = null;
 let editingId = null;
 
@@ -291,3 +293,7 @@ $('q-add-row').onclick = () => $('q-rows').appendChild(makeRow());
 $('q-cancel').onclick = () => $('q-modal').close();
 $('q-save').onclick = saveQuery;
 init();
+
+// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
+Object.assign(window, { openQueryModal, deleteQuery, shareQuery });
+})();

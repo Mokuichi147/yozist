@@ -1,5 +1,7 @@
 // ファイル詳細ページ（/ui/files/:id）のロジック。file_detail.html のインライン
 // <script> から切り出した静的ファイル（issue #50）。/ui/pages/file_detail.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const fileId = location.pathname.split('/').pop();
 let currentFile = null;
 let canEdit = false;          // 現在の content がテキスト編集可能か
@@ -1163,3 +1165,13 @@ async function deleteFile() {
 }
 
 init();
+
+// テンプレート／生成 HTML のインライン onclick 等から参照される関数を明示的に公開する。
+Object.assign(window, {
+  startRename, toggleEdit, saveEdit, uploadContent, downloadContent,
+  deleteFile, restoreFile, rollback,
+  renderTags, addTag, detachTag, assignExistingTag,
+  addToSeries, removeFromSeries, gotoFile,
+  issueShare, grantPermission,
+});
+})();

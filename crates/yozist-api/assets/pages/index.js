@@ -1,5 +1,7 @@
 // ダッシュボードページ（/ui）のロジック。index.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/index.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 async function init() {
   const me = await requireAuth();
   if (!me) return;
@@ -352,3 +354,7 @@ async function doUpload() {
 
 setupUpload();
 init();
+
+// テンプレートのインライン onclick から参照される関数を明示的に公開する。
+Object.assign(window, { doUpload });
+})();

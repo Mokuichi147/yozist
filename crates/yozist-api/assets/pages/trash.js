@@ -1,5 +1,7 @@
 // ゴミ箱ページ（/ui/trash）のロジック。trash.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/trash.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const PAGE = 100;
 
 let items = [];       // 表示中の削除済みファイル
@@ -136,3 +138,7 @@ async function emptyTrash() {
 }
 
 init();
+
+// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
+Object.assign(window, { loadMore, restoreFile, purgeFile, emptyTrash });
+})();

@@ -1,5 +1,7 @@
 // ユーザー設定ページ（/ui/settings）のロジック。settings.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/settings.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 function showMsg(el, text, ok) {
   el.textContent = text;
   el.className = 'text-sm mt-2 ' + (ok ? 'text-success' : 'text-error');
@@ -74,3 +76,4 @@ async function changePassword(e) {
 $('dn-save').onclick = saveDisplayName;
 $('pw-form').addEventListener('submit', changePassword);
 init();
+})();

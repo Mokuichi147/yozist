@@ -1,6 +1,8 @@
 // シリーズ設定ページ（/ui/series/:id）のロジック。series_settings.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/series_settings.js で配信される。
 // URL: /ui/series/<id>
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 const seriesId = decodeURIComponent((location.pathname.match(/\/ui\/series\/([^/]+)/) || [])[1] || '');
 let members = [];          // [{ file_id, display_name }] 現在の表示順
 let savedOrder = [];       // 最後に保存された file_id の順序（dirty 判定用）
@@ -183,3 +185,7 @@ async function removeMember(i) {
 }
 
 init();
+
+// テンプレート／生成 HTML のインライン onclick/onchange から参照される関数を明示的に公開する。
+Object.assign(window, { onSortChange, saveName, saveOrder, move, removeMember });
+})();

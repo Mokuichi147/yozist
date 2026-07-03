@@ -1,5 +1,7 @@
 // ログインページ（/ui/login）のロジック。login.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/login.js で配信される。
+// IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
+(() => {
 function nextUrl() {
   const p = new URLSearchParams(location.search).get('next');
   if (p && p.startsWith('/ui')) return p;
@@ -70,4 +72,5 @@ $('register-btn').addEventListener('click', (e) => { e.preventDefault(); doRegis
     const me = await r.json();
     if (!me.anonymous) location.href = nextUrl();
   } catch (_) {}
+})();
 })();
