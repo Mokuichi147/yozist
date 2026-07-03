@@ -24,7 +24,6 @@ function tagIcon(kind) {
 }
 
 async function loadTags() {
-  const el = $('tag-list');
   try {
     // システムタグ（拡張子・種別など自動付与）は管理対象外。手動 / AI タグのみ扱う。
     tags = (await json('/api/tags/stats')).filter(t => t.kind !== 'system');
@@ -34,7 +33,7 @@ async function loadTags() {
     sortTags();
     render();
   } catch (e) {
-    el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>';
+    $('tag-list').replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
   }
 }
 
@@ -66,24 +65,26 @@ function applySort() {
 }
 
 function render() {
-  const el = $('tag-list');
+  const box = $('tag-list');
   if (tags.length === 0) {
-    el.innerHTML = '<div class="opacity-50 text-xs">タグなし</div>';
+    box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, 'タグなし'));
     updateMergeBar();
     return;
   }
-  el.innerHTML = tags.map(t => {
-    const checked = selected.has(t.id) ? 'checked' : '';
-    return `<div class="flex items-center gap-2 row-compact">
-      <input type="checkbox" class="checkbox checkbox-xs" ${checked}
-             onchange="toggleSelect('${t.id}', this.checked)">
-      <span class="badge badge-sm ${tagVariant(t.kind)} gap-1">${escapeHtml(t.name)}${tagIcon(t.kind)}</span>
-      <span class="text-xs opacity-50">${t.count} 件</span>
-      <span class="flex-1"></span>
-      <button class="btn btn-xs btn-ghost" onclick="renameTag('${t.id}')">名前変更</button>
-      <button class="btn btn-xs btn-error btn-outline" onclick="deleteTag('${t.id}')">削除</button>
-    </div>`;
-  }).join('');
+  box.replaceChildren(...tags.map(t =>
+    el('div', { class: 'flex items-center gap-2 row-compact' }, [
+      el('input', {
+        type: 'checkbox', class: 'checkbox checkbox-xs',
+        checked: selected.has(t.id),
+        onchange: (/** @type {Event} */ e) =>
+          toggleSelect(t.id, /** @type {HTMLInputElement} */ (e.target).checked),
+      }),
+      el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name + tagIcon(t.kind)),
+      el('span', { class: 'text-xs opacity-50' }, `${t.count} 件`),
+      el('span', { class: 'flex-1' }),
+      el('button', { class: 'btn btn-xs btn-ghost', onclick: () => renameTag(t.id) }, '名前変更'),
+      el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => deleteTag(t.id) }, '削除'),
+    ])));
   updateMergeBar();
 }
 
@@ -161,13 +162,15 @@ function openMerge() {
   // 既定の合流先は割り当て数が最も多いタグ
   let defaultTarget = chosen[0];
   for (const t of chosen) if (t.count > defaultTarget.count) defaultTarget = t;
-  $('merge-options').innerHTML = chosen.map(t => `
-    <label class="flex items-center gap-2 row-compact cursor-pointer">
-      <input type="radio" name="merge-target" class="radio radio-xs" value="${t.id}"
-             ${t.id === defaultTarget.id ? 'checked' : ''}>
-      <span class="badge badge-sm ${tagVariant(t.kind)} gap-1">${escapeHtml(t.name)}${tagIcon(t.kind)}</span>
-      <span class="text-xs opacity-50">${t.count} 件</span>
-    </label>`).join('');
+  $('merge-options').replaceChildren(...chosen.map(t =>
+    el('label', { class: 'flex items-center gap-2 row-compact cursor-pointer' }, [
+      el('input', {
+        type: 'radio', name: 'merge-target', class: 'radio radio-xs',
+        value: t.id, checked: t.id === defaultTarget.id,
+      }),
+      el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name + tagIcon(t.kind)),
+      el('span', { class: 'text-xs opacity-50' }, `${t.count} 件`),
+    ])));
   /** @type {HTMLDialogElement} */ ($('merge-modal')).showModal();
 }
 
@@ -194,9 +197,9 @@ $('merge-cancel').onclick = () => /** @type {HTMLDialogElement} */ ($('merge-mod
 $('merge-confirm').onclick = confirmMerge;
 init();
 
-// テンプレート／生成 HTML のインライン onclick/onchange から参照される関数を明示的に公開する。
+// テンプレートのインライン onclick/onchange から参照される関数を明示的に公開する。
+// (toggleSelect / renameTag / deleteTag は el() のクロージャ直結になり公開不要)
 Object.assign(window, {
-  loadTags, onSortKeyChange, applySort, toggleSelect, clearSelection,
-  createTag, renameTag, deleteTag, openMerge,
+  loadTags, onSortKeyChange, applySort, clearSelection, createTag, openMerge,
 });
 })();
