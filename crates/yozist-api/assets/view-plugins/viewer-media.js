@@ -6,25 +6,31 @@
 // 異なる（現在ファイル or 特定コミット）ため、object URL の生成は ctx.objectUrlFor で
 // 注入する。テキスト/不明・編集など各ページ固有の描画は各ページが別途登録する。
 (() => {
-  const { escapeHtml } = ViewRuntime.host;
+  const { el } = ViewRuntime.host;
 
   ViewRuntime.registerView({ kind: 'core/image', label: '画像', async mount(cont, ctx) {
     const url = await ctx.objectUrlFor(ctx.mime);
-    cont.innerHTML = `<img src="${url}" alt="${escapeHtml(ctx.file.display_name)}"
-      class="max-w-full max-h-[70vh] object-contain mx-auto block rounded bg-base-300/30">`;
+    cont.replaceChildren(el('img', {
+      src: url, alt: ctx.file.display_name,
+      class: 'max-w-full max-h-[70vh] object-contain mx-auto block rounded bg-base-300/30',
+    }));
   } });
   ViewRuntime.registerView({ kind: 'media/video', label: '動画', async mount(cont, ctx) {
     const url = await ctx.objectUrlFor(ctx.mime);
-    cont.innerHTML = `<video src="${url}" controls
-      class="max-w-full max-h-[70vh] mx-auto block rounded bg-black"></video>`;
+    cont.replaceChildren(el('video', {
+      src: url, controls: true,
+      class: 'max-w-full max-h-[70vh] mx-auto block rounded bg-black',
+    }));
   } });
   ViewRuntime.registerView({ kind: 'media/audio', label: '音声', async mount(cont, ctx) {
     const url = await ctx.objectUrlFor(ctx.mime);
-    cont.innerHTML = `<audio src="${url}" controls class="w-full mt-2"></audio>`;
+    cont.replaceChildren(el('audio', { src: url, controls: true, class: 'w-full mt-2' }));
   } });
   ViewRuntime.registerView({ kind: 'doc/pdf', label: 'PDF', async mount(cont, ctx) {
     const url = await ctx.objectUrlFor(ctx.mime);
-    cont.innerHTML = `<iframe src="${url}" title="${escapeHtml(ctx.file.display_name)}"
-      class="w-full h-[70vh] rounded border border-base-300"></iframe>`;
+    cont.replaceChildren(el('iframe', {
+      src: url, title: ctx.file.display_name,
+      class: 'w-full h-[70vh] rounded border border-base-300',
+    }));
   } });
 })();

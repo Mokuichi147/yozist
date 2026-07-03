@@ -81,14 +81,16 @@ function buildModeToolbar(plugin) {
   box.classList.remove('hidden'); label.classList.remove('hidden');
   if (!curMode[plugin.kind]) curMode[plugin.kind] = modes[0].id;
   const sel = curMode[plugin.kind];
-  box.innerHTML = modes.map(m =>
-    `<button class="btn btn-xs join-item ${m.id === sel ? 'btn-active' : ''}" data-mode="${m.id}">${escapeHtml(m.label)}</button>`
-  ).join('');
-  box.querySelectorAll('button').forEach(b => b.onclick = () => {
-    curMode[plugin.kind] = b.dataset.mode;
-    buildModeToolbar(plugin);
-    renderCurrent();
-  });
+  box.replaceChildren(...modes.map(m =>
+    el('button', {
+      class: `btn btn-xs join-item ${m.id === sel ? 'btn-active' : ''}`,
+      'data-mode': m.id,
+      onclick: () => {
+        curMode[plugin.kind] = m.id;
+        buildModeToolbar(plugin);
+        renderCurrent();
+      },
+    }, m.label)));
 }
 
 async function renderCurrent() {
@@ -142,12 +144,11 @@ function optionLabel(c) {
 }
 
 function buildSelectors() {
-  const opts = history.map(c =>
-    `<option value="${c.id}">${escapeHtml(optionLabel(c))}</option>`).join('');
+  const opts = () => history.map(c => el('option', { value: c.id }, optionLabel(c)));
   const selBase = /** @type {HTMLSelectElement} */ ($('sel-base'));
   const selCompare = /** @type {HTMLSelectElement} */ ($('sel-compare'));
-  selBase.innerHTML = opts;
-  selCompare.innerHTML = opts;
+  selBase.replaceChildren(...opts());
+  selCompare.replaceChildren(...opts());
 
   // 既定: compare = current、base = それより 1 つ古いコミット
   const sorted = history.slice().sort((a, b) =>
