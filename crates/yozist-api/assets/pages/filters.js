@@ -78,30 +78,43 @@ function queryText(q) {
 }
 
 async function loadQueries() {
-  const el = $('query-list');
+  const box = $('query-list');
   try {
     const list = await json('/api/filters');
-    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-sm py-2">フィルターはまだありません。「+ 新規作成」から追加してください。</div>'; return; }
-    el.innerHTML = list.map(q => {
+    if (list.length === 0) {
+      box.replaceChildren(el('div', { class: 'opacity-50 text-sm py-2' },
+        'フィルターはまだありません。「+ 新規作成」から追加してください。'));
+      return;
+    }
+    box.replaceChildren(...list.map(q => {
       const mine = canEditQuery(q);
-      const editBtns = mine ? `
-          <button class="btn btn-xs" onclick="openQueryModal('edit','${q.id}')">編集</button>
-          <button class="btn btn-xs btn-error btn-outline" onclick="deleteQuery('${q.id}','${escapeHtml(q.name)}')">削除</button>` : '';
-      return `<div class="flex items-start justify-between row-compact gap-2 border-b border-base-200 last:border-0 py-2">
-        <div class="min-w-0">
-          <div><a href="/ui/files?filter=${q.id}" class="font-semibold break-all link link-hover"
-                  title="この条件でファイル一覧を開く">${escapeHtml(q.name)}</a></div>
-          <div class="text-xs opacity-60 break-all">${escapeHtml(q.description || queryText(q))}</div>
-        </div>
-        <div class="flex gap-1 shrink-0">
-          <a href="/ui/files?filter=${q.id}" class="btn btn-xs btn-primary btn-outline"
-             title="この条件でファイル一覧を開く">開く</a>
-          <button class="btn btn-xs" onclick="shareQuery('${q.id}','${escapeHtml(q.name)}')">共有</button>
-          ${editBtns}
-        </div>
-      </div>`;
-    }).join('');
-  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+      return el('div', { class: 'flex items-start justify-between row-compact gap-2 border-b border-base-200 last:border-0 py-2' }, [
+        el('div', { class: 'min-w-0' }, [
+          el('div', {}, el('a', {
+            href: `/ui/files?filter=${q.id}`,
+            class: 'font-semibold break-all link link-hover',
+            title: 'この条件でファイル一覧を開く',
+          }, q.name)),
+          el('div', { class: 'text-xs opacity-60 break-all' }, q.description || queryText(q)),
+        ]),
+        el('div', { class: 'flex gap-1 shrink-0' }, [
+          el('a', {
+            href: `/ui/files?filter=${q.id}`,
+            class: 'btn btn-xs btn-primary btn-outline',
+            title: 'この条件でファイル一覧を開く',
+          }, '開く'),
+          el('button', { class: 'btn btn-xs', onclick: () => shareQuery(q.id, q.name) }, '共有'),
+          mine && el('button', { class: 'btn btn-xs', onclick: () => openQueryModal('edit', q.id) }, '編集'),
+          mine && el('button', {
+            class: 'btn btn-xs btn-error btn-outline',
+            onclick: () => deleteQuery(q.id, q.name),
+          }, '削除'),
+        ]),
+      ]);
+    }));
+  } catch (e) {
+    box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
+  }
 }
 
 // 属性（タグ種別）→ 参照するタグ候補 datalist の対応。
@@ -115,18 +128,18 @@ const TAG_DATALIST = {
 async function loadTagOptions() {
   try {
     const tags = await json('/api/tags');
-    const opt = ts => ts.map(t => `<option value="${escapeHtml(t.name)}"></option>`).join('');
+    const opt = ts => ts.map(t => el('option', { value: t.name }));
     // 種別ごとに候補を振り分け、種別不問用には全件を入れる。
-    $('tag-options-manual').innerHTML = opt(tags.filter(t => t.kind === 'manual'));
-    $('tag-options-system').innerHTML = opt(tags.filter(t => t.kind === 'system'));
-    $('tag-options-ai').innerHTML = opt(tags.filter(t => t.kind === 'ai'));
-    $('tag-options-all').innerHTML = opt(tags);
+    $('tag-options-manual').replaceChildren(...opt(tags.filter(t => t.kind === 'manual')));
+    $('tag-options-system').replaceChildren(...opt(tags.filter(t => t.kind === 'system')));
+    $('tag-options-ai').replaceChildren(...opt(tags.filter(t => t.kind === 'ai')));
+    $('tag-options-all').replaceChildren(...opt(tags));
   } catch (e) { /* 候補なしでも手入力できる */ }
 }
 async function loadSeriesOptions() {
   try {
     const series = await json('/api/series');
-    $('series-options').innerHTML = series.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+    $('series-options').replaceChildren(...series.map(s => el('option', { value: s.name })));
   } catch (e) { /* 同上 */ }
 }
 
@@ -134,38 +147,42 @@ async function loadSeriesOptions() {
 function opOptions(type, op) {
   let opts;
   if (type === 'tag' || type === 'series' || type === 'mime') {
-    opts = [['include', type === 'mime' ? 'を含む' : 'を含む'], ['exclude', 'を含まない']];
+    opts = [['include', 'を含む'], ['exclude', 'を含まない']];
   } else if (type === 'text') {
     opts = [['contains', 'を含む'], ['is', 'と一致'], ['starts_with', 'で始まる'], ['ends_with', 'で終わる'], ['not_contains', 'を含まない']];
   } else { // date
     opts = [['within', '以内'], ['before', 'より前'], ['after', 'より後']];
   }
-  return opts.map(([v, l]) => `<option value="${v}"${v === op ? ' selected' : ''}>${l}</option>`).join('');
+  return opts.map(([v, l]) => el('option', { value: v, selected: v === op }, l));
 }
 
+// 演算子・値コントロールの要素列を返す（呼び出し側が .q-controls へ replaceChildren する）。
 function renderControls(type, op, value, unit, field) {
-  const v = escapeHtml(value || '');
+  const v = value || '';
   // 演算子（「を含む」等）は日本語として自然になるよう値の右側（末尾）に置く。
-  const opSel = w => `<select class="q-op select select-bordered select-sm ${w} shrink-0">${opOptions(type, op)}</select>`;
+  const opSel = w => el('select', { class: `q-op select select-bordered select-sm ${w} shrink-0` }, opOptions(type, op));
   if (type === 'tag') {
     const list = TAG_DATALIST[field] || 'tag-options-all';
-    return `<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="${list}" placeholder="タグ名" value="${v}" />${opSel('w-32')}`;
+    return [el('input', { class: 'q-val input input-bordered input-sm flex-1 min-w-0', list, placeholder: 'タグ名', value: v }), opSel('w-32')];
   }
   if (type === 'series') {
-    return `<input class="q-val input input-bordered input-sm flex-1 min-w-0" list="series-options" placeholder="シリーズ名" value="${v}" />${opSel('w-32')}`;
+    return [el('input', { class: 'q-val input input-bordered input-sm flex-1 min-w-0', list: 'series-options', placeholder: 'シリーズ名', value: v }), opSel('w-32')];
   }
   if (type === 'mime') {
-    const opts = MIME_PRESETS.map(([val, lbl]) => `<option value="${val}"${val === value ? ' selected' : ''}>${lbl}</option>`).join('');
-    return `<select class="q-val select select-bordered select-sm flex-1 min-w-0">${opts}</select>${opSel('w-32')}`;
+    return [el('select', { class: 'q-val select select-bordered select-sm flex-1 min-w-0' },
+      MIME_PRESETS.map(([val, lbl]) => el('option', { value: val, selected: val === value }, lbl))), opSel('w-32')];
   }
   if (type === 'text') {
-    return `<input class="q-val input input-bordered input-sm flex-1 min-w-0" placeholder="文字列" value="${v}" />${opSel('w-32')}`;
+    return [el('input', { class: 'q-val input input-bordered input-sm flex-1 min-w-0', placeholder: '文字列', value: v }), opSel('w-32')];
   }
   // date: [数値][単位][演算子]
-  const units = [['day', '日'], ['month', 'か月'], ['year', '年']]
-    .map(([val, lbl]) => `<option value="${val}"${val === (unit || 'day') ? ' selected' : ''}>${lbl}</option>`).join('');
-  return `<input type="number" min="0" class="q-val input input-bordered input-sm w-20 shrink-0" value="${v || '1'}" />
-    <select class="q-unit select select-bordered select-sm w-24 shrink-0">${units}</select>${opSel('w-28')}`;
+  return [
+    el('input', { type: 'number', min: '0', class: 'q-val input input-bordered input-sm w-20 shrink-0', value: v || '1' }),
+    el('select', { class: 'q-unit select select-bordered select-sm w-24 shrink-0' },
+      [['day', '日'], ['month', 'か月'], ['year', '年']]
+        .map(([val, lbl]) => el('option', { value: val, selected: val === (unit || 'day') }, lbl))),
+    opSel('w-28'),
+  ];
 }
 
 function makeRow(c) {
@@ -179,12 +196,13 @@ function makeRow(c) {
     <button type="button" class="btn btn-sm btn-square btn-ghost q-del shrink-0" title="この条件を削除">−</button>`;
   const fieldSel = /** @type {HTMLSelectElement} */ (row.querySelector('.q-field'));
   fieldSel.value = c.field;
-  row.querySelector('.q-controls').innerHTML =
-    renderControls(type, c.op, c.value, c.unit, c.field);
+  row.querySelector('.q-controls').replaceChildren(
+    ...renderControls(type, c.op, c.value, c.unit, c.field));
   // 属性変更時は演算子・値コントロール（タグ候補の参照先含む）を作り直す。
   fieldSel.onchange = () => {
     const t = FIELD_TYPE[fieldSel.value] || 'tag';
-    row.querySelector('.q-controls').innerHTML = renderControls(t, null, '', null, fieldSel.value);
+    row.querySelector('.q-controls').replaceChildren(
+      ...renderControls(t, null, '', null, fieldSel.value));
   };
   /** @type {HTMLElement} */ (row.querySelector('.q-del')).onclick = () => {
     const rows = $('q-rows');
@@ -296,6 +314,7 @@ $('q-cancel').onclick = () => /** @type {HTMLDialogElement} */ ($('q-modal')).cl
 $('q-save').onclick = saveQuery;
 init();
 
-// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
-Object.assign(window, { openQueryModal, deleteQuery, shareQuery });
+// テンプレートのインライン onclick から参照される関数を明示的に公開する。
+// (deleteQuery / shareQuery は el() のクロージャ直結になり公開不要)
+Object.assign(window, { openQueryModal });
 })();

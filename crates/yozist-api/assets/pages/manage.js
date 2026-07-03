@@ -16,17 +16,21 @@ async function refresh() {
 
 // ---- groups ----
 async function loadGroups() {
-  const el = $('group-list');
+  const box = $('group-list');
   try {
     const list = await json('/api/groups');
-    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">グループなし</div>'; return; }
-    el.innerHTML = list.map(g => {
-      return `<div class="flex items-center justify-between row-compact">
-        <div><span class="font-semibold">${escapeHtml(g.name)}</span></div>
-        <button class="btn btn-xs" onclick="manageGroupMembers('${g.id}','${escapeHtml(g.name)}')">メンバー</button>
-      </div>`;
-    }).join('');
-  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+    if (list.length === 0) {
+      box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, 'グループなし'));
+      return;
+    }
+    box.replaceChildren(...list.map(g =>
+      el('div', { class: 'flex items-center justify-between row-compact' }, [
+        el('div', {}, el('span', { class: 'font-semibold' }, g.name)),
+        el('button', { class: 'btn btn-xs', onclick: () => manageGroupMembers(g.id, g.name) }, 'メンバー'),
+      ])));
+  } catch (e) {
+    box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
+  }
 }
 
 async function createGroup() {
@@ -56,20 +60,26 @@ async function renderGroupMembers() {
     json('/api/users'),
   ]);
   const usersById = Object.fromEntries(users.map(u => [u.id, u.username]));
-  const mEl = $('gm-members');
-  mEl.innerHTML = members.length === 0
-    ? '<div class="opacity-50 text-xs">メンバーなし</div>'
-    : members.map(uid => `<div class="flex items-center justify-between row-compact">
-        <span>${escapeHtml(usersById[uid] || uid.slice(0, 8))}</span>
-        <button class="btn btn-xs btn-error btn-outline" onclick="removeMember('${uid}')">除外</button>
-      </div>`).join('');
+  const mBox = $('gm-members');
+  if (members.length === 0) {
+    mBox.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, 'メンバーなし'));
+  } else {
+    mBox.replaceChildren(...members.map(uid =>
+      el('div', { class: 'flex items-center justify-between row-compact' }, [
+        el('span', {}, usersById[uid] || uid.slice(0, 8)),
+        el('button', {
+          class: 'btn btn-xs btn-error btn-outline',
+          onclick: () => removeMember(uid),
+        }, '除外'),
+      ])));
+  }
   // 追加候補 = 未所属ユーザー
   const memberSet = new Set(members);
   const candidates = users.filter(u => !memberSet.has(u.id));
   const sel = /** @type {HTMLSelectElement} */ ($('gm-add-select'));
-  sel.innerHTML = candidates.length === 0
-    ? '<option value="">(追加できるユーザーなし)</option>'
-    : candidates.map(u => `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
+  sel.replaceChildren(...(candidates.length === 0
+    ? [el('option', { value: '' }, '(追加できるユーザーなし)')]
+    : candidates.map(u => el('option', { value: u.id }, u.username))));
   sel.disabled = candidates.length === 0;
   /** @type {HTMLButtonElement} */ ($('gm-add-btn')).disabled = candidates.length === 0;
 }
@@ -99,20 +109,29 @@ async function removeMember(uid) {
 
 // ---- active shares ----
 async function loadShares() {
-  const el = $('share-list');
+  const box = $('share-list');
   try {
     const list = await json('/api/shares');
-    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">発行済み共有なし</div>'; return; }
-    el.innerHTML = list.map(s => {
-      const revoked = s.revoked_at ? ' <span class="badge badge-error badge-sm">失効</span>' : '';
-      const fullJti = s.jti;
-      return `<div class="flex items-center justify-between row-compact">
-        <span><span class="badge badge-ghost badge-sm">${escapeHtml(s.kind)}</span>
-          <span class="opacity-70">${s.target_id.slice(0,8)}…</span>${revoked}</span>
-        ${!s.revoked_at ? `<button class="btn btn-xs btn-error btn-outline" onclick="revokeShare('${fullJti}')">失効</button>` : ''}
-      </div>`;
-    }).join('');
-  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+    if (list.length === 0) {
+      box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '発行済み共有なし'));
+      return;
+    }
+    box.replaceChildren(...list.map(s =>
+      el('div', { class: 'flex items-center justify-between row-compact' }, [
+        el('span', {}, [
+          el('span', { class: 'badge badge-ghost badge-sm' }, s.kind), ' ',
+          el('span', { class: 'opacity-70' }, s.target_id.slice(0, 8) + '…'),
+          s.revoked_at && ' ',
+          s.revoked_at && el('span', { class: 'badge badge-error badge-sm' }, '失効'),
+        ]),
+        !s.revoked_at && el('button', {
+          class: 'btn btn-xs btn-error btn-outline',
+          onclick: () => revokeShare(s.jti),
+        }, '失効'),
+      ])));
+  } catch (e) {
+    box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
+  }
 }
 
 async function revokeShare(jti) {
@@ -125,32 +144,34 @@ async function revokeShare(jti) {
 
 // ---- audit log ----
 async function loadAudit() {
-  const el = $('audit-list');
+  const box = $('audit-list');
   try {
     const list = await json('/api/audit?limit=15');
-    if (list.length === 0) { el.innerHTML = '<div class="opacity-50 text-xs">監査記録なし</div>'; return; }
-    el.innerHTML = list.map(a => {
+    if (list.length === 0) {
+      box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '監査記録なし'));
+      return;
+    }
+    box.replaceChildren(...list.map(a => {
       const ok = a.result.startsWith('ok');
-      const status = ok
-        ? '<span class="text-success">✓</span>'
-        : '<span class="text-error">✗</span>';
-      const time = fmtTs(a.timestamp);
-      return `<div class="row-compact text-xs">
-        ${status} <span class="opacity-70">${time}</span>
-        <span class="font-semibold">${escapeHtml(a.actor_label || '-')}</span>
-        ${escapeHtml(a.action)} ${escapeHtml(a.target_type || '')}
-        ${a.target_ref ? '<span class="opacity-60">'+a.target_ref.slice(0,8)+'…</span>' : ''}
-      </div>`;
-    }).join('');
-  } catch (e) { el.innerHTML = '<div class="opacity-50 text-xs">取得失敗</div>'; }
+      return el('div', { class: 'row-compact text-xs' }, [
+        ok ? el('span', { class: 'text-success' }, '✓') : el('span', { class: 'text-error' }, '✗'),
+        ' ',
+        el('span', { class: 'opacity-70' }, fmtTs(a.timestamp)), ' ',
+        el('span', { class: 'font-semibold' }, a.actor_label || '-'), ' ',
+        `${a.action} ${a.target_type || ''} `,
+        a.target_ref && el('span', { class: 'opacity-60' }, a.target_ref.slice(0, 8) + '…'),
+      ]);
+    }));
+  } catch (e) {
+    box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
+  }
 }
 
 $('gm-close').onclick = () => /** @type {HTMLDialogElement} */ ($('gm-modal')).close();
 $('gm-add-btn').onclick = addMember;
 init();
 
-// テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
-Object.assign(window, {
-  createGroup, loadShares, loadAudit, manageGroupMembers, removeMember, revokeShare,
-});
+// テンプレートのインライン onclick から参照される関数を明示的に公開する。
+// (manageGroupMembers / removeMember / revokeShare は el() のクロージャ直結になり公開不要)
+Object.assign(window, { createGroup, loadShares, loadAudit });
 })();
