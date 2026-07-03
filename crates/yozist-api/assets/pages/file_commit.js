@@ -1,3 +1,4 @@
+// @ts-check
 // 単一コミット表示ページ（/ui/files/:id/histories/:cid）のロジック。file_commit.html の
 // インライン <script> から切り出した静的ファイル（issue #50）。/ui/pages/file_commit.js で配信される。
 // IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
@@ -10,9 +11,9 @@ const contentPath = `/api/files/${fileId}/commits/${commitId}`;
 let file = null;
 
 const detailUrl = '/ui/files/' + fileId;
-$('back-detail').href = detailUrl;
-$('back-link').href = detailUrl;
-$('fc-raw').href = contentPath;
+/** @type {HTMLAnchorElement} */ ($('back-detail')).href = detailUrl;
+/** @type {HTMLAnchorElement} */ ($('back-link')).href = detailUrl;
+/** @type {HTMLAnchorElement} */ ($('fc-raw')).href = contentPath;
 
 // --- テキスト表示（file_detail.html の仮想スクロールビューアの読み取り専用版） ---
 // 小さいファイル（1 チャンク以下）は全文を読み取り専用 textarea で描画。

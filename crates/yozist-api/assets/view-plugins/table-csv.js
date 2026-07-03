@@ -1,3 +1,4 @@
+// @ts-check
 // table/csv ビュープラグイン（拡張例）。
 //
 // CSV/TSV を「テーブル」として解釈し、行 LCS ＋ セル単位ハイライトで差分表示する。
@@ -216,7 +217,7 @@
           const colgroup = `<colgroup><col style="width:3rem"><col style="width:3rem"></colgroup>`;
           container.innerHTML =
             `<table class="diff-table">${colgroup}${visible.map(r => r.html).join('')}</table>`;
-          container.querySelectorAll('.diff-gap').forEach(el => {
+          /** @type {NodeListOf<HTMLElement>} */ (container.querySelectorAll('.diff-gap')).forEach(el => {
             el.onclick = () => { c.expanded.add(parseInt(el.dataset.seg, 10)); run(); };
           });
         };

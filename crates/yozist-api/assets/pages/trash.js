@@ -1,3 +1,4 @@
+// @ts-check
 // ゴミ箱ページ（/ui/trash）のロジック。trash.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/trash.js で配信される。
 // IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
@@ -34,7 +35,7 @@ async function fetchPage() {
 }
 
 async function loadMore() {
-  const btn = $('load-more');
+  const btn = /** @type {HTMLButtonElement} */ ($('load-more'));
   btn.disabled = true;
   btn.textContent = '読み込み中…';
   try { await fetchPage(); }
@@ -98,7 +99,7 @@ function render() {
     `).join('');
   }
   $('load-more-wrap').classList.toggle('hidden', !hasMore);
-  $('empty-trash-btn').disabled = items.length === 0;
+  /** @type {HTMLButtonElement} */ ($('empty-trash-btn')).disabled = items.length === 0;
 }
 
 async function restoreFile(id) {

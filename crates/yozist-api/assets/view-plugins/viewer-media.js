@@ -1,3 +1,4 @@
+// @ts-check
 // 単一表示用の共有メディアビュープラグイン（image / video / audio / pdf）。
 //
 // ファイル詳細（file_detail）と単一コミット表示（file_commit）の双方が読み込み、

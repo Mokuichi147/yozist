@@ -1,3 +1,4 @@
+// @ts-check
 // シリーズ設定ページ（/ui/series/:id）のロジック。series_settings.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/series_settings.js で配信される。
 // URL: /ui/series/<id>
@@ -25,12 +26,12 @@ async function loadDetail() {
     uiToast('シリーズの取得に失敗しました: ' + e.message, 'error');
     return;
   }
-  $('ss-name').value = data.name || '';
-  $('ss-desc').value = data.description || '';
+  /** @type {HTMLInputElement} */ ($('ss-name')).value = data.name || '';
+  /** @type {HTMLTextAreaElement} */ ($('ss-desc')).value = data.description || '';
   sortOrder = data.sort_order || 'created_asc';
-  $('ss-sort').value = sortOrder;
+  /** @type {HTMLSelectElement} */ ($('ss-sort')).value = sortOrder;
   // 戻り先はこのシリーズのファイル一覧にしておく
-  $('ss-back').href = `/ui/files?series=${encodeURIComponent(seriesId)}`;
+  /** @type {HTMLAnchorElement} */ ($('ss-back')).href = `/ui/files?series=${encodeURIComponent(seriesId)}`;
   members = (data.members || []).map(m => ({ file_id: m.file_id, display_name: m.display_name }));
   savedOrder = members.map(m => m.file_id);
   renderList();
@@ -45,13 +46,13 @@ function isDirty() {
 
 function refreshDirty() {
   // 保存対象があるのはマニュアル順かつ並びが変わっているときだけ。
-  $('ss-save-order').disabled = !(isManual() && isDirty());
+  /** @type {HTMLButtonElement} */ ($('ss-save-order')).disabled = !(isManual() && isDirty());
 }
 
 // 並び順ドロップダウンの変更。マニュアル以外は即時適用し、サーバ並びを再取得する。
 // マニュアルを選んだ場合は現在の表示順をそのまま手動順として確定する。
 async function onSortChange() {
-  const val = $('ss-sort').value;
+  const val = /** @type {HTMLSelectElement} */ ($('ss-sort')).value;
   if (val === 'manual') {
     await saveOrder('マニュアル順に切り替えました');
     return;
@@ -62,7 +63,7 @@ async function onSortChange() {
     await loadDetail();
   } catch (e) {
     uiToast('並び順の変更に失敗しました: ' + e.message, 'error');
-    $('ss-sort').value = sortOrder; // 失敗時は元に戻す
+    /** @type {HTMLSelectElement} */ ($('ss-sort')).value = sortOrder; // 失敗時は元に戻す
   }
 }
 
@@ -96,7 +97,7 @@ function renderList() {
 function markManual() {
   if (sortOrder !== 'manual') {
     sortOrder = 'manual';
-    $('ss-sort').value = 'manual';
+    /** @type {HTMLSelectElement} */ ($('ss-sort')).value = 'manual';
   }
 }
 
@@ -111,7 +112,7 @@ function move(i, dir) {
 
 // ---- HTML5 ドラッグ＆ドロップ ----
 function bindDnd() {
-  $('ss-list').querySelectorAll('.ss-row').forEach(row => {
+  /** @type {NodeListOf<HTMLElement>} */ ($('ss-list').querySelectorAll('.ss-row')).forEach(row => {
     row.addEventListener('dragstart', e => {
       dragIndex = parseInt(row.dataset.idx, 10);
       row.classList.add('dragging');
@@ -142,9 +143,9 @@ function bindDnd() {
 
 // ---- 保存系 ----
 async function saveName() {
-  const name = $('ss-name').value.trim();
+  const name = /** @type {HTMLInputElement} */ ($('ss-name')).value.trim();
   if (!name) { uiToast('シリーズ名を入力してください', 'warning'); return; }
-  const description = $('ss-desc').value.trim();
+  const description = /** @type {HTMLTextAreaElement} */ ($('ss-desc')).value.trim();
   try {
     await json(`/api/series/${seriesId}`, {
       method: 'PATCH',

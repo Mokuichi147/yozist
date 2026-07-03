@@ -1,3 +1,4 @@
+// @ts-check
 // ダッシュボードページ（/ui）のロジック。index.html のインライン <script> から切り出した静的ファイル（issue #50）。
 // /ui/pages/index.js で配信される。
 // IIFE で包み、他ページとのグローバル衝突を避ける（issue #53）。
@@ -236,8 +237,8 @@ function walkEntry(entry, out, prefix) {
 
 function setupUpload() {
   const dz = $('dropzone');
-  const fileInput = $('upload-file');
-  const folderInput = $('upload-folder');
+  const fileInput = /** @type {HTMLInputElement} */ ($('upload-file'));
+  const folderInput = /** @type {HTMLInputElement} */ ($('upload-folder'));
 
   dz.onclick = () => fileInput.click();
   $('pick-folder').onclick = e => { e.stopPropagation(); folderInput.click(); };
@@ -265,7 +266,7 @@ function setupUpload() {
 async function doUpload() {
   if (selectedFiles.length === 0) { uiToast('アップロードするファイルを選択してください', 'warning'); return; }
 
-  const asSeries = $('as-series').checked;
+  const asSeries = /** @type {HTMLInputElement} */ ($('as-series')).checked;
   let seriesName = null;
   if (asSeries) {
     const r = await uiPrompt({
@@ -276,7 +277,7 @@ async function doUpload() {
     seriesName = r.name.trim();
   }
 
-  const btn = $('upload-btn');
+  const btn = /** @type {HTMLButtonElement} */ ($('upload-btn'));
   const resultEl = $('upload-result');
   btn.disabled = true;
   btn.classList.add('btn-disabled');
@@ -343,7 +344,7 @@ async function doUpload() {
   }
 
   clearFiles();
-  $('as-series').checked = false;
+  /** @type {HTMLInputElement} */ ($('as-series')).checked = false;
   const seriesNote = asSeries ? `（シリーズ「${escapeHtml(seriesName)}」に登録）` : '';
   const tagNote = tagged ? '（フォルダ名をタグとして付与）' : '';
   const failNote = failed > 0 ? ` / ${failed} 件失敗` : '';
