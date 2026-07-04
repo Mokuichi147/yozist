@@ -939,7 +939,7 @@ impl MetaStore for SqliteMetaStore {
             return Ok(Vec::new());
         }
         // trigram トークナイザは 3 文字未満の語句に一致を返せないため、
-        // 短い語を含む場合は LIKE 走査へフォールバックする（rank 順は失うが
+        // 短い語を含む場合は LIKE 走査へフォールバックする（bm25 は失うが
         // 「東京」「メモ」のような 2 文字の日本語検索を取りこぼさない）。
         let rows = if terms.iter().all(|t| t.chars().count() >= 3) {
             let match_query = terms
@@ -947,16 +947,20 @@ impl MetaStore for SqliteMetaStore {
                 .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // bm25 の列重み: ファイル名・タグでの一致を本文一致より上位に出す
+            // （引数は列定義順。UNINDEXED の file_id は 0）。値が小さいほど上位。
             sqlx::query(
                 "SELECT file_id FROM files_fts
                  WHERE files_fts MATCH ?
-                 ORDER BY rank LIMIT ?",
+                 ORDER BY bm25(files_fts, 0.0, 8.0, 4.0, 1.0) LIMIT ?",
             )
             .bind(match_query)
             .bind(limit as i64)
             .fetch_all(&self.pool)
             .await?
         } else {
+            // MATCH 経路と同じ優先度（ファイル名 > タグ > 本文）を
+            // 語ごとの CASE スコアの合計で近似する。
             let mut sql = String::from("SELECT file_id FROM files_fts WHERE 1=1");
             for _ in &terms {
                 sql.push_str(
@@ -965,14 +969,34 @@ impl MetaStore for SqliteMetaStore {
                        OR content LIKE ? ESCAPE '\\')",
                 );
             }
-            sql.push_str(" LIMIT ?");
-            let mut q = sqlx::query(&sql);
-            for t in &terms {
-                let pattern = format!(
-                    "%{}%",
-                    t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            sql.push_str(" ORDER BY ");
+            for (i, _) in terms.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" + ");
+                }
+                sql.push_str(
+                    "(CASE WHEN display_name LIKE ? ESCAPE '\\' THEN 8
+                           WHEN tags LIKE ? ESCAPE '\\' THEN 4
+                           ELSE 1 END)",
                 );
-                q = q.bind(pattern.clone()).bind(pattern.clone()).bind(pattern);
+            }
+            sql.push_str(" DESC LIMIT ?");
+            let patterns: Vec<String> = terms
+                .iter()
+                .map(|t| {
+                    format!(
+                        "%{}%",
+                        t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                    )
+                })
+                .collect();
+            let mut q = sqlx::query(&sql);
+            // バインドは SQL 中の ? の出現順: WHERE（語ごとに 3 つ）→ ORDER BY（語ごとに 2 つ）。
+            for p in &patterns {
+                q = q.bind(p.clone()).bind(p.clone()).bind(p.clone());
+            }
+            for p in &patterns {
+                q = q.bind(p.clone()).bind(p.clone());
             }
             q.bind(limit as i64).fetch_all(&self.pool).await?
         };
@@ -1628,6 +1652,36 @@ mod tests {
         assert!(s.search_fts("C++ \"quote", 10).await.unwrap().is_empty());
         // 空クエリは空結果
         assert!(s.search_fts("   ", 10).await.unwrap().is_empty());
+    }
+
+    /// ファイル名・タグでの一致が本文のみの一致より上位に並ぶ
+    /// （MATCH 経路 = bm25 列重み、LIKE 経路 = CASE スコアの両方）。
+    #[tokio::test]
+    async fn search_fts_ranks_name_and_tag_matches_first() {
+        let s = store().await;
+        let by_content = sample_file();
+        let by_tag = sample_file();
+        let by_name = sample_file();
+        for f in [&by_content, &by_tag, &by_name] {
+            s.insert_file(f).await.unwrap();
+        }
+        s.upsert_fts(&by_content.id, "z.txt", "", "本文にだけ検索対象という語がある")
+            .await
+            .unwrap();
+        s.upsert_fts(&by_tag.id, "y.txt", "検索対象", "無関係な本文")
+            .await
+            .unwrap();
+        s.upsert_fts(&by_name.id, "検索対象.txt", "", "無関係な本文")
+            .await
+            .unwrap();
+
+        // 3 文字以上 → MATCH 経路（bm25 重み）
+        let got = s.search_fts("検索対象", 10).await.unwrap();
+        assert_eq!(got, vec![by_name.id, by_tag.id, by_content.id]);
+
+        // 2 文字 → LIKE 経路（CASE スコア）
+        let got = s.search_fts("検索", 10).await.unwrap();
+        assert_eq!(got, vec![by_name.id, by_tag.id, by_content.id]);
     }
 
     /// LIKE フォールバックで % や _ がワイルドカードとして解釈されない。
