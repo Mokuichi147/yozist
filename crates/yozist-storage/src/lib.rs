@@ -37,6 +37,12 @@ pub trait BlobStore: Send + Sync {
     async fn get(&self, id: &BlobId) -> Result<Bytes, StorageError>;
     /// blob の存在確認。
     async fn exists(&self, id: &BlobId) -> Result<bool, StorageError>;
+    /// blob を削除する。存在しなければ何もしない（冪等）。
+    ///
+    /// CAS の blob は複数コミット・複数ファイルから共有され得るため、呼び出し側
+    /// （GC / デルタ再符号化）が「どこからも参照されていない」ことを確認してから
+    /// 呼ぶこと。`BlobStore` 自体は参照を関知しない。
+    async fn delete(&self, id: &BlobId) -> Result<(), StorageError>;
 
     /// ストリームを逐次保存し、`(コンテンツアドレス, 生バイト長)` を返す。
     ///

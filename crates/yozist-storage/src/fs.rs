@@ -110,6 +110,14 @@ impl BlobStore for FsBlobStore {
         Ok(fs::try_exists(self.blob_path(id)).await.unwrap_or(false))
     }
 
+    async fn delete(&self, id: &BlobId) -> Result<(), StorageError> {
+        match fs::remove_file(self.blob_path(id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::Io(e)),
+        }
+    }
+
     /// ストリームを逐次 zstd 圧縮しながら一時ファイルへ書き込み、生バイトの
     /// sha256 を逐次計算する。完了後にコンテンツアドレスへ rename する。
     /// オンディスク形式は `put` と同じ単一 zstd フレームなので `get` は無変更。
@@ -203,6 +211,18 @@ mod tests {
         let got = store.get(&id).await.unwrap();
         assert_eq!(&got[..], b"hello yozist");
         assert!(store.exists(&id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_blob_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).await.unwrap();
+        let id = store.put(b"to be removed").await.unwrap();
+        assert!(store.exists(&id).await.unwrap());
+        store.delete(&id).await.unwrap();
+        assert!(!store.exists(&id).await.unwrap());
+        // 既に無い blob の削除は冪等に成功する。
+        store.delete(&id).await.unwrap();
     }
 
     #[tokio::test]
