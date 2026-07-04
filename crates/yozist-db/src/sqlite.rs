@@ -931,15 +931,51 @@ impl MetaStore for SqliteMetaStore {
     }
 
     async fn search_fts(&self, query: &str, limit: u32) -> Result<Vec<FileId>, DbError> {
-        let rows = sqlx::query(
-            "SELECT file_id FROM files_fts
-             WHERE files_fts MATCH ?
-             ORDER BY rank LIMIT ?",
-        )
-        .bind(query)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
+        // 入力は FTS5 クエリ構文としてではなく「空白区切りの語句の AND」として扱う。
+        // 生のまま MATCH に渡すと日本語や記号（"C++" 等）で構文エラーになるため、
+        // 各語をフレーズ文字列として引用する。
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        // trigram トークナイザは 3 文字未満の語句に一致を返せないため、
+        // 短い語を含む場合は LIKE 走査へフォールバックする（rank 順は失うが
+        // 「東京」「メモ」のような 2 文字の日本語検索を取りこぼさない）。
+        let rows = if terms.iter().all(|t| t.chars().count() >= 3) {
+            let match_query = terms
+                .iter()
+                .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            sqlx::query(
+                "SELECT file_id FROM files_fts
+                 WHERE files_fts MATCH ?
+                 ORDER BY rank LIMIT ?",
+            )
+            .bind(match_query)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            let mut sql = String::from("SELECT file_id FROM files_fts WHERE 1=1");
+            for _ in &terms {
+                sql.push_str(
+                    " AND (display_name LIKE ? ESCAPE '\\'
+                       OR tags LIKE ? ESCAPE '\\'
+                       OR content LIKE ? ESCAPE '\\')",
+                );
+            }
+            sql.push_str(" LIMIT ?");
+            let mut q = sqlx::query(&sql);
+            for t in &terms {
+                let pattern = format!(
+                    "%{}%",
+                    t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                );
+                q = q.bind(pattern.clone()).bind(pattern.clone()).bind(pattern);
+            }
+            q.bind(limit as i64).fetch_all(&self.pool).await?
+        };
         rows.into_iter()
             .map(|r| {
                 let s: String = r.try_get("file_id")?;
@@ -1564,5 +1600,49 @@ mod tests {
         assert_eq!(got.description, None);
         // 旧名では引けない。
         assert!(s.get_filter_by_name("仕事メモ").await.unwrap().is_none());
+    }
+
+    /// 日本語本文の部分一致検索（unicode61 では文全体が 1 トークンになり
+    /// 常に 0 件だった回帰）。trigram + 短語 LIKE フォールバックで一致する。
+    #[tokio::test]
+    async fn search_fts_matches_japanese_substrings() {
+        let s = store().await;
+        let f = sample_file();
+        s.insert_file(&f).await.unwrap();
+        s.upsert_fts(&f.id, "議事録.txt", "仕事", "これは日本語のテスト文章です")
+            .await
+            .unwrap();
+
+        // 3 文字以上 → trigram MATCH
+        assert_eq!(s.search_fts("テスト", 10).await.unwrap(), vec![f.id]);
+        assert_eq!(s.search_fts("日本語", 10).await.unwrap(), vec![f.id]);
+        // 2 文字 → LIKE フォールバック
+        assert_eq!(s.search_fts("文章", 10).await.unwrap(), vec![f.id]);
+        assert_eq!(s.search_fts("仕事", 10).await.unwrap(), vec![f.id]);
+        // 複数語は AND
+        assert_eq!(s.search_fts("日本語 テスト", 10).await.unwrap(), vec![f.id]);
+        assert!(s.search_fts("日本語 存在しない", 10).await.unwrap().is_empty());
+        // 一致しない語
+        assert!(s.search_fts("英語", 10).await.unwrap().is_empty());
+        // 記号を含む入力が構文エラーにならない（フレーズ引用の確認）
+        assert!(s.search_fts("C++ \"quote", 10).await.unwrap().is_empty());
+        // 空クエリは空結果
+        assert!(s.search_fts("   ", 10).await.unwrap().is_empty());
+    }
+
+    /// LIKE フォールバックで % や _ がワイルドカードとして解釈されない。
+    #[tokio::test]
+    async fn search_fts_like_escapes_wildcards() {
+        let s = store().await;
+        let f = sample_file();
+        s.insert_file(&f).await.unwrap();
+        s.upsert_fts(&f.id, "a.txt", "", "100%完了").await.unwrap();
+
+        assert_eq!(s.search_fts("0%", 10).await.unwrap(), vec![f.id]);
+        // "%" 単体はどの本文にも literal に無ければヒットしない
+        let g = sample_file();
+        s.insert_file(&g).await.unwrap();
+        s.upsert_fts(&g.id, "b.txt", "", "percent なし").await.unwrap();
+        assert_eq!(s.search_fts("0%", 10).await.unwrap(), vec![f.id]);
     }
 }
