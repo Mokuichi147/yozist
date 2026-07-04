@@ -193,6 +193,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let size: i64 = row.try_get("size")?;
     let committed_by: Option<String> = row.try_get("committed_by")?;
     let committed_by_user_id: Option<i64> = row.try_get("committed_by_user_id")?;
+    let delta_base: Option<String> = row.try_get("delta_base")?;
     Ok(Commit {
         id: CommitId::from_uuid(parse_uuid(&id)?),
         file_id: FileId::from_uuid(parse_uuid(&file_id)?),
@@ -207,6 +208,9 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
         size: size.max(0) as u64,
         committed_by,
         committed_by_user_id,
+        delta_base: delta_base
+            .map(|s| parse_uuid(&s).map(CommitId::from_uuid))
+            .transpose()?,
     })
 }
 
@@ -331,13 +335,26 @@ impl MetaStore for SqliteMetaStore {
     async fn purge_file(&self, id: &FileId) -> Result<(), DbError> {
         // files 行を物理削除。commits / file_tags / series_members / blob_refs は
         // ON DELETE CASCADE で同時に消える（foreign_keys=ON 前提）。
+        // 消えるコミットの blob は同一トランザクションで削除候補（blob_orphans）へ
+        // 登録し、スイーパが参照残無しを確認してから実体を回収する。
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"INSERT INTO blob_orphans (blob_id, orphaned_at)
+               SELECT DISTINCT blob, ? FROM commits WHERE file_id = ?
+               ON CONFLICT(blob_id) DO NOTHING"#,
+        )
+        .bind(fmt_dt(time::OffsetDateTime::now_utc()))
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await?;
         let res = sqlx::query("DELETE FROM files WHERE id = ?")
             .bind(id.to_string())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if res.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -782,8 +799,8 @@ impl MetaStore for SqliteMetaStore {
         sqlx::query(
             r#"INSERT INTO commits
                (id, file_id, parent, actor, blob, format_id, timestamp, message,
-                size, committed_by, committed_by_user_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                size, committed_by, committed_by_user_id, delta_base)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(commit.id.to_string())
         .bind(commit.file_id.to_string())
@@ -796,6 +813,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(commit.size as i64)
         .bind(&commit.committed_by)
         .bind(commit.committed_by_user_id)
+        .bind(commit.delta_base.map(|c| c.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -941,6 +959,69 @@ impl MetaStore for SqliteMetaStore {
         .await?;
         rows.into_iter().map(row_to_commit).collect()
     }
+
+    async fn update_commit_storage(
+        &self,
+        commit: &CommitId,
+        blob: &BlobId,
+        delta_base: Option<CommitId>,
+    ) -> Result<(), DbError> {
+        let res = sqlx::query("UPDATE commits SET blob = ?, delta_base = ? WHERE id = ?")
+            .bind(blob.as_str())
+            .bind(delta_base.map(|c| c.to_string()))
+            .bind(commit.to_string())
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn count_commits_referencing_blob(&self, blob: &BlobId) -> Result<u64, DbError> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM commits WHERE blob = ?")
+            .bind(blob.as_str())
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n.max(0) as u64)
+    }
+
+    async fn insert_blob_orphan(
+        &self,
+        blob: &BlobId,
+        at: time::OffsetDateTime,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            r#"INSERT INTO blob_orphans (blob_id, orphaned_at) VALUES (?, ?)
+               ON CONFLICT(blob_id) DO NOTHING"#,
+        )
+        .bind(blob.as_str())
+        .bind(fmt_dt(at))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_blob_orphans(
+        &self,
+        before: time::OffsetDateTime,
+    ) -> Result<Vec<BlobId>, DbError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT blob_id FROM blob_orphans WHERE orphaned_at < ? ORDER BY orphaned_at ASC",
+        )
+        .bind(fmt_dt(before))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(s,)| BlobId::from_hex(s)).collect())
+    }
+
+    async fn remove_blob_orphan(&self, blob: &BlobId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM blob_orphans WHERE blob_id = ?")
+            .bind(blob.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 fn priority(k: TagKind) -> u8 {
@@ -1068,6 +1149,7 @@ mod tests {
             size: 0,
             committed_by: None,
             committed_by_user_id: None,
+            delta_base: None,
         };
         s.insert_commit(&commit).await.unwrap();
 
@@ -1392,6 +1474,7 @@ mod tests {
             size: 100,
             committed_by: None,
             committed_by_user_id: None,
+            delta_base: None,
         };
         let c2 = Commit {
             id: CommitId::new(),
@@ -1405,6 +1488,7 @@ mod tests {
             size: 250,
             committed_by: Some("alice".into()),
             committed_by_user_id: Some(42),
+            delta_base: Some(c1.id),
         };
         s.insert_commit(&c1).await.unwrap();
         s.insert_commit(&c2).await.unwrap();
@@ -1420,6 +1504,9 @@ mod tests {
         assert_eq!(log[0].committed_by_user_id, None);
         assert_eq!(log[1].committed_by.as_deref(), Some("alice"));
         assert_eq!(log[1].committed_by_user_id, Some(42));
+        // delta_base が往復で保持される（NULL/値の両方）
+        assert_eq!(log[0].delta_base, None);
+        assert_eq!(log[1].delta_base, Some(c1.id));
     }
 
     #[tokio::test]

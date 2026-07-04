@@ -170,6 +170,26 @@ async fn main() -> anyhow::Result<()> {
                 })
             });
 
+            // 孤立 blob スイーパ: デルタ再符号化やファイル完全削除で参照を失った
+            // blob を定期回収する。猶予期間を置くことで、候補登録時点で走って
+            // いた読み出しやコミットと競合しない。初回 tick は起動直後に発火し、
+            // 前回起動時の残骸も回収する。
+            let sweep_engine = engine.clone();
+            tokio::spawn(async move {
+                const SWEEP_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(15 * 60);
+                let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    match sweep_engine.sweep_orphan_blobs(SWEEP_INTERVAL).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!("孤立 blob を {n} 件回収"),
+                        Err(e) => tracing::warn!("孤立 blob の回収に失敗: {e}"),
+                    }
+                }
+            });
+
             let listener = TcpListener::bind(&cli.listen).await?;
             tracing::info!("listening on {}", cli.listen);
             let api_result = axum::serve(listener, app).await;

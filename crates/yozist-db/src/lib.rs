@@ -15,8 +15,8 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use yozist_core::{
-    Commit, FileId, FileMeta, Filter, FilterId, Series, SeriesId, SeriesMember, SeriesSort,
-    Tag, TagId,
+    BlobId, Commit, CommitId, FileId, FileMeta, Filter, FilterId, Series, SeriesId,
+    SeriesMember, SeriesSort, Tag, TagId,
 };
 
 pub mod audit;
@@ -60,7 +60,9 @@ pub trait MetaStore: Send + Sync {
     async fn list_deleted_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError>;
     /// ファイルを物理削除する（ゴミ箱からの完全削除）。関連する commits / file_tags /
     /// series_members / blob_refs は FK の ON DELETE CASCADE で同時に消える。blob 本体は
-    /// CAS（共有・GC なし）のため残す。存在しなければ `NotFound`。
+    /// CAS（共有）のため即時には消さず、削除候補（blob_orphans）へ登録して
+    /// `VersioningEngine::sweep_orphan_blobs` が参照残無しを確認後に回収する。
+    /// 存在しなければ `NotFound`。
     async fn purge_file(&self, id: &FileId) -> Result<(), DbError>;
 
     // ---- tags ----
@@ -120,6 +122,32 @@ pub trait MetaStore: Send + Sync {
     // ---- commits ----
     async fn insert_commit(&self, commit: &Commit) -> Result<(), DbError>;
     async fn list_commits(&self, file: &FileId) -> Result<Vec<Commit>, DbError>;
+    /// コミットの保存表現だけを差し替える（逆デルタ化用）。内容そのものは
+    /// 変わらず、「フル blob」を「基準 `delta_base` に対するパッチ blob」へ
+    /// 置き換える。id / parent / actor / size 等の履歴情報は変更しない。
+    async fn update_commit_storage(
+        &self,
+        commit: &CommitId,
+        blob: &BlobId,
+        delta_base: Option<CommitId>,
+    ) -> Result<(), DbError>;
+    /// 指定 blob を参照しているコミット数を返す（GC の削除前チェック用）。
+    async fn count_commits_referencing_blob(&self, blob: &BlobId) -> Result<u64, DbError>;
+
+    // ---- blob orphans (GC 候補キュー) ----
+    /// blob を削除候補として登録する。既に候補なら何もしない（最初の登録時刻を保持）。
+    async fn insert_blob_orphan(
+        &self,
+        blob: &BlobId,
+        at: time::OffsetDateTime,
+    ) -> Result<(), DbError>;
+    /// `before` より前に登録された削除候補を返す（猶予期間を過ぎたもの）。
+    async fn list_blob_orphans(
+        &self,
+        before: time::OffsetDateTime,
+    ) -> Result<Vec<BlobId>, DbError>;
+    /// 削除候補から取り除く（実体削除後、または参照が残っていた場合）。
+    async fn remove_blob_orphan(&self, blob: &BlobId) -> Result<(), DbError>;
 
     // ---- full-text search (FTS5) ----
     /// FTS の対応行を upsert。`display_name` / `tags` / `content` のいずれも空文字可。
