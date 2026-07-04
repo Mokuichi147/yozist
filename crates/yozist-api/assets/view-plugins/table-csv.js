@@ -6,6 +6,10 @@
 // ことを示す実例。base.html 共有 ViewRuntime に「変換」と「ビュー」を自己登録する。
 // このファイルを追加し compare.html から読み込むだけで、コアを改変せず CSV 差分が
 // 増える（種別 table/csv はコアにとって単なる文字列キー）。
+//
+// NOTE(#51): 差分テーブルは大量セルになり得るため、el() ではなく文字列構築 +
+// innerHTML を意図的に維持している（text-diff.js と同方針）。ユーザー由来の値
+// （セル内容）は必ず escapeHtml を通す規約。新しい埋め込みでも同様にすること。
 (() => {
   const { escapeHtml, decodeBytes, bytesLookBinary, looksBinaryText, diffKeyed } = ViewRuntime.host;
 

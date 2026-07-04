@@ -2,6 +2,10 @@
 // core/text ビュープラグイン（行差分: unified / split）。
 // base.html 共有 ViewRuntime に登録。内部関数は IIFE スコープに隔離され、
 // 外部とはホスト基盤(ViewRuntime.host)と registerView のみで接続する。
+//
+// NOTE(#51): 差分テーブルは数千行規模になり得るため、el() ではなく文字列構築 +
+// innerHTML を意図的に維持している。ユーザー由来の値（行テキスト）はこのモジュール
+// 内で必ず escapeHtml を通す規約。新しい埋め込みを足すときは必ず escapeHtml を通すこと。
 ViewRuntime.registerView((() => {
   const { escapeHtml, decodeBytes, looksBinaryText, diffKeyed } = ViewRuntime.host;
   // 中間領域に LCS を許す上限（行数の積）。超えるとブロック置換へ降格。

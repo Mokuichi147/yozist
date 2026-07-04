@@ -16,14 +16,14 @@ async function init() {
 
   const groupsEl = $('acc-groups');
   if (me.groups && me.groups.length) {
-    groupsEl.innerHTML = me.groups.map(g => {
-      const adminBadge = g.is_admin
-        ? ' <span class="badge badge-warning badge-sm">管理者</span>' : '';
-      return `<span class="inline-flex items-center gap-1">
-        <span class="badge badge-ghost badge-sm">${escapeHtml(g.name)}</span>${adminBadge}</span>`;
-    }).join('');
+    groupsEl.replaceChildren(...me.groups.map(g =>
+      el('span', { class: 'inline-flex items-center gap-1' }, [
+        el('span', { class: 'badge badge-ghost badge-sm' }, g.name),
+        g.is_admin && ' ',
+        g.is_admin && el('span', { class: 'badge badge-warning badge-sm' }, '管理者'),
+      ])));
   } else {
-    groupsEl.innerHTML = '<span class="opacity-50">所属なし</span>';
+    groupsEl.replaceChildren(el('span', { class: 'opacity-50' }, '所属なし'));
   }
 
   $('main').classList.remove('hidden');

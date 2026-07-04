@@ -64,6 +64,52 @@ function escapeHtml(s) {
   })[c]);
 }
 
+// ---------------------------------------------------------------------------
+// 安全な DOM 生成ヘルパ（issue #51）。文字列の子は常にテキストノードとして挿入
+// されるため、テンプレートリテラル + innerHTML と違い、エスケープ忘れによる XSS が
+// 原理的に起きない。ユーザー由来の値を含む DOM 生成はこちらを使う
+// （ユーザー入力を含まない静的な HTML 断片は innerHTML のままで構わない）。
+// ---------------------------------------------------------------------------
+/**
+ * el() の子要素。文字列・数値はテキストノード化、null/undefined/false は
+ * スキップ（`cond && el(...)` の条件付き描画用）、配列は再帰的に平坦化する
+ * （JSDoc の typedef は自己再帰できないため配列側は any[] で表す）。
+ * @typedef {Node|string|number|null|undefined|false|any[]} ElChild
+ */
+/**
+ * 要素を生成する。
+ * - attrs: 文字列・数値は setAttribute、関数（onclick 等）はプロパティ代入、
+ *   true は空属性として設定、false/null/undefined はスキップ。
+ * - children: 単体でも配列でも可（ElChild 参照）。
+ * @template {keyof HTMLElementTagNameMap} K
+ * @param {K} tag
+ * @param {Record<string, string|number|boolean|Function|null|undefined>} [attrs]
+ * @param {ElChild} [children]
+ * @returns {HTMLElementTagNameMap[K]}
+ */
+function el(tag, attrs, children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (typeof v === 'function') node[k] = v;
+    else if (v === true) node.setAttribute(k, '');
+    else node.setAttribute(k, String(v));
+  }
+  elAppend(node, children);
+  return node;
+}
+/**
+ * el() の子要素を親へ追加する（既存要素への追記にも使える）。
+ * @param {HTMLElement} parent
+ * @param {ElChild} child
+ */
+function elAppend(parent, child) {
+  if (child == null || child === false) return;
+  if (Array.isArray(child)) { for (const c of child) elAppend(parent, c); return; }
+  // DOM の append は文字列を常にテキストノードとして挿入する（HTML 解釈しない）。
+  parent.append(child instanceof Node ? child : String(child));
+}
+
 // /content・/commits は元エンコーディング（charset）で本文を返すため、その charset で
 // デコードする。Fetch の Response.text() は常に UTF-8 デコードで charset を無視するので、
 // arrayBuffer を取得して TextDecoder へ渡す必要がある。TextDecoder は既定で BOM を除去する。
@@ -628,7 +674,7 @@ const ViewRuntime = (() => {
 // （tsc は同一ファイル内の `ViewRuntime.host = ...` 代入を expando プロパティとして
 //   型に取り込むため、プラグイン側から ViewRuntime.host が型解決できる。）
 ViewRuntime.host = {
-  escapeHtml, decodeBytes, $, fmtSize, bytesEqual,
+  escapeHtml, decodeBytes, $, el, elAppend, fmtSize, bytesEqual,
   sniffImageMime, bytesLookBinary, looksBinaryText, diffKeyed, imageInfo, loadImageMeta,
   mediaKind, viewerKind,
 };

@@ -68,27 +68,39 @@ async function onSortChange() {
 }
 
 function renderList() {
-  const el = $('ss-list');
+  const list = $('ss-list');
   if (!members.length) {
-    el.innerHTML = '<li class="opacity-50 text-sm py-2">このシリーズにはまだ項目がありません。</li>';
+    list.replaceChildren(el('li', { class: 'opacity-50 text-sm py-2' }, 'このシリーズにはまだ項目がありません。'));
     refreshDirty();
     return;
   }
-  el.innerHTML = members.map((m, i) => `
-    <li class="ss-row flex items-center gap-2 rounded bg-base-200/60 px-2 py-1.5" draggable="true" data-idx="${i}">
-      <span class="ss-handle opacity-50 select-none" title="ドラッグで並び替え">⠿</span>
-      <span class="text-xs opacity-60 tabular-nums w-6 text-right shrink-0">${i + 1}</span>
-      <a href="/ui/files/${m.file_id}" class="text-sm link link-hover truncate flex-1 min-w-0"
-         title="${escapeHtml(m.display_name)}">${escapeHtml(m.display_name)}</a>
-      <div class="join shrink-0">
-        <button type="button" class="btn btn-xs join-item" title="上へ"
-                onclick="move(${i}, -1)" ${i === 0 ? 'disabled' : ''}>▲</button>
-        <button type="button" class="btn btn-xs join-item" title="下へ"
-                onclick="move(${i}, 1)" ${i === members.length - 1 ? 'disabled' : ''}>▼</button>
-      </div>
-      <button type="button" class="btn btn-xs btn-ghost shrink-0" title="このシリーズから外す"
-              onclick="removeMember(${i})">×</button>
-    </li>`).join('');
+  list.replaceChildren(...members.map((m, i) =>
+    el('li', {
+      class: 'ss-row flex items-center gap-2 rounded bg-base-200/60 px-2 py-1.5',
+      draggable: 'true', 'data-idx': i,
+    }, [
+      el('span', { class: 'ss-handle opacity-50 select-none', title: 'ドラッグで並び替え' }, '⠿'),
+      el('span', { class: 'text-xs opacity-60 tabular-nums w-6 text-right shrink-0' }, i + 1),
+      el('a', {
+        href: `/ui/files/${m.file_id}`,
+        class: 'text-sm link link-hover truncate flex-1 min-w-0',
+        title: m.display_name,
+      }, m.display_name),
+      el('div', { class: 'join shrink-0' }, [
+        el('button', {
+          type: 'button', class: 'btn btn-xs join-item', title: '上へ',
+          disabled: i === 0, onclick: () => move(i, -1),
+        }, '▲'),
+        el('button', {
+          type: 'button', class: 'btn btn-xs join-item', title: '下へ',
+          disabled: i === members.length - 1, onclick: () => move(i, 1),
+        }, '▼'),
+      ]),
+      el('button', {
+        type: 'button', class: 'btn btn-xs btn-ghost shrink-0',
+        title: 'このシリーズから外す', onclick: () => removeMember(i),
+      }, '×'),
+    ])));
   bindDnd();
   refreshDirty();
 }
@@ -188,5 +200,6 @@ async function removeMember(i) {
 init();
 
 // テンプレート／生成 HTML のインライン onclick/onchange から参照される関数を明示的に公開する。
-Object.assign(window, { onSortChange, saveName, saveOrder, move, removeMember });
+// (move / removeMember は el() のクロージャ直結になり公開不要)
+Object.assign(window, { onSortChange, saveName, saveOrder });
 })();

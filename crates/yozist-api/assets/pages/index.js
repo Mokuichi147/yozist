@@ -63,14 +63,12 @@ async function loadStorage() {
     stops.push(`${color} ${start}% ${end}%`);
 
     const pct = currentBytes ? v / currentBytes * 100 : 0;
-    const li = document.createElement('li');
-    li.className = 'flex items-center gap-2';
-    li.innerHTML =
-      `<span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:${color}"></span>` +
-      `<span class="flex-1 min-w-0 truncate">${escapeHtml(seg)}</span>` +
-      `<span class="opacity-70 tabular-nums shrink-0">${fmtSize(v)}</span>` +
-      `<span class="opacity-50 tabular-nums shrink-0 w-12 text-right">${pct.toFixed(1)}%</span>`;
-    legend.appendChild(li);
+    legend.appendChild(el('li', { class: 'flex items-center gap-2' }, [
+      el('span', { class: 'inline-block w-3 h-3 rounded-sm shrink-0', style: `background:${color}` }),
+      el('span', { class: 'flex-1 min-w-0 truncate' }, seg),
+      el('span', { class: 'opacity-70 tabular-nums shrink-0' }, fmtSize(v)),
+      el('span', { class: 'opacity-50 tabular-nums shrink-0 w-12 text-right' }, pct.toFixed(1) + '%'),
+    ]));
   }
   // 最新版が 0B（空ファイルのみ等）でもドーナツが破綻しないよう中立色で埋める。
   $('storage-donut').style.background = stops.length
@@ -160,23 +158,17 @@ function renderFileList() {
   summary.classList.remove('hidden');
   list.classList.remove('hidden');
   selectedFiles.forEach((f, i) => {
-    const li = document.createElement('li');
-    li.className = 'flex items-center justify-between gap-2 text-xs px-2 py-1 rounded bg-base-200/50';
-    const badges = folderTagsOf(f)
-      .map(d => `<span class="badge badge-ghost badge-xs shrink-0">${escapeHtml(d)}</span>`)
-      .join('');
-    li.innerHTML =
-      `<span class="flex items-center gap-1 flex-1 min-w-0" title="${escapeHtml(relPathOf(f))}">` +
-        `<span class="truncate">${escapeHtml(baseNameOf(f))}</span>${badges}` +
-      `</span>` +
-      `<span class="opacity-50 shrink-0">${fmtSize(f.size)}</span>`;
-    const rm = document.createElement('button');
-    rm.className = 'btn btn-xs btn-ghost px-1 text-error shrink-0';
-    rm.textContent = '×';
-    rm.title = '除外';
-    rm.onclick = () => { selectedFiles.splice(i, 1); renderFileList(); };
-    li.appendChild(rm);
-    list.appendChild(li);
+    list.appendChild(el('li', { class: 'flex items-center justify-between gap-2 text-xs px-2 py-1 rounded bg-base-200/50' }, [
+      el('span', { class: 'flex items-center gap-1 flex-1 min-w-0', title: relPathOf(f) }, [
+        el('span', { class: 'truncate' }, baseNameOf(f)),
+        folderTagsOf(f).map(d => el('span', { class: 'badge badge-ghost badge-xs shrink-0' }, d)),
+      ]),
+      el('span', { class: 'opacity-50 shrink-0' }, fmtSize(f.size)),
+      el('button', {
+        class: 'btn btn-xs btn-ghost px-1 text-error shrink-0', title: '除外',
+        onclick: () => { selectedFiles.splice(i, 1); renderFileList(); },
+      }, '×'),
+    ]));
   });
 }
 
@@ -345,11 +337,12 @@ async function doUpload() {
 
   clearFiles();
   /** @type {HTMLInputElement} */ ($('as-series')).checked = false;
-  const seriesNote = asSeries ? `（シリーズ「${escapeHtml(seriesName)}」に登録）` : '';
+  const seriesNote = asSeries ? `（シリーズ「${seriesName}」に登録）` : '';
   const tagNote = tagged ? '（フォルダ名をタグとして付与）' : '';
   const failNote = failed > 0 ? ` / ${failed} 件失敗` : '';
-  resultEl.innerHTML = `${created.length} 件アップロードしました${failNote} ${seriesNote}${tagNote} ` +
-    `<a class="link link-primary" href="/ui/files">ファイル一覧へ →</a>`;
+  resultEl.replaceChildren(
+    `${created.length} 件アップロードしました${failNote} ${seriesNote}${tagNote} `,
+    el('a', { class: 'link link-primary', href: '/ui/files' }, 'ファイル一覧へ →'));
   uiToast(`${created.length} 件アップロードしました`, failed > 0 ? 'warning' : 'success');
 }
 

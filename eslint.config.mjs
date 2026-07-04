@@ -18,7 +18,7 @@ const browserGlobals = Object.fromEntries([
 // base.html が読み込む common.js（/ui/assets/common.js）が定義する共有グローバル。
 // ページ JS・ビュープラグインはこれらを前提に動く。
 const commonJsGlobals = Object.fromEntries([
-  '$', 'token', 'api', 'json', 'escapeHtml', 'decodeBytes', 'fmtTs',
+  '$', 'token', 'api', 'json', 'escapeHtml', 'el', 'elAppend', 'decodeBytes', 'fmtTs',
   'redirectToLogin', 'logout', 'requireAuth',
   'uiToast', 'uiConfirm', 'uiPrompt', 'uiCopyUrl',
   'fmtSize', 'bytesEqual', 'sniffImageMime', 'bytesLookBinary', 'looksBinaryText',

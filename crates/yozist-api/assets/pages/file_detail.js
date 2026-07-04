@@ -103,8 +103,8 @@ async function init() {
 async function loadSeriesOptions() {
   try {
     seriesOptions = await json('/api/series');
-    $('fd-series-options').innerHTML =
-      seriesOptions.map(s => `<option value="${escapeHtml(s.name)}"></option>`).join('');
+    $('fd-series-options').replaceChildren(
+      ...seriesOptions.map(s => el('option', { value: s.name })));
   } catch (e) { seriesOptions = []; }
 }
 
@@ -116,8 +116,8 @@ function applyDeletedState() {
   $('fd-delete-btn').classList.toggle('hidden', d);
   $('fd-restore-btn').classList.toggle('hidden', !d);
   ['fd-update-btn', 'fd-share-btn', 'fd-perm-btn'].forEach(id => {
-    const el = /** @type {HTMLButtonElement} */ ($(id));
-    if (el) el.disabled = d;
+    const btn = /** @type {HTMLButtonElement} */ ($(id));
+    if (btn) btn.disabled = d;
   });
 }
 
@@ -133,16 +133,17 @@ async function restoreFile() {
 async function loadDetail() {
   $('fd-name').textContent = currentFile.display_name;
   applyDeletedState();
-  const metaRow = (label, value, mono) =>
-    `<div><dt class="opacity-50">${label}</dt>` +
-    `<dd class="break-all${mono ? ' font-mono' : ''}">${value}</dd></div>`;
-  $('fd-meta').innerHTML = `<dl class="space-y-2">
-    ${metaRow('サイズ', fmtSize(currentFile.size))}
-    ${metaRow('MIME', escapeHtml(currentFile.mime || '—'))}
-    ${currentFile.charset ? metaRow('文字コード', escapeHtml(currentFile.charset)) : ''}
-    ${metaRow('ID', escapeHtml(currentFile.id), true)}
-    ${metaRow('current_commit', escapeHtml(currentFile.current_commit), true)}
-  </dl>`;
+  const metaRow = (label, value, mono) => el('div', {}, [
+    el('dt', { class: 'opacity-50' }, label),
+    el('dd', { class: 'break-all' + (mono ? ' font-mono' : '') }, value),
+  ]);
+  $('fd-meta').replaceChildren(el('dl', { class: 'space-y-2' }, [
+    metaRow('サイズ', fmtSize(currentFile.size)),
+    metaRow('MIME', currentFile.mime || '—'),
+    currentFile.charset && metaRow('文字コード', currentFile.charset),
+    metaRow('ID', currentFile.id, true),
+    metaRow('current_commit', currentFile.current_commit, true),
+  ]));
   $('fd-share').textContent = '';
   await Promise.all([loadTags(), loadHistory(), loadFileSeries(), renderContent()]);
 }
@@ -182,16 +183,17 @@ function renderTags() {
 
   // 割り当て済み（選択済み）。システムタグ（ext:/type: 等）は自動付与で詳細情報に
   // MIME 等として表示されるため、タグカードには出さない。
-  const assignedHtml = assignedTags
+  const assigned = assignedTags
     .filter(t => t.kind !== 'system')
     .map(t =>
       // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
-      `<button type="button" class="badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error"
-              title="クリックでタグを外す" onclick="detachTag('${t.id}')">
-        ${escapeHtml(t.name)}${tagIcon(t.kind)}
-        <span class="leading-none opacity-70">×</span>
-      </button>`
-    ).join('');
+      el('button', {
+        type: 'button',
+        class: `badge badge-sm ${tagVariant(t.kind)} gap-1 cursor-pointer hover:badge-error`,
+        title: 'クリックでタグを外す',
+        onclick: () => detachTag(t.id),
+      }, [t.name + tagIcon(t.kind), el('span', { class: 'leading-none opacity-70' }, '×')])
+    );
 
   // 候補（未選択）。システムタグ・割り当て済みは除外し、入力でフィルター。
   const cands = allTags.filter(t =>
@@ -199,17 +201,20 @@ function renderTags() {
     !assignedTagIds.has(t.id) &&
     (q === '' || t.name.toLowerCase().includes(q))
   );
-  const candHtml = cands.slice(0, 30).map(t =>
-    `<button type="button"
-             class="badge badge-sm badge-outline ${tagVariant(t.kind)} cursor-pointer hover:badge-soft"
-             title="このタグを割り当てる" onclick="assignExistingTag('${t.id}')">+ ${escapeHtml(t.name)}${tagIcon(t.kind)}</button>`
-  ).join('');
+  const candBtns = cands.slice(0, 30).map(t =>
+    el('button', {
+      type: 'button',
+      class: `badge badge-sm badge-outline ${tagVariant(t.kind)} cursor-pointer hover:badge-soft`,
+      title: 'このタグを割り当てる',
+      onclick: () => assignExistingTag(t.id),
+    }, `+ ${t.name}${tagIcon(t.kind)}`)
+  );
 
-  if (!assignedHtml && !candHtml) {
-    box.innerHTML = '<span class="opacity-50 text-xs">タグなし</span>';
+  if (assigned.length === 0 && candBtns.length === 0) {
+    box.replaceChildren(el('span', { class: 'opacity-50 text-xs' }, 'タグなし'));
     return;
   }
-  box.innerHTML = assignedHtml + candHtml;
+  box.replaceChildren(...assigned, ...candBtns);
 }
 
 // 既存タグを割り当てる（候補クリック時）。
@@ -226,30 +231,39 @@ async function assignExistingTag(tagId) {
 async function loadHistory() {
   const history = await json(`/api/files/${fileId}/history`);
   const currentCommitId = currentFile.current_commit;
-  $('fd-history').innerHTML = history.length === 0
-    ? '<div class="opacity-50 text-xs">履歴なし</div>'
-    : history.map(c => {
-        const isCurrent = c.id === currentCommitId;
-        const time = fmtTs(c.timestamp);
-        const by = c.committed_by
-          ? `<span class="opacity-70">${escapeHtml(c.committed_by)}</span>`
-          : '<span class="opacity-40">不明</span>';
-        return `<div class="row-compact flex items-center justify-between gap-2 text-xs">
-          <div class="truncate">
-            ${isCurrent ? '<span class="text-warning font-bold">★</span> ' : ''}
-            <span class="opacity-70">${time}</span>
-            <span class="opacity-60">${escapeHtml(c.format_id)}</span>
-            <span class="opacity-50">·</span> ${by}
-            ${escapeHtml(c.message || '')}
-          </div>
-          <div class="flex gap-1 shrink-0">
-            <a class="btn btn-xs" href="/ui/files/${fileId}/compare?base=${c.id}&compare=${currentCommitId}" title="現在の内容と比較">Δ 比較</a>
-            <a class="btn btn-xs" href="/ui/files/${fileId}/histories/${c.id}">表示</a>
-            ${isCurrent ? '' : `<button class="btn btn-xs btn-warning btn-outline"
-              onclick="rollback('${c.id}','${time}')">戻す</button>`}
-          </div>
-        </div>`;
-      }).join('');
+  const box = $('fd-history');
+  if (history.length === 0) {
+    box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '履歴なし'));
+    return;
+  }
+  box.replaceChildren(...history.map(c => {
+    const isCurrent = c.id === currentCommitId;
+    const time = fmtTs(c.timestamp);
+    return el('div', { class: 'row-compact flex items-center justify-between gap-2 text-xs' }, [
+      el('div', { class: 'truncate' }, [
+        isCurrent && el('span', { class: 'text-warning font-bold' }, '★'),
+        isCurrent && ' ',
+        el('span', { class: 'opacity-70' }, time), ' ',
+        el('span', { class: 'opacity-60' }, c.format_id), ' ',
+        el('span', { class: 'opacity-50' }, '·'), ' ',
+        c.committed_by
+          ? el('span', { class: 'opacity-70' }, c.committed_by)
+          : el('span', { class: 'opacity-40' }, '不明'),
+        ' ' + (c.message || ''),
+      ]),
+      el('div', { class: 'flex gap-1 shrink-0' }, [
+        el('a', {
+          class: 'btn btn-xs', title: '現在の内容と比較',
+          href: `/ui/files/${fileId}/compare?base=${c.id}&compare=${currentCommitId}`,
+        }, 'Δ 比較'),
+        el('a', { class: 'btn btn-xs', href: `/ui/files/${fileId}/histories/${c.id}` }, '表示'),
+        !isCurrent && el('button', {
+          class: 'btn btn-xs btn-warning btn-outline',
+          onclick: () => rollback(c.id, time),
+        }, '戻す'),
+      ]),
+    ]);
+  }));
 }
 
 function revokeContentUrl() {
@@ -331,7 +345,8 @@ async function renderContent() {
   try {
     await plugin.mount(cont, ctx);
   } catch (e) {
-    cont.innerHTML = `<span class="text-error text-xs">content の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
+    cont.replaceChildren(el('span', { class: 'text-error text-xs' },
+      'content の読み込みに失敗しました: ' + e.message));
   }
   // 削除済みファイルはテキスト編集も無効化（復元してから編集する）
   $('fd-edit-btn').classList.toggle('hidden', !canEdit || !!(currentFile && currentFile.deleted));
@@ -659,13 +674,13 @@ async function fetchUtf8ChunkProbe() {
 }
 
 function renderBinary(cont) {
-  cont.innerHTML = `
-    <div class="flex flex-col items-center gap-3 py-10 text-center">
-      <div class="text-4xl opacity-30">🗎</div>
-      <div class="text-sm opacity-70">このファイルはプレビューに対応していません。</div>
-      <div class="text-xs opacity-50 break-all">${escapeHtml(currentFile.mime || '不明な形式')} · ${fmtSize(currentFile.size)}</div>
-      <button class="btn btn-sm btn-primary" onclick="downloadContent()">ダウンロード</button>
-    </div>`;
+  cont.replaceChildren(el('div', { class: 'flex flex-col items-center gap-3 py-10 text-center' }, [
+    el('div', { class: 'text-4xl opacity-30' }, '🗎'),
+    el('div', { class: 'text-sm opacity-70' }, 'このファイルはプレビューに対応していません。'),
+    el('div', { class: 'text-xs opacity-50 break-all' },
+      `${currentFile.mime || '不明な形式'} · ${fmtSize(currentFile.size)}`),
+    el('button', { class: 'btn btn-sm btn-primary', onclick: () => downloadContent() }, 'ダウンロード'),
+  ]));
 }
 
 async function downloadContent() {
@@ -1061,9 +1076,9 @@ async function removeFromSeries(seriesId) {
 function renderFileSeries(list) {
   const box = $('fd-series-list');
   if (!box) return;
-  if (!list || list.length === 0) { box.innerHTML = ''; return; }
+  if (!list || list.length === 0) { box.replaceChildren(); return; }
 
-  box.innerHTML = list.map(s => {
+  box.replaceChildren(...list.map(s => {
     const total = s.members.length;
     const pos = s.position;            // 1 始まり。0 = 見つからない
     const idx = pos - 1;
@@ -1074,40 +1089,46 @@ function renderFileSeries(list) {
     const next  = (idx >= 0 && idx < total - 1) ? s.members[idx + 1] : null;
     const last  = total ? s.members[total - 1] : null;
 
-    const navBtn = (label, target, title, disabled) => {
-      if (disabled || !target) {
-        return `<button type="button" class="btn btn-xs join-item" disabled>${label}</button>`;
-      }
-      return `<button type="button" class="btn btn-xs join-item"
-                 title="${escapeHtml(title + ': ' + target.display_name)}"
-                 onclick="gotoFile('${target.file_id}')">${label}</button>`;
-    };
+    const navBtn = (label, target, title, disabled) =>
+      (disabled || !target)
+        ? el('button', { type: 'button', class: 'btn btn-xs join-item', disabled: true }, label)
+        : el('button', {
+            type: 'button', class: 'btn btn-xs join-item',
+            title: title + ': ' + target.display_name,
+            onclick: () => gotoFile(target.file_id),
+          }, label);
 
-    return `
-      <div class="rounded bg-base-200/60 px-2 py-1.5">
-        <div class="flex items-center justify-between gap-2">
-          <a href="/ui/files?series=${encodeURIComponent(s.id)}"
-             class="text-sm font-medium link link-hover truncate"
-             title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</a>
-          <div class="flex items-center gap-1 shrink-0">
-            <span class="text-xs opacity-60 tabular-nums">${pos} / ${total}</span>
-            <a href="/ui/series/${encodeURIComponent(s.id)}"
-               class="btn btn-xs btn-ghost btn-square"
-               title="シリーズ設定（並び替え・名称変更）">⚙</a>
-          </div>
-        </div>
-        <div class="flex items-center gap-1 mt-1.5">
-          <div class="join">
-            ${navBtn('«', first, '最初へ', atStart)}
-            ${navBtn('&lt;', prev, '前へ', atStart)}
-            ${navBtn('&gt;', next, '次へ', atEnd)}
-            ${navBtn('»', last, '最後へ', atEnd)}
-          </div>
-          <button type="button" class="btn btn-xs btn-ghost ml-auto"
-                  title="このシリーズから外す" onclick="removeFromSeries('${s.id}')">×</button>
-        </div>
-      </div>`;
-  }).join('');
+    return el('div', { class: 'rounded bg-base-200/60 px-2 py-1.5' }, [
+      el('div', { class: 'flex items-center justify-between gap-2' }, [
+        el('a', {
+          href: `/ui/files?series=${encodeURIComponent(s.id)}`,
+          class: 'text-sm font-medium link link-hover truncate',
+          title: s.name,
+        }, s.name),
+        el('div', { class: 'flex items-center gap-1 shrink-0' }, [
+          el('span', { class: 'text-xs opacity-60 tabular-nums' }, `${pos} / ${total}`),
+          el('a', {
+            href: `/ui/series/${encodeURIComponent(s.id)}`,
+            class: 'btn btn-xs btn-ghost btn-square',
+            title: 'シリーズ設定（並び替え・名称変更）',
+          }, '⚙'),
+        ]),
+      ]),
+      el('div', { class: 'flex items-center gap-1 mt-1.5' }, [
+        el('div', { class: 'join' }, [
+          navBtn('«', first, '最初へ', atStart),
+          navBtn('<', prev, '前へ', atStart),
+          navBtn('>', next, '次へ', atEnd),
+          navBtn('»', last, '最後へ', atEnd),
+        ]),
+        el('button', {
+          type: 'button', class: 'btn btn-xs btn-ghost ml-auto',
+          title: 'このシリーズから外す',
+          onclick: () => removeFromSeries(s.id),
+        }, '×'),
+      ]),
+    ]);
+  }));
 }
 
 async function issueShare() {
@@ -1121,7 +1142,8 @@ async function issueShare() {
   try {
     const res = await json(`/api/files/${fileId}/share`, { method: 'POST', body: { ttl_secs: ttl } });
     const fullUrl = location.origin + res.url;
-    $('fd-share').innerHTML = `共有URL (${ttl}秒): <a class="link link-primary" href="${fullUrl}" target="_blank">${escapeHtml(fullUrl)}</a>`;
+    $('fd-share').replaceChildren(`共有URL (${ttl}秒): `,
+      el('a', { class: 'link link-primary', href: fullUrl, target: '_blank' }, fullUrl));
     await uiCopyUrl(fullUrl, 'ファイル共有URL');
   } catch (e) {
     uiToast('共有URL発行に失敗しました: ' + e.message, 'error');
@@ -1133,8 +1155,8 @@ async function grantPermission() {
   try { users = await json('/api/users'); }
   catch (e) { uiToast('ユーザー取得に失敗しました', 'error'); return; }
   if (users.length === 0) { uiToast('ユーザーが存在しません', 'warning'); return; }
-  $('perm-user').innerHTML = users.map(u =>
-    `<option value="${u.id}">${escapeHtml(u.username)}</option>`).join('');
+  $('perm-user').replaceChildren(
+    ...users.map(u => el('option', { value: u.id }, u.username)));
   /** @type {HTMLDialogElement} */ ($('perm-modal')).showModal();
 }
 
@@ -1169,11 +1191,13 @@ async function deleteFile() {
 init();
 
 // テンプレート／生成 HTML のインライン onclick 等から参照される関数を明示的に公開する。
+// el() 移行に伴い、JS 生成 HTML の onclick 文字列から参照されていた関数
+// (rollback / detachTag / assignExistingTag / removeFromSeries / gotoFile) は
+// クロージャ直結になったため公開不要になった。
 Object.assign(window, {
   startRename, toggleEdit, saveEdit, uploadContent, downloadContent,
-  deleteFile, restoreFile, rollback,
-  renderTags, addTag, detachTag, assignExistingTag,
-  addToSeries, removeFromSeries, gotoFile,
+  deleteFile, restoreFile,
+  renderTags, addTag, addToSeries,
   issueShare, grantPermission,
 });
 })();

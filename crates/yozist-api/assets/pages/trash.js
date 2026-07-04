@@ -68,35 +68,35 @@ function fileIcon(f) {
 }
 
 // 削除を実行したユーザー（更新者ラベル）。未記録は空。
+// テキストノードとして挿入する（el() ヘルパー）ためエスケープ不要。
 function actorLabel(f) {
   const who = f.updated_by || f.created_by;
-  return who ? ` · ${escapeHtml(who)}` : '';
+  return who ? ` · ${who}` : '';
 }
 
 function render() {
   $('trash-count').textContent = `(${items.length}${hasMore ? '+' : ''})`;
-  const el = $('trash-list');
+  const list = $('trash-list');
   if (items.length === 0) {
-    el.innerHTML = '<li class="px-2 py-8 opacity-60 text-sm text-center">ゴミ箱は空です。</li>';
+    list.replaceChildren(el('li', { class: 'px-2 py-8 opacity-60 text-sm text-center' }, 'ゴミ箱は空です。'));
   } else {
-    el.innerHTML = items.map(f => `
-      <li class="flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200" data-id="${f.id}">
-        <span class="text-lg shrink-0" aria-hidden="true">${fileIcon(f)}</span>
-        <span class="min-w-0 flex-1">
-          <a href="/ui/files/${f.id}" class="font-semibold truncate block link link-hover"
-             title="詳細を表示">${escapeHtml(f.display_name)}</a>
-          <span class="text-xs opacity-60 block">
-            削除: ${fmtTs(f.deleted_at || f.updated_at)}${actorLabel(f)} · ${fmtSize(f.size)}
-          </span>
-        </span>
-        <span class="flex gap-6 shrink-0">
-          <button class="btn btn-xs btn-primary btn-outline"
-                  onclick="restoreFile('${f.id}')">復元</button>
-          <button class="btn btn-xs btn-error btn-outline"
-                  onclick="purgeFile('${f.id}')">完全に削除</button>
-        </span>
-      </li>
-    `).join('');
+    list.replaceChildren(...items.map(f =>
+      el('li', { class: 'flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200', 'data-id': f.id }, [
+        el('span', { class: 'text-lg shrink-0', 'aria-hidden': 'true' }, fileIcon(f)),
+        el('span', { class: 'min-w-0 flex-1' }, [
+          el('a', {
+            href: `/ui/files/${f.id}`,
+            class: 'font-semibold truncate block link link-hover',
+            title: '詳細を表示',
+          }, f.display_name),
+          el('span', { class: 'text-xs opacity-60 block' },
+            `削除: ${fmtTs(f.deleted_at || f.updated_at)}${actorLabel(f)} · ${fmtSize(f.size)}`),
+        ]),
+        el('span', { class: 'flex gap-6 shrink-0' }, [
+          el('button', { class: 'btn btn-xs btn-primary btn-outline', onclick: () => restoreFile(f.id) }, '復元'),
+          el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => purgeFile(f.id) }, '完全に削除'),
+        ]),
+      ])));
   }
   $('load-more-wrap').classList.toggle('hidden', !hasMore);
   /** @type {HTMLButtonElement} */ ($('empty-trash-btn')).disabled = items.length === 0;
@@ -141,5 +141,6 @@ async function emptyTrash() {
 init();
 
 // テンプレート／生成 HTML のインライン onclick から参照される関数を明示的に公開する。
-Object.assign(window, { loadMore, restoreFile, purgeFile, emptyTrash });
+// (restoreFile / purgeFile は el() のクロージャ直結になり公開不要)
+Object.assign(window, { loadMore, emptyTrash });
 })();

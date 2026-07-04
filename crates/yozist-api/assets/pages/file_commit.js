@@ -145,7 +145,8 @@ async function renderContent() {
   try {
     await plugin.mount(cont, ctx);
   } catch (e) {
-    cont.innerHTML = `<span class="text-error text-xs">コミット内容の読み込みに失敗しました: ${escapeHtml(e.message)}</span>`;
+    cont.replaceChildren(el('span', { class: 'text-error text-xs' },
+      'コミット内容の読み込みに失敗しました: ' + e.message));
   }
 }
 
@@ -154,12 +155,12 @@ async function renderTextContent(cont, kind) {
   // 先頭チャンクを取得（バイナリ判定にも使う）。
   const first = await fetchUtf8ChunkProbe();
   if (kind === 'unknown' && !file.charset && looksBinary(first.buf)) {
-    cont.innerHTML = `
-      <div class="flex flex-col items-center gap-3 py-10 text-center">
-        <div class="text-4xl opacity-30">🗎</div>
-        <div class="text-sm opacity-70">このファイルはプレビューに対応していません。</div>
-        <div class="text-xs opacity-50 break-all">${escapeHtml(file.mime || '不明な形式')} · ${fmtSize(first.total)}</div>
-      </div>`;
+    cont.replaceChildren(el('div', { class: 'flex flex-col items-center gap-3 py-10 text-center' }, [
+      el('div', { class: 'text-4xl opacity-30' }, '🗎'),
+      el('div', { class: 'text-sm opacity-70' }, 'このファイルはプレビューに対応していません。'),
+      el('div', { class: 'text-xs opacity-50 break-all' },
+        `${file.mime || '不明な形式'} · ${fmtSize(first.total)}`),
+    ]));
     return;
   }
   textTotalBytes = first.total;
@@ -459,13 +460,17 @@ async function init() {
 
   const isCurrent = file.current_commit === commitId;
   const time = fmtTs(commit.timestamp);
-  const badge = isCurrent
-    ? '<span class="badge badge-warning badge-sm ml-1">★ current</span>'
-    : '';
-  $('fc-meta').innerHTML =
-    `commit <span class="font-mono">${escapeHtml(commit.format_id || commitId.slice(0, 8))}</span> ${badge}<br>
-     <span class="opacity-70">${time}</span>
-     ${commit.message ? ' — ' + escapeHtml(commit.message) : ''}`;
+  const meta = $('fc-meta');
+  meta.replaceChildren();
+  elAppend(meta, [
+    'commit ',
+    el('span', { class: 'font-mono' }, commit.format_id || commitId.slice(0, 8)),
+    isCurrent && ' ',
+    isCurrent && el('span', { class: 'badge badge-warning badge-sm ml-1' }, '★ current'),
+    el('br'),
+    el('span', { class: 'opacity-70' }, time),
+    commit.message && ' — ' + commit.message,
+  ]);
 
   if (!isCurrent) {
     const btn = $('fc-rollback');
