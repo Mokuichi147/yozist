@@ -93,7 +93,6 @@ function applyFiltersDebounced() {
 
 function resetFilters() {
   /** @type {HTMLInputElement} */ ($('f-search')).value = '';
-  /** @type {HTMLInputElement} */ ($('f-name')).value = '';
   /** @type {HTMLSelectElement} */ ($('f-series')).value = '';
   /** @type {HTMLSelectElement} */ ($('f-filter')).value = '';
   selectedTags.clear();
@@ -106,11 +105,9 @@ function sortVal() { return /** @type {HTMLSelectElement} */ ($('f-sort')).value
 function saveFiltersToUrl() {
   const params = new URLSearchParams();
   const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
-  const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
   const series = /** @type {HTMLSelectElement} */ ($('f-series')).value;
   const filter = /** @type {HTMLSelectElement} */ ($('f-filter')).value;
   if (q) params.set('q', q);
-  if (name) params.set('name', name);
   if (series) params.set('series', series);
   if (filter) params.set('filter', filter);
   if (selectedTags.size) params.set('tags', [...selectedTags].join(','));
@@ -122,7 +119,8 @@ function saveFiltersToUrl() {
 function restoreFiltersFromUrl() {
   const p = new URLSearchParams(location.search);
   if (p.get('q')) /** @type {HTMLInputElement} */ ($('f-search')).value = p.get('q');
-  if (p.get('name')) /** @type {HTMLInputElement} */ ($('f-name')).value = p.get('name');
+  // 旧「ファイル名 (部分一致)」欄の URL パラメータは統合後の検索欄へ引き継ぐ
+  else if (p.get('name')) /** @type {HTMLInputElement} */ ($('f-search')).value = p.get('name');
   if (p.get('series')) /** @type {HTMLSelectElement} */ ($('f-series')).value = p.get('series');
   if (p.get('filter')) /** @type {HTMLSelectElement} */ ($('f-filter')).value = p.get('filter');
   if (p.get('tags')) p.get('tags').split(',').filter(Boolean).forEach(t => selectedTags.add(t));
@@ -135,12 +133,11 @@ function restoreFiltersFromUrl() {
 async function applyFilters() {
   saveFiltersToUrl();
   const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
-  const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
   const seriesId = /** @type {HTMLSelectElement} */ ($('f-series')).value;
   const filterId = /** @type {HTMLSelectElement} */ ($('f-filter')).value;
   const tags = [...selectedTags];
 
-  browseMode = !q && tags.length === 0 && !seriesId && !name && !filterId;
+  browseMode = !q && tags.length === 0 && !seriesId && !filterId;
 
   if (browseMode) {
     browseOffset = 0;
@@ -160,7 +157,7 @@ async function applyFilters() {
       // 保存済みフィルター単独 → その条件に一致するファイルを基底集合にする
       files = await json('/api/filters/' + filterId + '/files');
     } else {
-      // 名前 / シリーズのみ → ベース集合をソート済みで広めに取得
+      // シリーズのみ → ベース集合をソート済みで広めに取得
       files = await json('/api/files?limit=1000&sort=' + sortParams().sort + '&order=' + sortParams().order);
     }
   } catch (e) {
@@ -185,11 +182,6 @@ async function applyFilters() {
     const members = await json('/api/series/' + seriesId + '/members').catch(() => []);
     const allowed = new Set(members.map(m => m.file_id));
     files = files.filter(f => allowed.has(f.id));
-  }
-
-  if (name) {
-    const lower = name.toLowerCase();
-    files = files.filter(f => f.display_name.toLowerCase().includes(lower));
   }
 
   // FTS は関連度順を保つ。それ以外（または明示的に並び替えた場合）はクライアントでソート
@@ -318,11 +310,9 @@ function renderActiveFilters() {
   const box = $('active-filters');
   const chips = [];
   const q = /** @type {HTMLInputElement} */ ($('f-search')).value.trim();
-  const name = /** @type {HTMLInputElement} */ ($('f-name')).value.trim();
   const sel = /** @type {HTMLSelectElement} */ ($('f-series'));
   const fil = /** @type {HTMLSelectElement} */ ($('f-filter'));
   if (q) chips.push({ label: `検索: "${q}"`, clear: () => { /** @type {HTMLInputElement} */ ($('f-search')).value = ''; } });
-  if (name) chips.push({ label: `名前: "${name}"`, clear: () => { /** @type {HTMLInputElement} */ ($('f-name')).value = ''; } });
   if (sel.value) chips.push({
     label: 'シリーズ: ' + sel.options[sel.selectedIndex].text,
     clear: () => { sel.value = ''; },

@@ -12,20 +12,14 @@
           <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">フィルター</h2>
 
           <div>
-            <label class="text-xs opacity-70 block mb-1">全文検索 (FTS5)</label>
+            <label class="text-xs opacity-70 block mb-1">検索</label>
             <div class="join w-full">
               <input id="f-search" class="input input-bordered input-sm join-item w-full"
-                     placeholder="本文・名前を検索 ( / )"
+                     placeholder="名前・本文・タグを検索 ( / )"
+                     oninput="applyFiltersDebounced()"
                      onkeydown="if(event.key==='Enter')applyFilters()">
               <button class="btn btn-sm join-item btn-ghost" onclick="$('f-search').value='';applyFilters()" title="クリア">×</button>
             </div>
-          </div>
-
-          <div>
-            <label class="text-xs opacity-70 block mb-1">ファイル名 (部分一致)</label>
-            <input id="f-name" class="input input-bordered input-sm w-full"
-                   placeholder="例: memo"
-                   oninput="applyFiltersDebounced()">
           </div>
 
           <div>
