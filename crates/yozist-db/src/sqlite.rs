@@ -193,6 +193,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let size: i64 = row.try_get("size")?;
     let committed_by: Option<String> = row.try_get("committed_by")?;
     let committed_by_user_id: Option<i64> = row.try_get("committed_by_user_id")?;
+    let delta_base: Option<String> = row.try_get("delta_base")?;
     Ok(Commit {
         id: CommitId::from_uuid(parse_uuid(&id)?),
         file_id: FileId::from_uuid(parse_uuid(&file_id)?),
@@ -207,6 +208,9 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
         size: size.max(0) as u64,
         committed_by,
         committed_by_user_id,
+        delta_base: delta_base
+            .map(|s| parse_uuid(&s).map(CommitId::from_uuid))
+            .transpose()?,
     })
 }
 
@@ -782,8 +786,8 @@ impl MetaStore for SqliteMetaStore {
         sqlx::query(
             r#"INSERT INTO commits
                (id, file_id, parent, actor, blob, format_id, timestamp, message,
-                size, committed_by, committed_by_user_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                size, committed_by, committed_by_user_id, delta_base)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(commit.id.to_string())
         .bind(commit.file_id.to_string())
@@ -796,6 +800,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(commit.size as i64)
         .bind(&commit.committed_by)
         .bind(commit.committed_by_user_id)
+        .bind(commit.delta_base.map(|c| c.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1068,6 +1073,7 @@ mod tests {
             size: 0,
             committed_by: None,
             committed_by_user_id: None,
+            delta_base: None,
         };
         s.insert_commit(&commit).await.unwrap();
 
@@ -1392,6 +1398,7 @@ mod tests {
             size: 100,
             committed_by: None,
             committed_by_user_id: None,
+            delta_base: None,
         };
         let c2 = Commit {
             id: CommitId::new(),
@@ -1405,6 +1412,7 @@ mod tests {
             size: 250,
             committed_by: Some("alice".into()),
             committed_by_user_id: Some(42),
+            delta_base: Some(c1.id),
         };
         s.insert_commit(&c1).await.unwrap();
         s.insert_commit(&c2).await.unwrap();
@@ -1420,6 +1428,9 @@ mod tests {
         assert_eq!(log[0].committed_by_user_id, None);
         assert_eq!(log[1].committed_by.as_deref(), Some("alice"));
         assert_eq!(log[1].committed_by_user_id, Some(42));
+        // delta_base が往復で保持される（NULL/値の両方）
+        assert_eq!(log[0].delta_base, None);
+        assert_eq!(log[1].delta_base, Some(c1.id));
     }
 
     #[tokio::test]

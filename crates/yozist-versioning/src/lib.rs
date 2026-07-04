@@ -6,11 +6,19 @@
 //! - **書き込みの単一経路**: SMB/API/AI のどこから書く場合も `commit()` を経由。
 //! - **並行性**: テキストは CRDT（自動マージ）、バイナリは LWW（最終書き込み勝ち）。
 //!
+//! # 差分保存（issue #10）
+//! バッファ経由の `commit()` は、前コミットの内容を zstd 辞書としたパッチ
+//! （[`delta`] モジュール参照）を blob に保存し、`Commit.delta_base` で基準を指す。
+//! デルタ鎖が `delta::SNAPSHOT_INTERVAL` に達する、内容が大きすぎる、または
+//! パッチに利得がない場合はフルスナップショット（従来通りの完全な内容）を保存
+//! する。ストリーミング経路（大容量バイナリ）と `commit_raw`（巨大ファイルの
+//! 部分編集）は前バージョンを読まない設計のため、常にフルスナップショット。
+//!
 //! # TODO
 //! - [ ] `PlainTextCrdt`（yrs ベース）の本実装
 //! - [ ] Markdown / JSON / CSV CRDT
 //! - [ ] commit DAG（merge コミット）対応
-//! - [ ] スナップショット圧縮間隔（N コミット毎にフル保存）
+//! - [x] スナップショット圧縮間隔（N コミット毎にフル保存）
 //! - [ ] `broadcast` チャネルによる変更通知
 
 use async_trait::async_trait;
@@ -22,6 +30,7 @@ use yozist_core::{
 use yozist_db::SharedMetaStore;
 use yozist_storage::{ByteStream, SharedBlobStore, StorageError};
 
+pub mod delta;
 pub mod registry;
 pub mod text;
 pub use registry::{CrdtRegistry, LwwFormat, PlainTextCrdt};
@@ -202,18 +211,14 @@ impl VersioningEngine {
         }
         let fmt = self.registry.resolve(&hint);
 
-        // 既存状態を読み込み、新規 op を適用してから保存。
-        let prev_bytes = if let Some(prev_commit_id) = file.current_commit {
+        // 既存状態を読み込み、新規 op を適用してから保存。前コミットの内容は
+        // デルタ鎖を復元して得る。鎖の深さはデルタ保存の判定にも使う。
+        let (prev_bytes, prev_depth) = if let Some(prev_commit_id) = file.current_commit {
             let commits = self.meta.list_commits(&file_id).await?;
-            let prev = commits
-                .into_iter()
-                .find(|c| c.id == prev_commit_id)
-                .ok_or_else(|| {
-                    VersioningError::Conflict("current_commit references missing row".into())
-                })?;
-            self.blob.get(&prev.blob).await?.to_vec()
+            let bytes = self.materialize_from(&commits, prev_commit_id).await?;
+            (bytes, chain_depth(&commits, prev_commit_id))
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
 
         let mut state = fmt.load(&prev_bytes).await?;
@@ -224,7 +229,21 @@ impl VersioningEngine {
         fmt.apply_ops(&mut state, &[op]).await?;
         let serialized = fmt.serialize(&state).await?;
 
-        let blob_id = self.blob.put(&serialized).await?;
+        // デルタ保存判定: 鎖が上限未満で、パッチに利得がある場合のみ差分を保存。
+        // それ以外（初回・鎖上限・大きすぎ・利得なし）はフルスナップショット。
+        let mut delta_base = None;
+        let mut patch = None;
+        if let Some(prev_id) = file.current_commit
+            && prev_depth.saturating_add(1) < delta::SNAPSHOT_INTERVAL
+            && let Some(p) = delta::encode(&prev_bytes, &serialized)
+        {
+            patch = Some(p);
+            delta_base = Some(prev_id);
+        }
+        let blob_id = match &patch {
+            Some(p) => self.blob.put(p).await?,
+            None => self.blob.put(&serialized).await?,
+        };
         let now = time::OffsetDateTime::now_utc();
         let content_str = if fmt.format_id() == "text/plain" {
             std::str::from_utf8(&serialized).unwrap_or("").to_string()
@@ -242,6 +261,7 @@ impl VersioningEngine {
         self.persist_commit(
             &mut file,
             blob_id,
+            delta_base,
             size,
             fmt.format_id(),
             actor,
@@ -313,6 +333,7 @@ impl VersioningEngine {
         self.persist_commit(
             &mut file,
             blob_id,
+            None,
             size,
             fmt.format_id(),
             actor,
@@ -468,6 +489,7 @@ impl VersioningEngine {
             self.persist_commit(
                 &mut file,
                 blob_id,
+                None,
                 size,
                 fmt.format_id(),
                 actor,
@@ -534,7 +556,7 @@ impl VersioningEngine {
             // バイナリ(LWW): 本文をメモリに載せず blob へ直接流す。
             let (blob_id, size) = self.blob.put_stream(stream).await?;
             self.persist_commit(
-                &mut file, blob_id, size, fmt.format_id(), actor, committed_by,
+                &mut file, blob_id, None, size, fmt.format_id(), actor, committed_by,
                 committed_by_user_id, message, None, "", now, &hint,
             )
             .await
@@ -557,6 +579,7 @@ impl VersioningEngine {
             self.persist_commit(
                 &mut file,
                 blob_id,
+                None,
                 size,
                 fmt.format_id(),
                 actor,
@@ -621,6 +644,7 @@ impl VersioningEngine {
             size,
             committed_by,
             committed_by_user_id,
+            delta_base: None,
         };
         self.meta.insert_commit(&commit).await?;
 
@@ -667,6 +691,7 @@ impl VersioningEngine {
         &self,
         file: &mut FileMeta,
         blob_id: BlobId,
+        delta_base: Option<CommitId>,
         size: u64,
         format_id: &str,
         actor: ActorId,
@@ -690,6 +715,7 @@ impl VersioningEngine {
             size,
             committed_by,
             committed_by_user_id,
+            delta_base,
         };
         self.meta.insert_commit(&commit).await?;
 
@@ -753,8 +779,7 @@ impl VersioningEngine {
             .get_file(&file_id)
             .await?
             .ok_or(VersioningError::NotFound(file_id))?;
-        let blob_id = self.find_blob(&file_id, commit_id).await?;
-        Ok(self.blob.get(&blob_id).await?.to_vec())
+        self.materialize(&file_id, commit_id).await
     }
 
     /// `commit_id` 時点の内容を新規コミットとして再投入する (= rollback)。
@@ -870,21 +895,50 @@ impl VersioningEngine {
         let commit_id = file
             .current_commit
             .ok_or_else(|| VersioningError::Conflict("file has no commits".into()))?;
-        let blob_id = self.find_blob(&file_id, commit_id).await?;
-        Ok(self.blob.get(&blob_id).await?.to_vec())
+        self.materialize(&file_id, commit_id).await
     }
 
-    async fn find_blob(
+    /// 指定コミット時点の内容を取得する（デルタ鎖の復元込み）。
+    async fn materialize(
         &self,
         file_id: &FileId,
         commit_id: CommitId,
-    ) -> Result<BlobId, VersioningError> {
+    ) -> Result<Vec<u8>, VersioningError> {
         let commits = self.meta.list_commits(file_id).await?;
-        commits
-            .into_iter()
+        self.materialize_from(&commits, commit_id).await
+    }
+
+    /// コミット一覧から `commit_id` 時点の内容を再構成する。
+    ///
+    /// フルスナップショット（`delta_base: None`）なら blob をそのまま返す。
+    /// デルタコミットは基準を直近のスナップショットまで遡り、パッチを古い順に
+    /// 適用して復元する。鎖はコミット数を超えたら循環（データ破損）とみなす。
+    async fn materialize_from(
+        &self,
+        commits: &[Commit],
+        commit_id: CommitId,
+    ) -> Result<Vec<u8>, VersioningError> {
+        let mut chain: Vec<&Commit> = Vec::new();
+        let mut cur = commits
+            .iter()
             .find(|c| c.id == commit_id)
-            .map(|c| c.blob)
-            .ok_or_else(|| VersioningError::Conflict("commit not found in log".into()))
+            .ok_or_else(|| VersioningError::Conflict("commit not found in log".into()))?;
+        while let Some(base) = cur.delta_base {
+            chain.push(cur);
+            if chain.len() > commits.len() {
+                return Err(VersioningError::Conflict("delta chain cycle".into()));
+            }
+            cur = commits
+                .iter()
+                .find(|c| c.id == base)
+                .ok_or_else(|| VersioningError::Conflict("delta base missing".into()))?;
+        }
+        let mut content = self.blob.get(&cur.blob).await?.to_vec();
+        for c in chain.iter().rev() {
+            let patch = self.blob.get(&c.blob).await?;
+            content = delta::decode(&content, &patch)?;
+        }
+        Ok(content)
     }
 
     async fn normalize(
@@ -900,6 +954,29 @@ impl VersioningEngine {
         let _ = &mut state;
         fmt.serialize(&state).await
     }
+}
+
+/// `commit_id` からデルタ基準（`delta_base`）を遡り、直近のフルスナップショット
+/// までの鎖の長さを返す（スナップショット自身なら 0）。基準が見つからない・
+/// 循環している（データ破損）場合は上限値を返し、呼び出し側をフルスナップ
+/// ショット保存側へ倒す。
+fn chain_depth(commits: &[Commit], commit_id: CommitId) -> usize {
+    let mut depth = 0;
+    let mut cur = commit_id;
+    while depth <= commits.len() {
+        match commits
+            .iter()
+            .find(|c| c.id == cur)
+            .and_then(|c| c.delta_base)
+        {
+            Some(base) => {
+                depth += 1;
+                cur = base;
+            }
+            None => return depth,
+        }
+    }
+    usize::MAX
 }
 
 fn ext_of(name: &str) -> Option<String> {
@@ -1416,6 +1493,163 @@ mod engine_tests {
             .await
             .unwrap();
         assert_eq!(file.charset, None);
+    }
+
+    #[tokio::test]
+    async fn text_commits_store_deltas_and_snapshot_at_interval() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let base = "行０\n".to_string() + &"共通の本文行です。\n".repeat(200);
+        let (file, _c1) = eng
+            .create_file("doc.md", base.as_bytes(), actor, None, None, None)
+            .await
+            .unwrap();
+
+        // SNAPSHOT_INTERVAL を跨ぐ回数の小さな編集を積む。
+        let n = delta::SNAPSHOT_INTERVAL + 3;
+        let mut expected = Vec::new();
+        for i in 0..n {
+            let content = format!("行{i}\n") + &"共通の本文行です。\n".repeat(200);
+            eng.commit(file.id, content.as_bytes(), actor, None, None, None)
+                .await
+                .unwrap();
+            expected.push(content);
+        }
+
+        let log = eng.meta.list_commits(&file.id).await.unwrap();
+        assert_eq!(log.len(), n + 1);
+        // 初回はスナップショット、以後は鎖が上限に達するまでデルタ、
+        // 上限で再びスナップショットに戻る。
+        assert_eq!(log[0].delta_base, None);
+        for c in &log[1..delta::SNAPSHOT_INTERVAL] {
+            assert!(c.delta_base.is_some(), "expected delta: {:?}", c.id);
+        }
+        assert_eq!(log[delta::SNAPSHOT_INTERVAL].delta_base, None);
+
+        // デルタコミットの blob（パッチ）はフル内容より大幅に小さい。
+        let patch = eng.blob.get(&log[1].blob).await.unwrap();
+        assert!(
+            patch.len() < base.len() / 10,
+            "patch not small: {} vs {}",
+            patch.len(),
+            base.len()
+        );
+
+        // 全履歴が正確に復元できる。
+        assert_eq!(
+            eng.read_current(file.id).await.unwrap(),
+            expected.last().unwrap().as_bytes()
+        );
+        for (i, c) in log[1..].iter().enumerate() {
+            assert_eq!(
+                eng.read_at_commit(file.id, c.id).await.unwrap(),
+                expected[i].as_bytes(),
+                "commit {i} mismatch"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_buffered_commit_uses_delta_and_roundtrips() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // 圧縮の効きにくい擬似ランダムバイナリ。
+        let mut v1 = vec![0u8; 64 * 1024];
+        let mut x: u32 = 7;
+        for b in v1.iter_mut() {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (x >> 24) as u8;
+        }
+        let (file, c1) = eng
+            .create_file("data.bin", &v1, actor, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(c1.format_id, "_/lww");
+
+        // 一部だけ書き換えた v2 をバッファ経由でコミット → デルタ保存される。
+        let mut v2 = v1.clone();
+        v2[100..132].copy_from_slice(&[0xEE; 32]);
+        let c2 = eng
+            .commit(file.id, &v2, actor, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(c2.delta_base, Some(c1.id));
+        assert_eq!(eng.read_current(file.id).await.unwrap(), v2);
+        assert_eq!(eng.read_at_commit(file.id, c1.id).await.unwrap(), v1);
+
+        // 全く別の内容（利得なし）はフルスナップショットへフォールバックする。
+        let mut v3 = vec![0u8; 64 * 1024];
+        for b in v3.iter_mut() {
+            x = x.wrapping_mul(22695477).wrapping_add(1);
+            *b = (x >> 24) as u8;
+        }
+        let c3 = eng
+            .commit(file.id, &v3, actor, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(c3.delta_base, None);
+        assert_eq!(eng.read_current(file.id).await.unwrap(), v3);
+    }
+
+    #[tokio::test]
+    async fn rollback_across_delta_chain() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        let (file, c1) = eng
+            .create_file("note.txt", b"version one", actor, None, None, None)
+            .await
+            .unwrap();
+        eng.commit(file.id, b"version two", actor, None, None, None)
+            .await
+            .unwrap();
+        eng.commit(file.id, b"version three", actor, None, None, None)
+            .await
+            .unwrap();
+        // デルタ鎖の途中（スナップショット）へ巻き戻しても内容が正しい。
+        eng.rollback_to(file.id, c1.id, actor, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(eng.read_current(file.id).await.unwrap(), b"version one");
+    }
+
+    #[tokio::test]
+    async fn streaming_commit_after_delta_becomes_snapshot() {
+        let (eng, _td) = engine().await;
+        let actor = ActorId::new();
+        // バイナリ(LWW)ファイル。バッファ経由の commit はデルタ保存になり、
+        // その後のストリーミング commit はフルスナップショットへ戻る。
+        let v1: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let (file, c1) = eng
+            .create_file("data.bin", &v1, actor, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(c1.format_id, "_/lww");
+        let mut v2 = v1.clone();
+        v2[10..14].copy_from_slice(b"edit");
+        let c2 = eng
+            .commit(file.id, &v2, actor, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(c2.delta_base, Some(c1.id));
+        // ストリーミング経路（前バージョンを読まない）はフルスナップショット。
+        let c3 = eng
+            .commit_streaming(
+                file.id,
+                byte_stream(vec![b"\x00\x01binary now"]),
+                actor,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(c3.delta_base, None);
+        assert_eq!(
+            eng.read_current(file.id).await.unwrap(),
+            b"\x00\x01binary now"
+        );
+        // デルタで保存された過去バージョンも読める。
+        assert_eq!(eng.read_at_commit(file.id, c2.id).await.unwrap(), v2);
     }
 
     #[tokio::test]

@@ -3936,6 +3936,7 @@ dependencies = [
  "yozist-storage",
  "yozist-tagging",
  "yrs",
+ "zstd",
 ]
 
 [[package]]
