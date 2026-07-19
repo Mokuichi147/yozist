@@ -28,6 +28,65 @@ const ZSTD_LEVEL: i32 = 3;
 /// `put_stream` の一時ファイル名を同一プロセス内で衝突させないための連番。
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// パスが載っているファイルシステムの容量情報。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpace {
+    /// 非特権プロセスが書き込み可能な空きバイト数（`f_bavail`）。
+    pub available_bytes: u64,
+    /// ファイルシステム全体の総バイト数。
+    pub total_bytes: u64,
+}
+
+/// `path` が属するファイルシステムの空き／総容量を返す。
+///
+/// `path` 自体がまだ存在しない場合は、存在する祖先ディレクトリを辿って問い合わせる。
+/// 見つからなければカレントディレクトリを使う。
+pub fn disk_space(path: &Path) -> Result<DiskSpace, StorageError> {
+    let probe = resolve_existing_ancestor(path);
+    disk_space_of(&probe)
+}
+
+/// 存在する祖先ディレクトリ（または `.`）を返す。
+fn resolve_existing_ancestor(path: &Path) -> PathBuf {
+    let mut cur = path.to_path_buf();
+    loop {
+        if cur.exists() {
+            return cur;
+        }
+        if !cur.pop() {
+            return PathBuf::from(".");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn disk_space_of(path: &Path) -> Result<DiskSpace, StorageError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        StorageError::InvalidPath(path.to_path_buf())
+    })?;
+    // SAFETY: c_path は NUL 終端、stat はゼロ初期化済み。statvfs は成功時 0 を返す。
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return Err(StorageError::Io(std::io::Error::last_os_error()));
+    }
+    let frsize = stat.f_frsize as u64;
+    Ok(DiskSpace {
+        available_bytes: stat.f_bavail as u64 * frsize,
+        total_bytes: stat.f_blocks as u64 * frsize,
+    })
+}
+
+#[cfg(not(unix))]
+fn disk_space_of(_path: &Path) -> Result<DiskSpace, StorageError> {
+    Err(StorageError::Other(
+        "disk space query is not supported on this platform".into(),
+    ))
+}
+
 /// ローカルファイルシステム上の CAS 実装。
 pub struct FsBlobStore {
     root: PathBuf,
@@ -38,6 +97,16 @@ impl FsBlobStore {
         let root = root.into();
         fs::create_dir_all(&root).await?;
         Ok(Self { root })
+    }
+
+    /// blob ルートディレクトリのパス。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// blob ルートが載っているファイルシステムの空き／総容量。
+    pub fn disk_space(&self) -> Result<DiskSpace, StorageError> {
+        disk_space(&self.root)
     }
 
     fn blob_path(&self, id: &BlobId) -> PathBuf {
@@ -264,5 +333,18 @@ mod tests {
         let (a, _) = store.put_stream(mk()).await.unwrap();
         let (b, _) = store.put_stream(mk()).await.unwrap();
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn disk_space_reports_positive_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).await.unwrap();
+        let space = store.disk_space().unwrap();
+        // 総容量は 0 より大きく、空きは総容量以下。
+        assert!(space.total_bytes > 0);
+        assert!(space.available_bytes <= space.total_bytes);
+        // 未作成の子孫パスでも祖先を辿って問い合わせられる。
+        let nested = disk_space(&dir.path().join("does-not-exist-yet")).unwrap();
+        assert_eq!(nested.total_bytes, space.total_bytes);
     }
 }

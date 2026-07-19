@@ -22,7 +22,7 @@ use std::sync::Arc;
 use yozist_core::BlobId;
 
 pub mod fs;
-pub use fs::FsBlobStore;
+pub use fs::{disk_space, DiskSpace, FsBlobStore};
 
 /// blob をストリーミング保存する際の入力ストリーム。
 /// HTTP ボディ等を 1 チャンクずつ流し込み、メモリに全体を載せずに保存する。

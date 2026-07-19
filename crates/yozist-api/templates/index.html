@@ -16,9 +16,10 @@
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4 sm:p-6">
           <h2 class="card-title text-base">ストレージ使用量</h2>
-          <p class="text-xs opacity-50 mb-4">使用容量は過去バージョン込みの合計です。ドーナツは最新版のファイル種別内訳。</p>
+          <p class="text-xs opacity-50 mb-4">使用容量は過去バージョン込みの合計です。ドーナツは最新版のファイル種別内訳。空き容量はデータ保存先ディスクの実測値です。</p>
           <div id="storage-loading" class="text-sm opacity-60">読み込み中…</div>
           <div id="storage-empty" class="hidden text-sm opacity-60">アップロードされたファイルはまだありません。</div>
+          <!-- ドーナツ + 種別凡例（ファイルがあるときのみ） -->
           <div id="storage-content" class="hidden flex flex-col gap-4">
             <div class="flex flex-col sm:flex-row items-center gap-6">
               <div class="relative shrink-0" style="width:10rem;height:10rem;">
@@ -30,31 +31,41 @@
               </div>
               <ul id="storage-legend" class="flex-1 w-full space-y-1.5 text-sm"></ul>
             </div>
+          </div>
 
-            <!-- バージョン別: 最新版を表示する容量 / 過去バージョンを維持する容量 -->
-            <div class="pt-3 border-t border-base-200 text-sm space-y-2">
-              <div class="flex h-2 w-full rounded overflow-hidden bg-base-200">
-                <div id="ver-bar-current" class="h-full" style="background:#0d9488"></div>
-                <div id="ver-bar-history" class="h-full" style="background:#64748b"></div>
-              </div>
-              <div class="flex items-center justify-between gap-2">
-                <span class="flex items-center gap-2 min-w-0">
-                  <span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:#0d9488"></span>
-                  <span class="truncate">最新版</span>
-                </span>
-                <span class="shrink-0 tabular-nums">
-                  <span id="ver-current"></span> <span id="ver-current-pct" class="opacity-50"></span>
-                </span>
-              </div>
-              <div class="flex items-center justify-between gap-2">
-                <span class="flex items-center gap-2 min-w-0">
-                  <span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:#64748b"></span>
-                  <span class="truncate">過去バージョン</span>
-                </span>
-                <span class="shrink-0 tabular-nums">
-                  <span id="ver-history"></span> <span id="ver-history-pct" class="opacity-50"></span>
-                </span>
-              </div>
+          <!-- 最新版 / 過去バージョン / 空き容量（ファイル有無に関わらず表示） -->
+          <div id="storage-breakdown" class="hidden pt-3 border-t border-base-200 text-sm space-y-2">
+            <div class="flex h-2 w-full rounded overflow-hidden bg-base-200">
+              <div id="ver-bar-current" class="h-full" style="background:#0d9488"></div>
+              <div id="ver-bar-history" class="h-full" style="background:#64748b"></div>
+              <div id="ver-bar-free" class="h-full" style="background:#a5b4fc"></div>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="flex items-center gap-2 min-w-0">
+                <span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:#0d9488"></span>
+                <span class="truncate">最新版</span>
+              </span>
+              <span class="shrink-0 tabular-nums">
+                <span id="ver-current"></span> <span id="ver-current-pct" class="opacity-50"></span>
+              </span>
+            </div>
+            <div class="flex items-center justify-between gap-2">
+              <span class="flex items-center gap-2 min-w-0">
+                <span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:#64748b"></span>
+                <span class="truncate">過去バージョン</span>
+              </span>
+              <span class="shrink-0 tabular-nums">
+                <span id="ver-history"></span> <span id="ver-history-pct" class="opacity-50"></span>
+              </span>
+            </div>
+            <div id="ver-free-row" class="hidden flex items-center justify-between gap-2">
+              <span class="flex items-center gap-2 min-w-0">
+                <span class="inline-block w-3 h-3 rounded-sm shrink-0" style="background:#a5b4fc"></span>
+                <span class="truncate">空き容量</span>
+              </span>
+              <span class="shrink-0 tabular-nums">
+                <span id="ver-free"></span> <span id="ver-free-pct" class="opacity-50"></span>
+              </span>
             </div>
           </div>
         </div>

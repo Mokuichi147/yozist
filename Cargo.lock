@@ -3893,6 +3893,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "libc",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",

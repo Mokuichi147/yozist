@@ -39,6 +39,12 @@ async function loadStorage() {
   const currentBytes = stats.current_bytes || 0;
   const historyBytes = stats.history_bytes || 0;
   const grand = currentBytes + historyBytes;
+  // 空き容量はデータ保存先ディスクの実測値（取得失敗時は null → ゲージに載せない）。
+  const freeBytes = stats.available_bytes != null ? Number(stats.available_bytes) : null;
+
+  // 最新版 / 過去バージョン / 空き容量のゲージ（ファイルが無くても空きがあれば表示）。
+  renderBreakdown(currentBytes, historyBytes, freeBytes);
+
   if (stats.file_count === 0 || grand === 0) {
     $('storage-empty').classList.remove('hidden');
     return;
@@ -78,18 +84,44 @@ async function loadStorage() {
   $('storage-total').textContent = fmtSize(grand);
   $('storage-count').textContent = `${stats.file_count} 件`;
 
-  // バージョン別の内訳: 最新版を表示する容量 vs 過去バージョンを維持する容量
-  // （分母は総容量 = 最新版 + 過去バージョン）。
-  const curPct = grand ? currentBytes / grand * 100 : 0;
-  const hisPct = grand ? historyBytes / grand * 100 : 0;
+  $('storage-content').classList.remove('hidden');
+}
+
+// 最新版 / 過去バージョン / 空き容量の積み上げゲージを描画する。
+// 分母 = 最新版 + 過去バージョン + 空き（空きが取れない場合は使用量のみ）。
+function renderBreakdown(currentBytes, historyBytes, freeBytes) {
+  const used = currentBytes + historyBytes;
+  const hasFree = freeBytes != null && freeBytes >= 0;
+  const free = hasFree ? freeBytes : 0;
+  const total = used + free;
+  if (total <= 0 && !hasFree) {
+    $('storage-breakdown').classList.add('hidden');
+    return;
+  }
+
+  const denom = total > 0 ? total : 1;
+  const curPct = currentBytes / denom * 100;
+  const hisPct = historyBytes / denom * 100;
+  const freePct = free / denom * 100;
+
   $('ver-bar-current').style.width = curPct + '%';
   $('ver-bar-history').style.width = hisPct + '%';
+  $('ver-bar-free').style.width = hasFree ? freePct + '%' : '0%';
+
   $('ver-current').textContent = fmtSize(currentBytes);
   $('ver-current-pct').textContent = `(${curPct.toFixed(1)}%)`;
   $('ver-history').textContent = fmtSize(historyBytes);
   $('ver-history-pct').textContent = `(${hisPct.toFixed(1)}%)`;
 
-  $('storage-content').classList.remove('hidden');
+  if (hasFree) {
+    $('ver-free').textContent = fmtSize(free);
+    $('ver-free-pct').textContent = `(${freePct.toFixed(1)}%)`;
+    $('ver-free-row').classList.remove('hidden');
+  } else {
+    $('ver-free-row').classList.add('hidden');
+  }
+
+  $('storage-breakdown').classList.remove('hidden');
 }
 
 // ===== アップロード（ドラッグ&ドロップ / 複数ファイル / フォルダ）=====

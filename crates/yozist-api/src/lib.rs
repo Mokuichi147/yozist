@@ -65,6 +65,8 @@ pub struct ApiState {
     /// プラガブルなビュー変換レジストリ（形式 → ViewModel）。
     /// 表示・差分のビュー種別判定と、重い形式変換の追加点。
     pub view_registry: Arc<yozist_view::ViewRegistry>,
+    /// データディレクトリ（DB / blob を格納）。ストレージ空き容量の問い合わせ先。
+    pub data_dir: std::path::PathBuf,
 }
 
 /// 展開済み content の単一エントリキャッシュ（直近に読んだファイル）。
@@ -397,10 +399,15 @@ struct CategoryStat {
     bytes: u64,
 }
 
-/// `GET /api/stats/storage` のレスポンス。サイズはいずれも **論理サイズ
-/// （提示サイズ）** で、ファイル一覧やダウンロードで見えるサイズと一致する。
-/// blob のオンディスク実体は zstd 圧縮されており論理サイズと大きく異なる
-/// （特にテキスト）ため、ユーザーの体感に合う論理サイズで集計する。
+/// `GET /api/stats/storage` のレスポンス。
+///
+/// `categories` / `current_bytes` / `history_bytes` は **論理サイズ（提示サイズ）**
+/// で、ファイル一覧やダウンロードで見えるサイズと一致する。blob のオンディスク実体は
+/// zstd 圧縮されており論理サイズと大きく異なる（特にテキスト）ため、ユーザーの体感に
+/// 合う論理サイズで集計する。
+///
+/// `available_bytes` / `total_bytes` はデータディレクトリが載っているファイルシステム
+/// の実容量（OS の空き／総容量）。取得できない環境では `None`。
 #[derive(Serialize)]
 struct StorageStats {
     /// 最新版のカテゴリ別内訳。
@@ -413,6 +420,10 @@ struct StorageStats {
     file_count: u64,
     /// 可視ファイルのコミット総数。
     commit_count: u64,
+    /// データディレクトリが載っている FS の空き容量（バイト）。取得失敗時は `null`。
+    available_bytes: Option<u64>,
+    /// データディレクトリが載っている FS の総容量（バイト）。取得失敗時は `null`。
+    total_bytes: Option<u64>,
 }
 
 /// ファイルを内訳カテゴリに分類する（WebUI の `storageCategory` / files ページの
@@ -503,12 +514,23 @@ async fn storage_stats(
         .map(|(category, bytes)| CategoryStat { category, bytes })
         .collect();
 
+    // データディレクトリが載っている FS の空き／総容量。失敗しても使用量集計は返す。
+    let (available_bytes, total_bytes) = match yozist_storage::disk_space(&s.data_dir) {
+        Ok(space) => (Some(space.available_bytes), Some(space.total_bytes)),
+        Err(e) => {
+            tracing::warn!("ストレージ空き容量の取得に失敗: {e}");
+            (None, None)
+        }
+    };
+
     Ok(Json(StorageStats {
         categories,
         current_bytes,
         history_bytes,
         file_count: visible.len() as u64,
         commit_count,
+        available_bytes,
+        total_bytes,
     }))
 }
 
@@ -3786,6 +3808,7 @@ mod tests {
                 smb_creds: None,
                 content_cache: Arc::new(ContentCache::default()),
                 view_registry: Arc::new(yozist_view::ViewRegistry::with_defaults()),
+                data_dir: dir.path().to_path_buf(),
             },
             dir,
         )

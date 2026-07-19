@@ -16,6 +16,8 @@ zstd.workspace = true
 async-compression.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Unix の statvfs で空き容量を問い合わせる（ディスク使用量 UI 用）。
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
