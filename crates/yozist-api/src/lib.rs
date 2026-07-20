@@ -1300,7 +1300,7 @@ async fn commit_partial(
     body: Body,
     actor: ActorId,
     committed_by: Option<String>,
-    committed_by_user_id: Option<i64>,
+    committed_by_user_id: Option<yozist_core::UserId>,
     message: Option<String>,
 ) -> Result<yozist_core::Commit, ApiError> {
     let body = axum::body::to_bytes(body, MAX_EDIT_PREFIX_BYTES)
@@ -3122,7 +3122,9 @@ async fn add_acl_rule(
     // System コンテキストか、現状 rule が 0 件なら作成可能。
     let (stype, sid) = split_colon(&input.subject)?;
     let subject = match stype {
-        "user" => Subject::User(parse_i64_id(sid)?),
+        "user" => Subject::User(
+            uuid::Uuid::parse_str(sid).map_err(|e| ApiError::BadRequest(format!("user id: {e}")))?,
+        ),
         "group" => Subject::Group(parse_i64_id(sid)?),
         other => return Err(ApiError::BadRequest(format!("subject type: {other}"))),
     };
@@ -3203,8 +3205,7 @@ async fn login(
 ) -> Result<Json<AuthResponse>, ApiError> {
     let token = s
         .auth_db
-        .users()
-        .authenticate(
+        .login(
             &input.username,
             &input.password,
             std::time::Duration::from_secs(24 * 3600),
@@ -3264,7 +3265,7 @@ async fn list_groups(
 
 #[derive(Deserialize)]
 struct AddGroupMemberInput {
-    user_id: i64,
+    user_id: UserId,
 }
 
 async fn list_group_members(
@@ -3295,7 +3296,7 @@ async fn add_group_member(
         .add_user(id, input.user_id, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
-    let meta = format!("{{\"user_id\":{}}}", input.user_id);
+    let meta = format!("{{\"user_id\":\"{}\"}}", input.user_id);
     audit_event(
         &s,
         &ctx,
@@ -3313,7 +3314,7 @@ async fn add_group_member(
 async fn remove_group_member(
     State(s): State<ApiState>,
     AuthCtx(ctx): AuthCtx,
-    Path((id, user_id)): Path<(i64, i64)>,
+    Path((id, user_id)): Path<(i64, UserId)>,
 ) -> Result<StatusCode, ApiError> {
     require_authenticated(&ctx).await?;
     let res = s
@@ -3322,7 +3323,7 @@ async fn remove_group_member(
         .remove_user(id, user_id, None)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()));
-    let meta = format!("{{\"user_id\":{}}}", user_id);
+    let meta = format!("{{\"user_id\":\"{}\"}}", user_id);
     audit_event(
         &s,
         &ctx,
@@ -3458,11 +3459,10 @@ async fn change_password(
             "新パスワードは8文字以上で入力してください".into(),
         ));
     }
-    // 現パスワードの検証: authenticate が成功すれば一致している。
+    // 現パスワードの検証: login が成功すれば一致している。
     let verified = s
         .auth_db
-        .users()
-        .authenticate(
+        .login(
             &user.username,
             &input.current_password,
             std::time::Duration::from_secs(60),

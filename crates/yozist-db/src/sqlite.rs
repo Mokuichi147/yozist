@@ -94,8 +94,8 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
     let deleted_at: Option<String> = row.try_get("deleted_at")?;
     let created_by: Option<String> = row.try_get("created_by")?;
     let updated_by: Option<String> = row.try_get("updated_by")?;
-    let created_by_user_id: Option<i64> = row.try_get("created_by_user_id")?;
-    let updated_by_user_id: Option<i64> = row.try_get("updated_by_user_id")?;
+    let created_by_user_id: Option<String> = row.try_get("created_by_user_id")?;
+    let updated_by_user_id: Option<String> = row.try_get("updated_by_user_id")?;
     Ok(FileMeta {
         id: FileId::from_uuid(parse_uuid(&id)?),
         display_name,
@@ -111,8 +111,8 @@ fn row_to_file(row: SqliteRow) -> Result<FileMeta, DbError> {
         deleted_at: deleted_at.map(|s| parse_dt(&s)).transpose()?,
         created_by,
         updated_by,
-        created_by_user_id,
-        updated_by_user_id,
+        created_by_user_id: created_by_user_id.map(|s| parse_uuid(&s)).transpose()?,
+        updated_by_user_id: updated_by_user_id.map(|s| parse_uuid(&s)).transpose()?,
     })
 }
 
@@ -164,7 +164,7 @@ fn row_to_filter(row: SqliteRow) -> Result<Filter, DbError> {
     let name: String = row.try_get("name")?;
     let definition_json: String = row.try_get("definition_json")?;
     let description: Option<String> = row.try_get("description")?;
-    let created_by: Option<i64> = row.try_get("created_by")?;
+    let created_by: Option<String> = row.try_get("created_by")?;
     let created_at: String = row.try_get("created_at")?;
     let expires_at: Option<String> = row.try_get("expires_at")?;
 
@@ -175,7 +175,7 @@ fn row_to_filter(row: SqliteRow) -> Result<Filter, DbError> {
         name,
         definition,
         description,
-        created_by,
+        created_by: created_by.map(|s| parse_uuid(&s)).transpose()?,
         created_at: parse_dt(&created_at)?,
         expires_at: expires_at.map(|s| parse_dt(&s)).transpose()?,
     })
@@ -192,7 +192,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
     let message: Option<String> = row.try_get("message")?;
     let size: i64 = row.try_get("size")?;
     let committed_by: Option<String> = row.try_get("committed_by")?;
-    let committed_by_user_id: Option<i64> = row.try_get("committed_by_user_id")?;
+    let committed_by_user_id: Option<String> = row.try_get("committed_by_user_id")?;
     let delta_base: Option<String> = row.try_get("delta_base")?;
     Ok(Commit {
         id: CommitId::from_uuid(parse_uuid(&id)?),
@@ -207,7 +207,7 @@ fn row_to_commit(row: SqliteRow) -> Result<Commit, DbError> {
         message,
         size: size.max(0) as u64,
         committed_by,
-        committed_by_user_id,
+        committed_by_user_id: committed_by_user_id.map(|s| parse_uuid(&s)).transpose()?,
         delta_base: delta_base
             .map(|s| parse_uuid(&s).map(CommitId::from_uuid))
             .transpose()?,
@@ -240,8 +240,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(meta.deleted_at.map(fmt_dt))
         .bind(&meta.created_by)
         .bind(&meta.updated_by)
-        .bind(meta.created_by_user_id)
-        .bind(meta.updated_by_user_id)
+        .bind(meta.created_by_user_id.map(|u| u.to_string()))
+        .bind(meta.updated_by_user_id.map(|u| u.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -276,8 +276,8 @@ impl MetaStore for SqliteMetaStore {
         .bind(meta.deleted_at.map(fmt_dt))
         .bind(&meta.created_by)
         .bind(&meta.updated_by)
-        .bind(meta.created_by_user_id)
-        .bind(meta.updated_by_user_id)
+        .bind(meta.created_by_user_id.map(|u| u.to_string()))
+        .bind(meta.updated_by_user_id.map(|u| u.to_string()))
         .bind(meta.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -812,7 +812,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(&commit.message)
         .bind(commit.size as i64)
         .bind(&commit.committed_by)
-        .bind(commit.committed_by_user_id)
+        .bind(commit.committed_by_user_id.map(|u| u.to_string()))
         .bind(commit.delta_base.map(|c| c.to_string()))
         .execute(&self.pool)
         .await?;
@@ -839,7 +839,7 @@ impl MetaStore for SqliteMetaStore {
         .bind(&q.name)
         .bind(body)
         .bind(&q.description)
-        .bind(q.created_by)
+        .bind(q.created_by.map(|u| u.to_string()))
         .bind(fmt_dt(q.created_at))
         .bind(q.expires_at.map(fmt_dt))
         .execute(&self.pool)
@@ -1116,8 +1116,8 @@ mod tests {
             deleted_at: None,
             created_by: Some("tester".into()),
             updated_by: Some("tester".into()),
-            created_by_user_id: Some(7),
-            updated_by_user_id: Some(7),
+            created_by_user_id: Some(Uuid::now_v7()),
+            updated_by_user_id: Some(Uuid::now_v7()),
         }
     }
 
@@ -1522,6 +1522,7 @@ mod tests {
         let file = sample_file();
         s.insert_file(&file).await.unwrap();
         let actor = ActorId::new();
+        let alice_id = Uuid::now_v7();
         let c1 = Commit {
             id: CommitId::new(),
             file_id: file.id,
@@ -1547,7 +1548,7 @@ mod tests {
             message: Some("edit".into()),
             size: 250,
             committed_by: Some("alice".into()),
-            committed_by_user_id: Some(42),
+            committed_by_user_id: Some(alice_id),
             delta_base: Some(c1.id),
         };
         s.insert_commit(&c1).await.unwrap();
@@ -1563,7 +1564,7 @@ mod tests {
         assert_eq!(log[0].committed_by, None);
         assert_eq!(log[0].committed_by_user_id, None);
         assert_eq!(log[1].committed_by.as_deref(), Some("alice"));
-        assert_eq!(log[1].committed_by_user_id, Some(42));
+        assert_eq!(log[1].committed_by_user_id, Some(alice_id));
         // delta_base が往復で保持される（NULL/値の両方）
         assert_eq!(log[0].delta_base, None);
         assert_eq!(log[1].delta_base, Some(c1.id));

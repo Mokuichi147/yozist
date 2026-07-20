@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
 use yozist_core::{
-    ActorId, BlobId, Commit, CommitId, FileId, FileMeta, FormatHint,
+    ActorId, BlobId, Commit, CommitId, FileId, FileMeta, FormatHint, UserId,
 };
 use yozist_db::SharedMetaStore;
 use yozist_storage::{ByteStream, SharedBlobStore, StorageError};
@@ -134,7 +134,7 @@ impl VersioningEngine {
         content: &[u8],
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         hint_override: Option<FormatHint>,
     ) -> Result<(FileMeta, Commit), VersioningError> {
         let display_name = display_name.into();
@@ -196,7 +196,7 @@ impl VersioningEngine {
         new_content: &[u8],
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -295,7 +295,7 @@ impl VersioningEngine {
         content: &[u8],
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -371,7 +371,7 @@ impl VersioningEngine {
         stream: ByteStream,
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         hint_override: Option<FormatHint>,
     ) -> Result<(FileMeta, Commit), VersioningError> {
         let display_name = display_name.into();
@@ -469,7 +469,7 @@ impl VersioningEngine {
         stream: ByteStream,
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -539,7 +539,7 @@ impl VersioningEngine {
         stream: ByteStream,
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let mut file = self
@@ -626,7 +626,7 @@ impl VersioningEngine {
         format_id: &str,
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         fts_content: &str,
         now: time::OffsetDateTime,
         hint: &FormatHint,
@@ -714,7 +714,7 @@ impl VersioningEngine {
         format_id: &str,
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         message: Option<String>,
         charset: Option<String>,
         fts_content: &str,
@@ -809,7 +809,7 @@ impl VersioningEngine {
         commit_id: CommitId,
         actor: ActorId,
         committed_by: Option<String>,
-        committed_by_user_id: Option<i64>,
+        committed_by_user_id: Option<UserId>,
         message: Option<String>,
     ) -> Result<Commit, VersioningError> {
         let bytes = self.read_at_commit(file_id, commit_id).await?;
@@ -828,7 +828,7 @@ impl VersioningEngine {
         file_id: FileId,
         new_name: impl Into<String>,
         updated_by: Option<String>,
-        updated_by_user_id: Option<i64>,
+        updated_by_user_id: Option<UserId>,
     ) -> Result<FileMeta, VersioningError> {
         let new_name = new_name.into();
         let mut file = self
@@ -1279,19 +1279,21 @@ mod engine_tests {
     async fn records_committed_by_label() {
         let (eng, _td) = engine().await;
         let actor = ActorId::new();
+        let alice_id = UserId::now_v7();
+        let bob_id = UserId::now_v7();
         // 作成・更新ともに実行ユーザーのラベルと不変キー(user.id)が各コミットへ記録される。
         let (file, c1) = eng
-            .create_file("note.txt", b"v1", actor, Some("alice".into()), Some(1), None)
+            .create_file("note.txt", b"v1", actor, Some("alice".into()), Some(alice_id), None)
             .await
             .unwrap();
         assert_eq!(c1.committed_by.as_deref(), Some("alice"));
-        assert_eq!(c1.committed_by_user_id, Some(1));
+        assert_eq!(c1.committed_by_user_id, Some(alice_id));
         let c2 = eng
-            .commit(file.id, b"v2", actor, Some("bob".into()), Some(2), None)
+            .commit(file.id, b"v2", actor, Some("bob".into()), Some(bob_id), None)
             .await
             .unwrap();
         assert_eq!(c2.committed_by.as_deref(), Some("bob"));
-        assert_eq!(c2.committed_by_user_id, Some(2));
+        assert_eq!(c2.committed_by_user_id, Some(bob_id));
         // ラベル・user.id 未指定（SMB 等）は NULL のまま。
         let c3 = eng
             .commit(file.id, b"v3", actor, None, None, None)
@@ -1303,9 +1305,9 @@ mod engine_tests {
         // DB へ往復しても保持される。
         let log = eng.meta.list_commits(&file.id).await.unwrap();
         assert_eq!(log[0].committed_by.as_deref(), Some("alice"));
-        assert_eq!(log[0].committed_by_user_id, Some(1));
+        assert_eq!(log[0].committed_by_user_id, Some(alice_id));
         assert_eq!(log[1].committed_by.as_deref(), Some("bob"));
-        assert_eq!(log[1].committed_by_user_id, Some(2));
+        assert_eq!(log[1].committed_by_user_id, Some(bob_id));
         assert_eq!(log[2].committed_by, None);
         assert_eq!(log[2].committed_by_user_id, None);
     }

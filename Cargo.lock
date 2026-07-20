@@ -3144,9 +3144,9 @@ dependencies = [
 
 [[package]]
 name = "user-permission-core"
-version = "0.2.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c396bed52592e5a005a389a6837276c9fd8f24c0a8eafcda1d3bcc67a9ffc2ba"
+checksum = "6708ec41917006d2f9481907cc34a0e44a558128b0c24520534b5d83a627c6a8"
 dependencies = [
  "argon2",
  "async-trait",
@@ -3161,6 +3161,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]

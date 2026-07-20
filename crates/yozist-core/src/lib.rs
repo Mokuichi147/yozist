@@ -56,9 +56,9 @@ ActorId);
 id_newtype!(/// フィルター（Shareable Path）。
 FilterId);
 
-// ユーザー / グループの ID は upstream `user-permission` の `i64` を直接使う。
-// 型エイリアスで意図を表現するが、実体は `i64`。
-pub type UserId = i64;
+// ユーザー ID は upstream `user-permission` の UUID v7 (`uuid::Uuid`) を直接使う。
+// グループ ID は upstream 側で引き続き `i64`。型エイリアスで意図を表現する。
+pub type UserId = uuid::Uuid;
 pub type GroupId = i64;
 
 /// Blob のコンテンツアドレス（SHA-256 を想定）。
@@ -117,10 +117,10 @@ pub struct FileMeta {
     /// 同名再登録に強い内部追跡用に持つ。API/UI には出さない（`serde(skip)`）。
     /// `None` は記録なし（旧データ・SMB/匿名）。
     #[serde(skip)]
-    pub created_by_user_id: Option<i64>,
+    pub created_by_user_id: Option<UserId>,
     /// 最終更新者の不変キー（users.id）。意味は `created_by_user_id` と同じ。
     #[serde(skip)]
-    pub updated_by_user_id: Option<i64>,
+    pub updated_by_user_id: Option<UserId>,
 }
 
 /// CRDT/LWW のフォーマット選択ヒント。
@@ -296,7 +296,7 @@ pub struct Commit {
     /// 改名・同名再登録に強い内部追跡用に持つ。API/UI には出さない（`serde(skip)`）。
     /// 旧データや SMB/匿名では NULL。
     #[serde(skip)]
-    pub committed_by_user_id: Option<i64>,
+    pub committed_by_user_id: Option<UserId>,
     /// 差分保存の基準コミット。`Some` のとき `blob` はフル内容ではなく、
     /// 基準コミットの内容を zstd 辞書として圧縮した差分（パッチ）を指す。
     /// `None` はフルスナップショット。復元は基準を辿って差分を順に適用する。

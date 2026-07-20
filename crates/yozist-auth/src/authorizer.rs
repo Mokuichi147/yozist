@@ -193,7 +193,7 @@ mod tests {
         let user = f
             .auth
             .users()
-            .create("alice", "pw", "Alice", None)
+            .create("alice", "zX9!qLm4-vK7wR", "Alice", None)
             .await
             .unwrap();
         let ctx = AuthContext::User {
@@ -231,7 +231,7 @@ mod tests {
         let user = f
             .auth
             .users()
-            .create("bob", "pw", "Bob", None)
+            .create("bob", "zX9!qLm4-vK7wR", "Bob", None)
             .await
             .unwrap();
         let file = FileId::new();
@@ -269,7 +269,7 @@ mod tests {
         let user = f
             .auth
             .users()
-            .create("dan", "pw", "Dan", None)
+            .create("dan", "zX9!qLm4-vK7wR", "Dan", None)
             .await
             .unwrap();
         let group = f

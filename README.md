@@ -80,6 +80,13 @@ cargo run -p yozist-server -- migrate
 cargo run -p yozist-server -- serve
 ```
 
+### user-permission-core 0.4.0 へのアップグレード時の注意
+
+`user-permission-core` 0.4.0 で `User.id` が `i64` から UUID v7 に変更された。開発中の DB
+のためデータ保全は行わず、アップグレード適用時は `data/auth.db` と `data/yozist.sqlite` を
+削除してから起動すること（`files`/`commits`/`filters` の `*_user_id` 列は `INTEGER` から
+`TEXT` へスキーマ変更されるため、旧DBのまま起動すると整合しない）。
+
 ## ライセンス
 
 未定。
