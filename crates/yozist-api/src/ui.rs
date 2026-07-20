@@ -34,6 +34,7 @@ pub fn router() -> Router<crate::ApiState> {
         .route("/tags", get(tags_page))
         .route("/manage", get(manage_page))
         .route("/files", get(files_page))
+        .route("/media", get(media_page))
         .route("/trash", get(trash_page))
         .route("/files/:id", get(file_detail_page))
         .route("/files/:id/compare", get(file_compare_page))
@@ -148,6 +149,12 @@ struct FilesTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "media.html")]
+struct MediaTemplate {
+    active: &'static str,
+}
+
+#[derive(Template)]
 #[template(path = "trash.html")]
 struct TrashTemplate {
     active: &'static str,
@@ -203,6 +210,10 @@ async fn tags_page() -> Response {
 
 async fn files_page() -> Response {
     render(FilesTemplate { active: "files" })
+}
+
+async fn media_page() -> Response {
+    render(MediaTemplate { active: "media" })
 }
 
 async fn trash_page() -> Response {
@@ -264,6 +275,7 @@ mod tests {
             "file_detail.js",
             "file_commit.js",
             "files.js",
+            "media.js",
             "compare.js",
             "index.js",
             "login.js",
