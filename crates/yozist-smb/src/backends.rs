@@ -1936,7 +1936,7 @@ mod all_backend_tests {
         let alice = deps
             .auth_db
             .users()
-            .create("alice", "pw", "alice", None)
+            .create("alice", "zX9!qLm4-vK7wR", "alice", None)
             .await
             .unwrap();
         let id = user_identity("alice");
@@ -2013,7 +2013,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("alice", "pw", "alice", None)
+            .create("alice", "zX9!qLm4-vK7wR", "alice", None)
             .await
             .unwrap();
         let id = user_identity("alice");
@@ -2060,7 +2060,7 @@ mod all_backend_tests {
         let alice = deps
             .auth_db
             .users()
-            .create("alice", "pw", "alice", None)
+            .create("alice", "zX9!qLm4-vK7wR", "alice", None)
             .await
             .unwrap();
         let id = user_identity("alice");
@@ -2135,7 +2135,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("bob", "pw", "bob", None)
+            .create("bob", "zX9!qLm4-vK7wR", "bob", None)
             .await
             .unwrap();
         let id = user_identity("bob");
@@ -2164,7 +2164,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("carol", "pw", "carol", None)
+            .create("carol", "zX9!qLm4-vK7wR", "carol", None)
             .await
             .unwrap();
         let id = user_identity("carol");
@@ -2192,7 +2192,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("dave", "pw", "dave", None)
+            .create("dave", "zX9!qLm4-vK7wR", "dave", None)
             .await
             .unwrap();
         let id = user_identity("dave");
@@ -2232,7 +2232,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("eve", "pw", "eve", None)
+            .create("eve", "zX9!qLm4-vK7wR", "eve", None)
             .await
             .unwrap();
         let id = user_identity("eve");
@@ -2329,7 +2329,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("gina", "pw", "gina", None)
+            .create("gina", "zX9!qLm4-vK7wR", "gina", None)
             .await
             .unwrap();
         let id = user_identity("gina");
@@ -2422,7 +2422,7 @@ mod all_backend_tests {
         let hana = deps
             .auth_db
             .users()
-            .create("hana", "pw", "hana", None)
+            .create("hana", "zX9!qLm4-vK7wR", "hana", None)
             .await
             .unwrap();
         let id = user_identity("hana");
@@ -2522,7 +2522,7 @@ mod all_backend_tests {
         let hana = deps
             .auth_db
             .users()
-            .create("hana", "pw", "hana", None)
+            .create("hana", "zX9!qLm4-vK7wR", "hana", None)
             .await
             .unwrap();
         let id = user_identity("hana");
@@ -2582,7 +2582,7 @@ mod all_backend_tests {
         let hana = deps
             .auth_db
             .users()
-            .create("hana", "pw", "hana", None)
+            .create("hana", "zX9!qLm4-vK7wR", "hana", None)
             .await
             .unwrap();
         let id = user_identity("hana");
@@ -2722,7 +2722,7 @@ mod all_backend_tests {
         let (deps, _dir) = test_deps().await;
         deps.auth_db
             .users()
-            .create("zoe", "pw", "zoe", None)
+            .create("zoe", "zX9!qLm4-vK7wR", "zoe", None)
             .await
             .unwrap();
         let id = user_identity("zoe");
