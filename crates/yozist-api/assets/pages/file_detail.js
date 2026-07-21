@@ -85,7 +85,21 @@ ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
 // バイナリのフォールバック（プレビュー不可）。getView の既定フォールバックも兼ねる。
 ViewRuntime.registerView({ kind: 'core/binary', mount(cont) { renderBinary(cont); } });
 
+// 遷移元ページへ戻れるようにする。メディアページ（/ui/media）からの遷移は
+// `?from=media` を付けて開かれる（media.js 参照）ので、戻る先もそこに合わせる。
+// クエリが無ければ通常のファイル一覧に戻る（既定の挙動を維持）。
+function setupBackLink() {
+  const from = new URLSearchParams(location.search).get('from');
+  const target = from === 'media' ? '/ui/media' : '/ui/files';
+  const label = from === 'media' ? '← メディア' : '← ファイル一覧';
+  const back = $('fd-back-link');
+  if (back) { back.href = target; back.textContent = label; }
+  const backNotFound = $('fd-back-link-notfound');
+  if (backNotFound) backNotFound.href = target;
+}
+
 async function init() {
+  setupBackLink();
   const me = await requireAuth();
   if (!me) return;
   try {
@@ -1010,7 +1024,11 @@ async function loadFileSeries() {
   updateContentNav();
 }
 
-function gotoFile(id) { location.href = '/ui/files/' + id; }
+// 前後ファイルへ移動しても「戻る」の遷移元（?from=media 等）を引き継ぐ。
+function gotoFile(id) {
+  const from = new URLSearchParams(location.search).get('from');
+  location.href = '/ui/files/' + id + (from ? '?from=' + encodeURIComponent(from) : '');
+}
 
 // コンテンツ両端のオーバーレイ遷移先（先頭シリーズ基準の前後ファイル）。
 // 複数シリーズに所属する場合は最初のシリーズを採用する（全シリーズはカードに表示）。
