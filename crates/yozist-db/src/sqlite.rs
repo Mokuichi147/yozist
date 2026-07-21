@@ -255,6 +255,54 @@ impl MetaStore for SqliteMetaStore {
         row.map(row_to_file).transpose()
     }
 
+    async fn get_files(&self, ids: &[FileId]) -> Result<Vec<FileMeta>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite のバインド変数上限（既定 32766）に収まるよう分割して問い合わせる。
+        const CHUNK: usize = 500;
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let mut qb = sqlx::QueryBuilder::new("SELECT * FROM files WHERE id IN (");
+            {
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(id.to_string());
+                }
+            }
+            qb.push(")");
+            for row in qb.build().fetch_all(&self.pool).await? {
+                out.push(row_to_file(row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_files_after(
+        &self,
+        after: Option<&FileId>,
+        limit: u32,
+    ) -> Result<Vec<FileMeta>, DbError> {
+        let rows = match after {
+            Some(after) => {
+                sqlx::query(
+                    "SELECT * FROM files WHERE deleted = 0 AND id > ? ORDER BY id LIMIT ?",
+                )
+                .bind(after.to_string())
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query("SELECT * FROM files WHERE deleted = 0 ORDER BY id LIMIT ?")
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        rows.into_iter().map(row_to_file).collect()
+    }
+
     async fn update_file(&self, meta: &FileMeta) -> Result<(), DbError> {
         // 楽観ロック: 現行 version を取得し、+1 で更新。
         let res = sqlx::query(
@@ -1129,6 +1177,78 @@ mod tests {
         let got = s.get_file(&f.id).await.unwrap().unwrap();
         assert_eq!(got.display_name, "test.md");
         assert_eq!(got.size, 12);
+    }
+
+    /// バッチ取得は `get_file` と同じ意味論（論理削除済みも返し、存在しない ID は
+    /// 落ちる）。N+1 を避けるバッチ処理がここに依存する。
+    #[tokio::test]
+    async fn get_files_returns_known_ids_including_deleted() {
+        let s = store().await;
+        let alive = sample_file();
+        let mut removed = sample_file();
+        removed.deleted = true;
+        s.insert_file(&alive).await.unwrap();
+        s.insert_file(&removed).await.unwrap();
+        let unknown = FileId::new();
+
+        let got = s
+            .get_files(&[alive.id, removed.id, unknown])
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<_> = got.iter().map(|f| f.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&alive.id));
+        assert!(ids.contains(&removed.id), "論理削除済みも返す");
+        assert!(!ids.contains(&unknown), "存在しない ID は結果から落ちる");
+
+        assert!(s.get_files(&[]).await.unwrap().is_empty());
+    }
+
+    /// キーセットページングは走査中に他の行が更新されても取りこぼさない。
+    /// `list_files` の OFFSET + updated_at 順ではここで行が移動して漏れる。
+    #[tokio::test]
+    async fn list_files_after_paginates_stably_under_updates() {
+        let s = store().await;
+        let mut files = Vec::new();
+        for _ in 0..5 {
+            let f = sample_file();
+            s.insert_file(&f).await.unwrap();
+            files.push(f);
+        }
+        files.sort_by_key(|f| f.id.to_string());
+
+        let first = s.list_files_after(None, 2).await.unwrap();
+        assert_eq!(
+            first.iter().map(|f| f.id).collect::<Vec<_>>(),
+            files[..2].iter().map(|f| f.id).collect::<Vec<_>>()
+        );
+
+        // 走査の途中で、まだ読んでいない行を更新する（updated_at が動く）。
+        let mut touched = files[4].clone();
+        touched.display_name = "touched.md".into();
+        touched.updated_at = OffsetDateTime::now_utc();
+        s.update_file(&touched).await.unwrap();
+
+        let rest = s.list_files_after(Some(&first[1].id), 100).await.unwrap();
+        assert_eq!(
+            rest.iter().map(|f| f.id).collect::<Vec<_>>(),
+            files[2..].iter().map(|f| f.id).collect::<Vec<_>>(),
+            "更新が挟まっても残りを取りこぼさない"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_files_after_excludes_deleted() {
+        let s = store().await;
+        let alive = sample_file();
+        let mut removed = sample_file();
+        removed.deleted = true;
+        s.insert_file(&alive).await.unwrap();
+        s.insert_file(&removed).await.unwrap();
+
+        let got = s.list_files_after(None, 100).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, alive.id);
     }
 
     #[tokio::test]

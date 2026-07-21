@@ -1270,11 +1270,17 @@ async fn get_preview(
     let id = parse_file_id(&id)?;
     let file = require_read_file(&s, &ctx, id).await?;
     let range = headers.get(axum::http::header::RANGE);
-    let variant = q
-        .variant
-        .as_deref()
-        .and_then(yozist_cache::Variant::parse)
-        .unwrap_or(yozist_cache::Variant::Preview);
+    // 未指定は preview。指定があって解釈できない場合は 400 にする（黙って
+    // preview にフォールバックすると、`?variant=thumb` のような綴り違いで
+    // 一覧グリッドに大きい方が配られ続け、気づけない）。
+    let variant = match q.variant.as_deref() {
+        None => yozist_cache::Variant::Preview,
+        Some(v) => yozist_cache::Variant::parse(v).ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "unknown variant: {v} (thumbnail か preview を指定)"
+            ))
+        })?,
+    };
 
     let is_image = file
         .mime
@@ -4164,6 +4170,39 @@ mod tests {
         let resp = call_get_preview(state.clone(), &file.id.to_string(), headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         assert!(body_bytes(resp).await.is_empty());
+    }
+
+    /// 綴り違いを黙って preview にフォールバックすると、一覧グリッドに大きい方が
+    /// 配られ続けても誰も気づけない。
+    #[tokio::test]
+    async fn get_preview_rejects_unknown_variant() {
+        let (state, _td) = make_state().await;
+        let (file, _commit) = make_image_file(&state).await;
+
+        let err = get_preview(
+            State(state.clone()),
+            AuthCtx(AuthContext::System),
+            Path(file.id.to_string()),
+            Query(PreviewQuery {
+                variant: Some("thumb".into()),
+            }),
+            Default::default(),
+        )
+        .await
+        .expect_err("未知の variant は 400");
+        assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+
+        // 未指定は従来どおり preview として扱う（400 にしない）。
+        let resp = get_preview(
+            State(state),
+            AuthCtx(AuthContext::System),
+            Path(file.id.to_string()),
+            Query(PreviewQuery { variant: None }),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// 同じコミットのまま再生成（`cache-regenerate` で品質やフォーマットを変更）

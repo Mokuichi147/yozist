@@ -68,8 +68,14 @@ struct Cli {
 
     /// JPEG 出力時の圧縮品質（0-100）。thumbnail/preview 共通で上書きする。
     /// 未指定時は variant ごとの既定値（thumbnail=75, preview=82）。
-    #[arg(long, env = "YOZIST_CACHE_QUALITY")]
+    #[arg(long, env = "YOZIST_CACHE_QUALITY", value_parser = parse_quality)]
     cache_quality: Option<f32>,
+
+    /// プレビュー生成ワーカーの本数。生成は CPU バウンド（mozjpeg/oxipng）
+    /// なので、増やすほど配信中のリクエスト処理と CPU を奪い合う。未指定時は
+    /// コア数の半分（最小 1・最大 4）。
+    #[arg(long, env = "YOZIST_CACHE_WORKERS", value_parser = clap::value_parser!(u32).range(1..=64))]
+    cache_workers: Option<u32>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -192,7 +198,12 @@ async fn main() -> anyhow::Result<()> {
             // （将来 AI 自動タグ付け等を追加する際も同じ JobRunner に別 kind を
             // 登録するだけでよい）。
             let (job_runner, cache_store, cache_dir) = open_cache_layer(&cli, engine.clone()).await?;
-            job_runner.spawn_workers(2);
+            let workers = cli
+                .cache_workers
+                .map(|n| n as usize)
+                .unwrap_or_else(default_cache_workers);
+            tracing::info!("preview cache workers: {workers}");
+            job_runner.spawn_workers(workers);
             let job_store = job_runner.store().clone();
 
             let state = ApiState {
@@ -423,6 +434,24 @@ fn report_drain_result(cmd: &str, remaining: i64) {
     }
 }
 
+/// 圧縮品質は 0-100。範囲外を素通しすると compressor 側の挙動が読めないので
+/// 起動時に弾く。
+fn parse_quality(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|_| format!("数値ではありません: {s}"))?;
+    if !(0.0..=100.0).contains(&v) {
+        return Err(format!("品質は 0-100 の範囲で指定してください: {v}"));
+    }
+    Ok(v)
+}
+
+/// 既定のワーカー本数。生成は CPU バウンドなので、配信用に余力を残して
+/// コア数の半分（最小 1・最大 4）にする。
+fn default_cache_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
+}
+
 fn parse_variants(s: Option<&str>) -> anyhow::Result<Vec<yozist_cache::Variant>> {
     match s {
         None => Ok(vec![yozist_cache::Variant::Thumbnail, yozist_cache::Variant::Preview]),
@@ -434,22 +463,26 @@ fn parse_variants(s: Option<&str>) -> anyhow::Result<Vec<yozist_cache::Variant>>
     }
 }
 
-/// 論理削除されておらず、画像 mime を持つファイルを全件取得する（ページング）。
+/// 論理削除されておらず、画像 mime を持つファイルを全件取得する。
+///
+/// ID 順のキーセットページングで走査する。`list_files` の OFFSET ページングは
+/// `updated_at` 順なので、走査中に誰かがコミットすると行がページ間を移動し、
+/// バックフィル対象を取りこぼす。
 async fn list_image_files(meta: &SharedMetaStore) -> anyhow::Result<Vec<FileMeta>> {
     const PAGE: u32 = 500;
     let mut out = Vec::new();
-    let mut offset = 0u32;
+    let mut cursor: Option<FileId> = None;
     loop {
-        let page = meta.list_files(PAGE, offset).await?;
+        let page = meta.list_files_after(cursor.as_ref(), PAGE).await?;
         let n = page.len() as u32;
+        cursor = page.last().map(|f| f.id);
         out.extend(
             page.into_iter()
-                .filter(|f| !f.deleted && f.mime.as_deref().is_some_and(|m| m.starts_with("image/"))),
+                .filter(|f| f.mime.as_deref().is_some_and(|m| m.starts_with("image/"))),
         );
         if n < PAGE {
             break;
         }
-        offset += PAGE;
     }
     Ok(out)
 }
@@ -480,13 +513,28 @@ async fn sweep_stale_preview_cache(
     cache_dir: &Path,
 ) -> anyhow::Result<usize> {
     let file_ids = cache_store.list_distinct_file_ids().await?;
+
+    // キャッシュに載っている ID の現在の状態をまとめて引く。1 件ずつ get_file を
+    // 呼ぶと、掃除のたびにキャッシュ行数ぶんのクエリが走る（15 分ごとの定期
+    // タスクなので、ファイルが増えるほど無視できなくなる）。
+    let parsed: Vec<(String, FileId)> = file_ids
+        .into_iter()
+        .filter_map(|s| {
+            uuid::Uuid::parse_str(&s)
+                .ok()
+                .map(|u| (s, FileId::from_uuid(u)))
+        })
+        .collect();
+    let known: std::collections::HashMap<FileId, FileMeta> = meta
+        .get_files(&parsed.iter().map(|(_, id)| *id).collect::<Vec<_>>())
+        .await?
+        .into_iter()
+        .map(|f| (f.id, f))
+        .collect();
+
     let mut removed = 0usize;
-    for file_id_s in file_ids {
-        let Ok(uuid) = uuid::Uuid::parse_str(&file_id_s) else {
-            continue;
-        };
-        let file_id = FileId::from_uuid(uuid);
-        let rel_paths = match meta.get_file(&file_id).await? {
+    for (file_id_s, file_id) in parsed {
+        let rel_paths = match known.get(&file_id) {
             Some(file) if !file.deleted => match file.current_commit {
                 Some(current) => {
                     cache_store
@@ -495,6 +543,7 @@ async fn sweep_stale_preview_cache(
                 }
                 None => cache_store.delete_by_file(&file_id_s).await?,
             },
+            // メタ DB に無い（purge 済み）か論理削除済み。
             _ => cache_store.delete_by_file(&file_id_s).await?,
         };
         for rel in rel_paths {
