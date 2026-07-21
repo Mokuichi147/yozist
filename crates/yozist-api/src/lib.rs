@@ -1287,50 +1287,48 @@ async fn get_preview(
         .as_deref()
         .is_some_and(|m| m.starts_with("image/"));
 
-    if is_image {
-        if let Some(commit_id) = file.current_commit {
-            let file_id_s = id.to_string();
-            let commit_id_s = commit_id.to_string();
-            match s.cache_store.lookup(&file_id_s, &commit_id_s, variant).await {
-                Ok(yozist_cache::Lookup::Ready(entry)) => {
-                    // ETag は commit に紐付く。同じ URL でも再コミットすれば別の
-                    // バイト列を返すため、長期キャッシュ（immutable）は使えない。
-                    // no-cache で「保存はするが毎回再検証」させ、変化が無ければ
-                    // 304 で本文を省く。
-                    //
-                    // 生成時刻も混ぜる: 同じコミットでも生成パラメータを変えて
-                    // `cache-regenerate` すればバイト列は変わる。commit だけだと
-                    // ETag が据え置きになり、クライアントは 304 を受け取り続けて
-                    // 再生成後の版を永久に取得しない。
-                    let etag = format!(
-                        "\"{commit_id_s}-{}-{}\"",
-                        variant.as_str(),
-                        entry.updated_at
-                    );
-                    if if_none_match_matches(&headers, &etag) {
-                        let mut resp = StatusCode::NOT_MODIFIED.into_response();
-                        set_preview_cache_headers(resp.headers_mut(), &etag);
-                        return Ok(resp);
-                    }
-                    let path = s.cache_dir.join(&entry.rel_path);
-                    if let Ok(bytes) = tokio::fs::read(&path).await {
-                        let mut resp = range_response(entry.mime, &bytes, range);
-                        set_preview_cache_headers(resp.headers_mut(), &etag);
-                        return Ok(resp);
-                    }
-                    // キャッシュ行はあるが実ファイルが読めない（削除された等）。
-                    // フォールバックしつつ再投入する。
-                    enqueue_preview_job(&s, &file_id_s, &commit_id_s, variant).await;
+    if let Some(commit_id) = file.current_commit.filter(|_| is_image) {
+        let file_id_s = id.to_string();
+        let commit_id_s = commit_id.to_string();
+        match s.cache_store.lookup(&file_id_s, &commit_id_s, variant).await {
+            Ok(yozist_cache::Lookup::Ready(entry)) => {
+                // ETag は commit に紐付く。同じ URL でも再コミットすれば別の
+                // バイト列を返すため、長期キャッシュ（immutable）は使えない。
+                // no-cache で「保存はするが毎回再検証」させ、変化が無ければ
+                // 304 で本文を省く。
+                //
+                // 生成時刻も混ぜる: 同じコミットでも生成パラメータを変えて
+                // `cache-regenerate` すればバイト列は変わる。commit だけだと
+                // ETag が据え置きになり、クライアントは 304 を受け取り続けて
+                // 再生成後の版を永久に取得しない。
+                let etag = format!(
+                    "\"{commit_id_s}-{}-{}\"",
+                    variant.as_str(),
+                    entry.updated_at
+                );
+                if if_none_match_matches(&headers, &etag) {
+                    let mut resp = StatusCode::NOT_MODIFIED.into_response();
+                    set_preview_cache_headers(resp.headers_mut(), &etag);
+                    return Ok(resp);
                 }
-                Ok(yozist_cache::Lookup::Missing) | Ok(yozist_cache::Lookup::Pending) => {
-                    enqueue_preview_job(&s, &file_id_s, &commit_id_s, variant).await;
+                let path = s.cache_dir.join(&entry.rel_path);
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    let mut resp = range_response(entry.mime, &bytes, range);
+                    set_preview_cache_headers(resp.headers_mut(), &etag);
+                    return Ok(resp);
                 }
-                Ok(yozist_cache::Lookup::Failed(_)) => {
-                    // 恒久失敗は再投入しない（無限リトライ防止）。
-                }
-                Err(e) => {
-                    tracing::warn!("preview cache lookup failed: {e}");
-                }
+                // キャッシュ行はあるが実ファイルが読めない（削除された等）。
+                // フォールバックしつつ再投入する。
+                enqueue_preview_job(&s, &file_id_s, &commit_id_s, variant).await;
+            }
+            Ok(yozist_cache::Lookup::Missing) | Ok(yozist_cache::Lookup::Pending) => {
+                enqueue_preview_job(&s, &file_id_s, &commit_id_s, variant).await;
+            }
+            Ok(yozist_cache::Lookup::Failed(_)) => {
+                // 恒久失敗は再投入しない（無限リトライ防止）。
+            }
+            Err(e) => {
+                tracing::warn!("preview cache lookup failed: {e}");
             }
         }
     }

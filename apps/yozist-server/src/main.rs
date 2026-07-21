@@ -296,15 +296,23 @@ async fn main() -> anyhow::Result<()> {
 
             let mut enqueued = 0usize;
             let mut skipped = 0usize;
+            let mut already_queued = 0usize;
             for v in &variants {
                 let missing = cache_store.list_missing_for(&candidates, *v).await?;
                 skipped += candidates.len() - missing.len();
                 for (file_id, commit_id) in &missing {
-                    enqueue_preview_job(&job_runner, &cache_store, file_id, commit_id, *v).await?;
-                    enqueued += 1;
+                    if enqueue_preview_job(&job_runner, &cache_store, file_id, commit_id, *v).await?
+                    {
+                        enqueued += 1;
+                    } else {
+                        already_queued += 1;
+                    }
                 }
             }
-            println!("cache-warm: {enqueued} 件投入、{skipped} 件は生成済みのためスキップ。処理中...");
+            println!(
+                "cache-warm: {enqueued} 件投入、{skipped} 件は生成済みのためスキップ\
+                 、{already_queued} 件は投入済みのジョブが処理待ち。処理中..."
+            );
             report_drain_result("cache-warm", job_runner.drain().await);
         }
         Cmd::CacheRegenerate { file, all, variant } => {
@@ -337,7 +345,10 @@ async fn main() -> anyhow::Result<()> {
                 let commit_id_s = commit.to_string();
                 for v in &variants {
                     cache_store.reset_to_pending(&file_id_s, &commit_id_s, *v).await?;
-                    enqueue_preview_job(&job_runner, &cache_store, &file_id_s, &commit_id_s, *v).await?;
+                    // 既に未完了ジョブが積まれていれば dedup で弾かれるが、
+                    // そのジョブが同じ組み合わせを生成するので目的は達せられる。
+                    enqueue_preview_job(&job_runner, &cache_store, &file_id_s, &commit_id_s, *v)
+                        .await?;
                     count += 1;
                 }
             }
@@ -446,6 +457,10 @@ fn parse_quality(s: &str) -> Result<f32, String> {
 
 /// 既定のワーカー本数。生成は CPU バウンドなので、配信用に余力を残して
 /// コア数の半分（最小 1・最大 4）にする。
+///
+/// NOTE: これは「同時に走る生成ジョブの本数」であって CPU 使用量の上限では
+/// ない。oxipng は内部でグローバルな rayon プールへ展開するため、1 本でも
+/// 全コアを使いうる。厳密に絞りたい場合は `RAYON_NUM_THREADS` を併用する。
 fn default_cache_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| (n.get() / 2).clamp(1, 4))
@@ -487,21 +502,23 @@ async fn list_image_files(meta: &SharedMetaStore) -> anyhow::Result<Vec<FileMeta
     Ok(out)
 }
 
+/// 戻り値は「実際にジョブ行が追加されたか」。既に同じ未完了ジョブが積まれて
+/// いれば `false`（呼び出し側の件数報告が実態とずれないようにする）。
 async fn enqueue_preview_job(
     job_runner: &yozist_jobs::JobRunner,
     cache_store: &yozist_cache::CacheStore,
     file_id: &str,
     commit_id: &str,
     variant: yozist_cache::Variant,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let dedup_key = yozist_cache::PreviewJobPayload::dedup_key(file_id, commit_id, variant);
     let payload = yozist_cache::PreviewJobPayload::new(file_id, commit_id, variant);
-    job_runner
+    let inserted = job_runner
         .store()
         .enqueue("preview.generate", Some(&dedup_key), &payload)
         .await?;
     cache_store.mark_pending(file_id, commit_id, variant).await?;
-    Ok(())
+    Ok(inserted)
 }
 
 /// preview_cache のうち「ファイルが削除/purge 済み」または「commit_id が現在の
@@ -560,7 +577,7 @@ async fn sweep_stale_preview_cache(
     Ok(removed)
 }
 
-/// 生成中にプロセスが落ちると `PreviewGenerator` の中間 PNG（`.tmp-*.png`）が
+/// 生成中にプロセスが落ちると `PreviewGenerator` の中間ファイル（`.tmp-*`）が
 /// シャードディレクトリに残る。DB には現れないため通常のスイーパでは回収
 /// できないので、起動時にまとめて掃除する。
 ///
@@ -585,7 +602,9 @@ async fn sweep_leftover_temp_files(cache_dir: &Path) -> anyhow::Result<usize> {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(".tmp-") || !name.ends_with(".png") {
+            // 中間 PNG（`-src.png`）と圧縮結果（`-out.<ext>`）の両方が対象。
+            // 拡張子は出力フォーマット次第で変わるので前置だけで判定する。
+            if !name.starts_with(".tmp-") {
                 continue;
             }
             // mtime が取れないものは判断材料が無いので触らない（次回に持ち越す）。

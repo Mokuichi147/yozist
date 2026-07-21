@@ -127,10 +127,18 @@ impl JobHandler for PreviewJobHandler {
 
         match generated {
             Ok(g) => {
+                // 絶対パスを rel_path に入れると `cache_dir.join()` が
+                // （Unix の join は絶対パスで置換されるため）偶然動いてしまい、
+                // 不整合が表に出ない。ここで失敗として扱う。
                 let rel_path = g
                     .path
                     .strip_prefix(&cache_dir)
-                    .unwrap_or(&g.path)
+                    .map_err(|_| {
+                        JobError::Permanent(format!(
+                            "生成先がキャッシュディレクトリの外です: {}",
+                            g.path.display()
+                        ))
+                    })?
                     .to_string_lossy()
                     .to_string();
                 let superseded = self

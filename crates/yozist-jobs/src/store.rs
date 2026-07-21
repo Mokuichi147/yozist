@@ -51,8 +51,9 @@ const DEFAULT_MAX_ATTEMPTS: i64 = 3;
 /// `running` は落ちた実行の残骸とみなして `pending` に戻す。
 ///
 /// プレビュー生成は通常数秒で終わるため 10 分あれば十分な余裕がある。
-/// 万一生きているジョブを再取得しても、生成は同じ出力パスへの上書きで
-/// 冪等なので実害は無い（無駄な再実行のみ）。
+/// 万一生きているジョブを再取得しても、生成は一時ファイルへ書いてから
+/// rename する（`yozist_cache::PreviewGenerator`）ので、2 本が同じ出力パスへ
+/// 同時に書いても壊れたファイルは残らない。実害は無駄な再実行のみ。
 pub const STALLED_LEASE: Duration = Duration::from_secs(10 * 60);
 
 /// 終端状態（done/failed）のジョブ行を保持する期間。過ぎた行は
@@ -99,17 +100,20 @@ impl JobStore {
 
     /// ジョブを投入する。`dedup_key` が既存の未完了ジョブ（pending/running）と
     /// 衝突する場合は何もしない（同一ジョブの多重投入を防ぐ）。
+    ///
+    /// 戻り値は「実際に行が追加されたか」。dedup で弾かれた場合は `false` を返す。
+    /// これを区別しないと、CLI の一括投入が投入件数を過大に報告する。
     pub async fn enqueue(
         &self,
         kind: &str,
         dedup_key: Option<&str>,
         payload: &impl Serialize,
-    ) -> Result<(), JobsError> {
+    ) -> Result<bool, JobsError> {
         let payload_json = serde_json::to_string(payload)
             .map_err(|e| JobsError::InvalidPayload(e.to_string()))?;
         let id = Uuid::now_v7().simple().to_string();
         let now = fmt_dt(OffsetDateTime::now_utc());
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO jobs
                 (id, kind, dedup_key, payload, status, attempts, max_attempts, run_after, created_at, updated_at)
              VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
@@ -125,7 +129,7 @@ impl JobStore {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// `updated_at` が `lease` より古い `running` ジョブを `pending` に戻す。
@@ -179,7 +183,13 @@ impl JobStore {
                 sep.push_bind(*k);
             }
         }
-        qb.push(") ORDER BY created_at LIMIT 1");
+        // 並び順に `run_after` を使うのは `idx_jobs_poll(status, run_after)` が
+        // そのまま順序を供給できるため。`created_at` で並べると索引は絞り込みに
+        // しか使えず、claim 1 回ごとに該当行全体の一時 B-tree ソートが走る
+        // （cache-warm が数万件積んだ直後にこれを件数ぶん繰り返すことになる）。
+        // `run_after` は投入時点では `created_at` と同値なので実質 FIFO のまま。
+        // リトライ分がバックオフ後ろへ回るのはむしろ望ましい。
+        qb.push(") ORDER BY run_after LIMIT 1");
 
         let row = qb.build().fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
@@ -366,6 +376,43 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// 投入順に取り出す。`run_after` は投入時点では `created_at` と同値なので、
+    /// 索引が供給する順序のまま FIFO になる。
+    #[tokio::test]
+    async fn claim_next_returns_jobs_in_enqueue_order() {
+        let store = JobStore::open_in_memory().await.unwrap();
+        for n in 0..3 {
+            store
+                .enqueue("preview.generate", Some(&format!("k{n}")), &json!({"n": n}))
+                .await
+                .unwrap();
+        }
+        for n in 0..3 {
+            let job = store.claim_next(&["preview.generate"]).await.unwrap().unwrap();
+            assert_eq!(job.payload["n"], n, "投入順に処理される");
+        }
+    }
+
+    /// dedup で弾かれたかどうかを呼び出し側が区別できる。
+    #[tokio::test]
+    async fn enqueue_reports_whether_row_was_inserted() {
+        let store = JobStore::open_in_memory().await.unwrap();
+        assert!(
+            store
+                .enqueue("preview.generate", Some("k"), &json!({}))
+                .await
+                .unwrap(),
+            "新規投入は true"
+        );
+        assert!(
+            !store
+                .enqueue("preview.generate", Some("k"), &json!({}))
+                .await
+                .unwrap(),
+            "dedup で弾かれたら false"
+        );
     }
 
     #[tokio::test]

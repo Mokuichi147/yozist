@@ -108,6 +108,9 @@ impl JobRunner {
     /// バックオフ待ちのジョブがあると `claim_next` は一時的に `None` を返すため、
     /// 「未完了が 0 件」になるまで待つ。戻り値は処理し切れずに残った件数
     /// （0 なら完全に捌けた）。
+    ///
+    /// NOTE: 判定は同じキューを見る全プロセスの合計に対して行う。サーバ稼働中に
+    /// CLI を叩くと、サーバ側が投入し続ける限り 0 にならず戻らないことがある。
     pub async fn drain(self: &Arc<Self>) -> i64 {
         let kinds: Vec<&str> = self.handlers.keys().map(|s| s.as_str()).collect();
         self.reclaim_stalled().await;

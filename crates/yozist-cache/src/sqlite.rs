@@ -113,6 +113,10 @@ impl CacheStore {
     }
 
     /// 生成ジョブを投入したことを記録する（`ready` な行は上書きしない）。
+    ///
+    /// `ready` を維持する場合は `updated_at` も据え置く。`updated_at` は ETag に
+    /// 混ざっているため、ここで進めるとバイト列が変わっていないのに ETag だけ
+    /// 変化し、クライアントに無駄な再ダウンロードをさせてしまう。
     pub async fn mark_pending(
         &self,
         file_id: &str,
@@ -125,7 +129,7 @@ impl CacheStore {
              VALUES (?, ?, ?, 'pending', ?, ?) \
              ON CONFLICT(file_id, commit_id, variant) DO UPDATE SET \
                 status = CASE WHEN preview_cache.status = 'ready' THEN preview_cache.status ELSE 'pending' END, \
-                updated_at = excluded.updated_at",
+                updated_at = CASE WHEN preview_cache.status = 'ready' THEN preview_cache.updated_at ELSE excluded.updated_at END",
         )
         .bind(file_id)
         .bind(commit_id)
@@ -382,6 +386,33 @@ mod tests {
             store.lookup("f1", "c1", Variant::Thumbnail).await.unwrap(),
             Lookup::Ready(_)
         ));
+    }
+
+    /// `ready` を維持する `mark_pending` は `updated_at` を進めない。進めると
+    /// バイト列が同じまま ETag だけ変わり、クライアントに無駄な再取得をさせる。
+    #[tokio::test]
+    async fn mark_pending_keeps_updated_at_of_ready_row() {
+        let store = CacheStore::open_in_memory().await.unwrap();
+        store
+            .mark_ready("f1", "c1", Variant::Thumbnail, "a.jpg", "image/jpeg", 1, 1, 1)
+            .await
+            .unwrap();
+        let Lookup::Ready(before) = store.lookup("f1", "c1", Variant::Thumbnail).await.unwrap()
+        else {
+            panic!("expected Ready");
+        };
+
+        // 実ファイルが読めず再投入された、という経路を再現する。
+        store.mark_pending("f1", "c1", Variant::Thumbnail).await.unwrap();
+
+        let Lookup::Ready(after) = store.lookup("f1", "c1", Variant::Thumbnail).await.unwrap()
+        else {
+            panic!("ready は維持される");
+        };
+        assert_eq!(
+            before.updated_at, after.updated_at,
+            "ready 維持なら ETag の元になる updated_at も据え置く"
+        );
     }
 
     #[tokio::test]
