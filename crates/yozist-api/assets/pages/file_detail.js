@@ -88,12 +88,18 @@ ViewRuntime.registerView({ kind: 'core/binary', mount(cont) { renderBinary(cont)
 // 遷移元ページへ戻れるようにする。メディアページ（/ui/media）からの遷移は
 // `?from=media` を付けて開かれる（media.js 参照）ので、戻る先もそこに合わせる。
 // クエリが無ければ通常のファイル一覧に戻る（既定の挙動を維持）。
+// 「戻る」リンクだけでなく、削除後など詳細ページを離れる操作全般で
+// 同じ遷移元へ戻すために使う（backTarget/backLabel）。
+function backTarget() {
+  return new URLSearchParams(location.search).get('from') === 'media' ? '/ui/media' : '/ui/files';
+}
+function backLabel() {
+  return backTarget() === '/ui/media' ? '← メディア' : '← ファイル一覧';
+}
 function setupBackLink() {
-  const from = new URLSearchParams(location.search).get('from');
-  const target = from === 'media' ? '/ui/media' : '/ui/files';
-  const label = from === 'media' ? '← メディア' : '← ファイル一覧';
+  const target = backTarget();
   const back = $('fd-back-link');
-  if (back) { back.href = target; back.textContent = label; }
+  if (back) { back.href = target; back.textContent = backLabel(); }
   const backNotFound = $('fd-back-link-notfound');
   if (backNotFound) backNotFound.href = target;
 }
@@ -1203,7 +1209,7 @@ async function deleteFile() {
   if (!await uiConfirm(`"${currentFile.display_name}" を削除しますか？`, { danger: true, okText: '削除' })) return;
   const r = await api(`/api/files/${fileId}`, { method: 'DELETE' });
   if (!r.ok) { uiToast('削除に失敗しました: ' + await r.text(), 'error'); return; }
-  location.href = '/ui/files';
+  location.href = backTarget();
 }
 
 init();
