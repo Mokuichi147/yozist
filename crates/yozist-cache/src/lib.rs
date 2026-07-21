@@ -14,6 +14,7 @@ mod job_handler;
 mod sqlite;
 
 pub use generator::{GenError, GeneratedPreview, PreviewGenerator};
+
 pub use job_handler::{PreviewJobHandler, PreviewJobPayload};
 pub use sqlite::{CacheEntry, CacheStore, Lookup};
 
@@ -43,23 +44,46 @@ impl Variant {
     }
 }
 
+/// 出力フォーマットの選び方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// アルファの有無で PNG（可逆）／JPEG（非可逆）を選ぶ。
+    /// 元画像に近い形式のまま残るので、詳細ページ向け。
+    Auto,
+    /// 常に WebP。アルファがあれば可逆、無ければ非可逆で出力する。
+    ///
+    /// 一覧グリッド向け。`Auto` だとアルファチャンネルを持つだけの
+    /// （実際は不透明な）スクリーンショット PNG が可逆 PNG のまま残り、
+    /// サムネイルが期待ほど小さくならない。WebP なら同じ可逆でも PNG より
+    /// 小さく、不透明画像は非可逆でさらに小さくできる。
+    ///
+    /// NOTE: アルファ付き非可逆 WebP を使えれば前者もさらに縮められるが、
+    /// compressor が API を公開していないため現状は可逆にフォールバック
+    /// している（Mokuichi147/compressor#3）。
+    Webp,
+}
+
 /// variant ごとの生成パラメータ。
 #[derive(Debug, Clone, Copy)]
 pub struct VariantConfig {
     /// 長辺の上限（px）。これを超える場合のみリサイズする。
     pub max_edge_px: u32,
-    /// JPEG 出力時の品質（0-100）。PNG（アルファ有り）出力では未使用。
+    /// 非可逆出力時の品質（0-100）。可逆出力（PNG / 可逆 WebP）では未使用。
     pub quality: f32,
+    /// 出力フォーマットの選び方。
+    pub format: OutputFormat,
 }
 
 impl VariantConfig {
     pub const DEFAULT_THUMBNAIL: VariantConfig = VariantConfig {
         max_edge_px: 480,
         quality: 75.0,
+        format: OutputFormat::Webp,
     };
     pub const DEFAULT_PREVIEW: VariantConfig = VariantConfig {
         max_edge_px: 1600,
         quality: 82.0,
+        format: OutputFormat::Auto,
     };
 }
 

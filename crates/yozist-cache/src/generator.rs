@@ -9,7 +9,7 @@ use image::imageops::FilterType;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::VariantConfig;
+use crate::{OutputFormat, VariantConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GenError {
@@ -69,19 +69,44 @@ impl PreviewGenerator {
             return Err(GenError::Unsupported(format!("failed to encode intermediate png: {e}")));
         }
 
-        let (final_path, mime) = if has_alpha {
-            let out = dest_dir.join(format!("{base_name}.png"));
-            compressor::rgba_image::path2compress(&tmp_path, &out);
-            (out, "image/png")
-        } else {
-            let out = dest_dir.join(format!("{base_name}.jpg"));
-            compressor::rgb_image::path2compress(&tmp_path, &out, cfg.quality);
-            (out, "image/jpeg")
+        let (final_path, mime) = match (cfg.format, has_alpha) {
+            // アルファ付き非可逆 WebP は compressor が未公開のため可逆で出す
+            // （Mokuichi147/compressor#3）。それでも PNG よりは小さい。
+            (OutputFormat::Webp, true) => {
+                let out = dest_dir.join(format!("{base_name}.webp"));
+                compressor::webp_image::path2compress_lossless(&tmp_path, &out);
+                (out, "image/webp")
+            }
+            (OutputFormat::Webp, false) => {
+                let out = dest_dir.join(format!("{base_name}.webp"));
+                compressor::webp_image::path2compress_lossy(&tmp_path, &out, cfg.quality);
+                (out, "image/webp")
+            }
+            (OutputFormat::Auto, true) => {
+                let out = dest_dir.join(format!("{base_name}.png"));
+                compressor::rgba_image::path2compress(&tmp_path, &out);
+                (out, "image/png")
+            }
+            (OutputFormat::Auto, false) => {
+                let out = dest_dir.join(format!("{base_name}.jpg"));
+                compressor::rgb_image::path2compress(&tmp_path, &out, cfg.quality);
+                (out, "image/jpeg")
+            }
         };
 
         let _ = std::fs::remove_file(&tmp_path);
 
-        let byte_size = std::fs::metadata(&final_path)?.len();
+        // compressor は失敗しても戻り値で知らせず、出力ファイルを作らないまま
+        // 返ることがある（Mokuichi147/compressor#3）。metadata の失敗を
+        // 「圧縮に失敗した」と解釈する。
+        let byte_size = std::fs::metadata(&final_path)
+            .map_err(|e| {
+                GenError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("圧縮結果が生成されませんでした ({}): {e}", final_path.display()),
+                ))
+            })?
+            .len();
         Ok(GeneratedPreview {
             path: final_path,
             mime,
@@ -123,6 +148,7 @@ mod tests {
         let cfg = VariantConfig {
             max_edge_px: 400,
             quality: 75.0,
+            format: OutputFormat::Auto,
         };
         let out = PreviewGenerator::generate(&bytes, dir.path(), "case1", cfg).unwrap();
         assert_eq!(out.mime, "image/jpeg");
@@ -140,11 +166,40 @@ mod tests {
         let cfg = VariantConfig {
             max_edge_px: 1600,
             quality: 80.0,
+            format: OutputFormat::Auto,
         };
         let out = PreviewGenerator::generate(&bytes, dir.path(), "case2", cfg).unwrap();
         assert_eq!(out.mime, "image/png");
         assert_eq!(out.width, 300);
         assert_eq!(out.height, 200);
+    }
+
+    /// サムネイル既定の `OutputFormat::Webp` は、アルファの有無に関わらず
+    /// WebP を出す（一覧グリッドの転送量を揃えるため）。
+    #[test]
+    fn webp_format_used_regardless_of_alpha() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = VariantConfig {
+            max_edge_px: 480,
+            quality: 75.0,
+            format: OutputFormat::Webp,
+        };
+
+        for (alpha, name) in [(false, "opaque"), (true, "alpha")] {
+            let bytes = sample_png(1200, 600, alpha);
+            let out = PreviewGenerator::generate(&bytes, dir.path(), name, cfg).unwrap();
+            assert_eq!(out.mime, "image/webp", "alpha={alpha}");
+            assert_eq!(out.path.extension().unwrap(), "webp", "alpha={alpha}");
+            assert_eq!((out.width, out.height), (480, 240), "alpha={alpha}");
+            assert!(out.byte_size > 0, "alpha={alpha}");
+        }
+    }
+
+    /// thumbnail 既定は WebP、preview 既定は従来どおり JPEG/PNG。
+    #[test]
+    fn default_variant_configs_pick_expected_formats() {
+        assert_eq!(VariantConfig::DEFAULT_THUMBNAIL.format, OutputFormat::Webp);
+        assert_eq!(VariantConfig::DEFAULT_PREVIEW.format, OutputFormat::Auto);
     }
 
     #[test]
@@ -153,6 +208,7 @@ mod tests {
         let cfg = VariantConfig {
             max_edge_px: 400,
             quality: 75.0,
+            format: OutputFormat::Auto,
         };
         let err = PreviewGenerator::generate(b"not an image", dir.path(), "case3", cfg)
             .unwrap_err();
