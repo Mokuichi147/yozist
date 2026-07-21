@@ -213,8 +213,10 @@ function rebuildItems(files) {
  */
 function createItem(f) {
   const kind = mediaKindOf(f);
+  // ?from=media を付けてファイル詳細へ渡し、詳細ページの「戻る」がここに戻れるようにする
+  // （file_detail.js の setupBackLink 参照）。
   const a = el('a', {
-    href: `/ui/files/${f.id}`,
+    href: `/ui/files/${f.id}?from=media`,
     class: 'jg-item',
     title: f.display_name,
   }, [

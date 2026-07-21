@@ -85,7 +85,27 @@ ViewRuntime.registerView({ kind: 'core/text', async mount(cont, ctx) {
 // バイナリのフォールバック（プレビュー不可）。getView の既定フォールバックも兼ねる。
 ViewRuntime.registerView({ kind: 'core/binary', mount(cont) { renderBinary(cont); } });
 
+// 遷移元ページへ戻れるようにする。メディアページ（/ui/media）からの遷移は
+// `?from=media` を付けて開かれる（media.js 参照）ので、戻る先もそこに合わせる。
+// クエリが無ければ通常のファイル一覧に戻る（既定の挙動を維持）。
+// 「戻る」リンクだけでなく、削除後など詳細ページを離れる操作全般で
+// 同じ遷移元へ戻すために使う（backTarget/backLabel）。
+function backTarget() {
+  return new URLSearchParams(location.search).get('from') === 'media' ? '/ui/media' : '/ui/files';
+}
+function backLabel() {
+  return backTarget() === '/ui/media' ? '← メディア' : '← ファイル一覧';
+}
+function setupBackLink() {
+  const target = backTarget();
+  const back = $('fd-back-link');
+  if (back) { back.href = target; back.textContent = backLabel(); }
+  const backNotFound = $('fd-back-link-notfound');
+  if (backNotFound) backNotFound.href = target;
+}
+
 async function init() {
+  setupBackLink();
   const me = await requireAuth();
   if (!me) return;
   try {
@@ -1010,7 +1030,11 @@ async function loadFileSeries() {
   updateContentNav();
 }
 
-function gotoFile(id) { location.href = '/ui/files/' + id; }
+// 前後ファイルへ移動しても「戻る」の遷移元（?from=media 等）を引き継ぐ。
+function gotoFile(id) {
+  const from = new URLSearchParams(location.search).get('from');
+  location.href = '/ui/files/' + id + (from ? '?from=' + encodeURIComponent(from) : '');
+}
 
 // コンテンツ両端のオーバーレイ遷移先（先頭シリーズ基準の前後ファイル）。
 // 複数シリーズに所属する場合は最初のシリーズを採用する（全シリーズはカードに表示）。
@@ -1185,7 +1209,7 @@ async function deleteFile() {
   if (!await uiConfirm(`"${currentFile.display_name}" を削除しますか？`, { danger: true, okText: '削除' })) return;
   const r = await api(`/api/files/${fileId}`, { method: 'DELETE' });
   if (!r.ok) { uiToast('削除に失敗しました: ' + await r.text(), 'error'); return; }
-  location.href = '/ui/files';
+  location.href = backTarget();
 }
 
 init();
