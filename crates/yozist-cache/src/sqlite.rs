@@ -219,36 +219,45 @@ impl CacheStore {
         Ok(())
     }
 
-    /// `file_ids` のうち、指定 variant の `ready` 行を持たないものを返す
-    /// （未生成 or 生成失敗 = バックフィル対象）。
+    /// `targets`（`(file_id, commit_id)` の組）のうち、その **コミットに対する**
+    /// 指定 variant の `ready` 行を持たないものを返す（未生成 or 生成失敗 =
+    /// バックフィル対象）。
+    ///
+    /// commit_id まで見るのが重要: 旧コミットの `ready` 行が残っているだけで
+    /// 「生成済み」と誤判定すると、再コミット直後のファイルが（sweeper が
+    /// 陳腐化行を回収するまでの間）バックフィルから漏れる。
     pub async fn list_missing_for(
         &self,
-        file_ids: &[String],
+        targets: &[(String, String)],
         variant: Variant,
-    ) -> Result<Vec<String>, CacheError> {
-        if file_ids.is_empty() {
+    ) -> Result<Vec<(String, String)>, CacheError> {
+        if targets.is_empty() {
             return Ok(Vec::new());
         }
-        let mut qb = sqlx::QueryBuilder::new(
-            "SELECT file_id FROM preview_cache WHERE variant = ",
-        );
-        qb.push_bind(variant.as_str());
-        qb.push(" AND status = 'ready' AND file_id IN (");
-        {
-            let mut sep = qb.separated(", ");
-            for id in file_ids {
-                sep.push_bind(id);
+        // SQLite のバインド変数上限（既定 32766）を超えないよう分割して問い合わせる。
+        const CHUNK: usize = 500;
+        let mut ready: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for chunk in targets.chunks(CHUNK) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "SELECT file_id, commit_id FROM preview_cache WHERE variant = ",
+            );
+            qb.push_bind(variant.as_str());
+            qb.push(" AND status = 'ready' AND file_id IN (");
+            {
+                let mut sep = qb.separated(", ");
+                for (file_id, _) in chunk {
+                    sep.push_bind(file_id);
+                }
+            }
+            qb.push(")");
+            for row in qb.build().fetch_all(&self.pool).await? {
+                ready.insert((row.try_get("file_id")?, row.try_get("commit_id")?));
             }
         }
-        qb.push(")");
-        let rows = qb.build().fetch_all(&self.pool).await?;
-        let ready: std::collections::HashSet<String> = rows
-            .into_iter()
-            .map(|r| r.try_get::<String, _>("file_id"))
-            .collect::<Result<_, _>>()?;
-        Ok(file_ids
+        Ok(targets
             .iter()
-            .filter(|id| !ready.contains(id.as_str()))
+            .filter(|pair| !ready.contains(*pair))
             .cloned()
             .collect())
     }
@@ -369,11 +378,29 @@ mod tests {
             .unwrap();
         store.mark_failed("f2", "c1", Variant::Thumbnail, "err").await.unwrap();
 
-        let ids = vec!["f1".to_string(), "f2".to_string(), "f3".to_string()];
-        let missing = store.list_missing_for(&ids, Variant::Thumbnail).await.unwrap();
+        let targets = vec![
+            ("f1".to_string(), "c1".to_string()),
+            ("f2".to_string(), "c1".to_string()),
+            ("f3".to_string(), "c1".to_string()),
+        ];
+        let missing = store.list_missing_for(&targets, Variant::Thumbnail).await.unwrap();
         assert_eq!(missing.len(), 2);
-        assert!(missing.contains(&"f2".to_string()));
-        assert!(missing.contains(&"f3".to_string()));
+        assert!(missing.contains(&("f2".to_string(), "c1".to_string())));
+        assert!(missing.contains(&("f3".to_string(), "c1".to_string())));
+    }
+
+    #[tokio::test]
+    async fn list_missing_for_treats_other_commit_as_missing() {
+        let store = CacheStore::open_in_memory().await.unwrap();
+        // 旧コミット c1 のサムネイルは生成済みだが、現行コミットは c2。
+        store
+            .mark_ready("f1", "c1", Variant::Thumbnail, "old.jpg", "image/jpeg", 1, 1, 1)
+            .await
+            .unwrap();
+
+        let targets = vec![("f1".to_string(), "c2".to_string())];
+        let missing = store.list_missing_for(&targets, Variant::Thumbnail).await.unwrap();
+        assert_eq!(missing, targets, "旧コミットの ready 行で現行分をスキップしてはいけない");
     }
 
     #[tokio::test]

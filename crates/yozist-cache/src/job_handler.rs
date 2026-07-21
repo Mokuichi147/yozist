@@ -102,9 +102,12 @@ impl JobHandler for PreviewJobHandler {
             return Err(JobError::Permanent(format!("unsupported mime: {mime}")));
         }
 
+        // 上の検証で使った commit を明示して読む。`read_current` だと現在の
+        // current_commit を読み直すため、検証後に再コミットが挟まると
+        // 「新しいバイト列を旧 commit_id の行に保存する」ズレが起きる。
         let bytes = self
             .engine
-            .read_current(file_id)
+            .read_at_commit(file_id, current_commit)
             .await
             .map_err(|e| JobError::Retryable(e.to_string()))?;
 

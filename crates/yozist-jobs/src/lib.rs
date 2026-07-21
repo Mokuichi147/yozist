@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod store;
-pub use store::{JobRecord, JobStatus, JobStore};
+pub use store::{JobRecord, JobStatus, JobStore, STALLED_LEASE};
 
 /// ジョブハンドラの実行結果エラー。
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,9 @@ pub enum JobsError {
 /// ジョブが見つからなかった時の再ポーリング間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 固着した `running` ジョブを回収する間隔（ワーカー 0 番のみが実行する）。
+const RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+
 /// `kind → JobHandler` の登録表とワーカー起動を担う。
 pub struct JobRunner {
     store: Arc<JobStore>,
@@ -71,10 +74,16 @@ impl JobRunner {
     }
 
     /// 登録済み全 kind をポーリングするワーカーを `n` 本、バックグラウンドに起動する。
+    ///
+    /// 起動時に一度 [`JobStore::reclaim_stalled`] を回し、前回プロセスが
+    /// ジョブ実行中に落ちて `running` のまま残った行を回収する。
     pub fn spawn_workers(self: &Arc<Self>, n: usize) {
         for worker_id in 0..n {
             let runner = self.clone();
             tokio::spawn(async move {
+                if worker_id == 0 {
+                    runner.reclaim_stalled().await;
+                }
                 runner.worker_loop(worker_id).await;
             });
         }
@@ -82,23 +91,57 @@ impl JobRunner {
 
     /// キューが空になるまで自ワーカーだけで処理し、その後戻る。CLI の一括投入
     /// コマンド（cache-warm 等）が「終わったらプロセスを終了する」ために使う。
-    pub async fn drain(self: &Arc<Self>) {
+    ///
+    /// バックオフ待ちのジョブがあると `claim_next` は一時的に `None` を返すため、
+    /// 「未完了が 0 件」になるまで待つ。戻り値は処理し切れずに残った件数
+    /// （0 なら完全に捌けた）。
+    pub async fn drain(self: &Arc<Self>) -> i64 {
         let kinds: Vec<&str> = self.handlers.keys().map(|s| s.as_str()).collect();
+        self.reclaim_stalled().await;
         loop {
             match self.store.claim_next(&kinds).await {
                 Ok(Some(job)) => self.run_one(job).await,
-                Ok(None) => break,
+                Ok(None) => {
+                    // キューは空に見えるが、リトライのバックオフ待ちが残って
+                    // いる可能性がある。未完了が無くなって初めて完了とみなす。
+                    match self.store.count_incomplete(&kinds).await {
+                        Ok(0) => return 0,
+                        Ok(remaining) => {
+                            tracing::debug!(remaining, "バックオフ待ちのジョブを待機中");
+                            tokio::time::sleep(POLL_INTERVAL).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("未完了ジョブ数の取得に失敗: {e}");
+                            return -1;
+                        }
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("job queue poll failed: {e}");
-                    break;
+                    return self.store.count_incomplete(&kinds).await.unwrap_or(-1);
                 }
             }
         }
     }
 
+    async fn reclaim_stalled(&self) {
+        match self.store.reclaim_stalled(store::STALLED_LEASE).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("固着していた running ジョブを {n} 件回収"),
+            Err(e) => tracing::warn!("固着ジョブの回収に失敗: {e}"),
+        }
+    }
+
     async fn worker_loop(&self, worker_id: usize) {
         let kinds: Vec<&str> = self.handlers.keys().map(|s| s.as_str()).collect();
+        let mut last_reclaim = tokio::time::Instant::now();
         loop {
+            // ワーカー 0 番だけが定期回収を担う（全員でやっても同じ行を奪い合う
+            // だけで意味がない）。
+            if worker_id == 0 && last_reclaim.elapsed() >= RECLAIM_INTERVAL {
+                self.reclaim_stalled().await;
+                last_reclaim = tokio::time::Instant::now();
+            }
             match self.store.claim_next(&kinds).await {
                 Ok(Some(job)) => self.run_one(job).await,
                 Ok(None) => tokio::time::sleep(POLL_INTERVAL).await,
@@ -119,7 +162,21 @@ impl JobRunner {
                 .await;
             return;
         };
-        match handler.handle(&job.payload).await {
+
+        // ハンドラは別タスクで実行する。ワーカーループ内で直接 await すると
+        // ハンドラの panic がワーカータスクごと巻き込み、ワーカーが静かに全滅
+        // してジョブ処理が止まる。別タスクなら panic は JoinError として
+        // 受け取れ、通常のリトライ経路に流せる。
+        let handler = handler.clone();
+        let payload = job.payload.clone();
+        let outcome = tokio::spawn(async move { handler.handle(&payload).await }).await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => Err(JobError::Retryable(format!("handler panicked: {e}"))),
+        };
+
+        match outcome {
             Ok(()) => {
                 if let Err(e) = self.store.mark_done(&job.id).await {
                     tracing::warn!("failed to mark job {} done: {e}", job.id);

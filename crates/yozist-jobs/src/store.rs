@@ -8,6 +8,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Duration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -40,6 +41,19 @@ pub struct JobRecord {
 /// 恒久失敗までのリトライ間隔（秒）。試行回数に応じて段階的に伸ばす。
 const RETRY_BACKOFF_SECS: [i64; 3] = [10, 60, 300];
 const DEFAULT_MAX_ATTEMPTS: i64 = 3;
+
+/// `running` のまま放置されたジョブを回収するまでの猶予。
+///
+/// `claim_next` は `pending` しか拾わず、dedup の部分インデックスは
+/// `pending`/`running` を対象にするため、`running` のまま残った行は
+/// 「再取得もされず、同じ dedup_key の再投入も弾く」状態で固着する。
+/// プロセスがジョブ実行中に落ちると必ずこうなるので、一定時間を過ぎた
+/// `running` は落ちた実行の残骸とみなして `pending` に戻す。
+///
+/// プレビュー生成は通常数秒で終わるため 10 分あれば十分な余裕がある。
+/// 万一生きているジョブを再取得しても、生成は同じ出力パスへの上書きで
+/// 冪等なので実害は無い（無駄な再実行のみ）。
+pub const STALLED_LEASE: Duration = Duration::from_secs(10 * 60);
 
 pub struct JobStore {
     pool: SqlitePool,
@@ -108,6 +122,28 @@ impl JobStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// `updated_at` が `lease` より古い `running` ジョブを `pending` に戻す。
+    /// 戻した件数を返す。詳細は [`STALLED_LEASE`] を参照。
+    ///
+    /// 起動直後（前回プロセスの残骸を回収）と、ワーカーの定期実行から呼ぶ。
+    /// `attempts` は `claim_next` 側で増えているので、ここで戻した行も
+    /// `max_attempts` に達すれば通常どおり恒久失敗として確定する。
+    pub async fn reclaim_stalled(&self, lease: Duration) -> Result<u64, JobsError> {
+        let now = OffsetDateTime::now_utc();
+        let cutoff = fmt_dt(now - time::Duration::seconds(lease.as_secs() as i64));
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'pending', run_after = ?, updated_at = ?, \
+                error = COALESCE(error, 'reclaimed after stalled run') \
+             WHERE status = 'running' AND updated_at < ?",
+        )
+        .bind(fmt_dt(now))
+        .bind(fmt_dt(now))
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// `kinds` のいずれかに一致し、実行可能（`run_after` を過ぎた pending）な
@@ -391,6 +427,60 @@ mod tests {
             store.count_incomplete(&["preview.generate"]).await.unwrap(),
             1
         );
+    }
+
+    /// プロセスがジョブ実行中に落ちると `running` の行が残る。この行は
+    /// `claim_next`（pending のみ対象）にも拾われず、dedup の部分インデックスが
+    /// `running` を含むので同じ dedup_key の再投入も弾かれる。回収機構が無いと
+    /// その (file, commit, variant) は永久に生成されなくなる。
+    #[tokio::test]
+    async fn stalled_running_job_is_reclaimed() {
+        let store = JobStore::open_in_memory().await.unwrap();
+        store
+            .enqueue("preview.generate", Some("f1:c1:thumbnail"), &json!({}))
+            .await
+            .unwrap();
+        let job = store.claim_next(&["preview.generate"]).await.unwrap().unwrap();
+
+        // ここでプロセスが落ちたとする。running のまま固着し、
+        // 再投入も再取得もできない。
+        store
+            .enqueue("preview.generate", Some("f1:c1:thumbnail"), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_incomplete(&["preview.generate"]).await.unwrap(),
+            1,
+            "dedup により再投入は弾かれる"
+        );
+        assert!(
+            store.claim_next(&["preview.generate"]).await.unwrap().is_none(),
+            "running のままなので再取得もされない"
+        );
+
+        // リース切れとして回収すれば再び処理できる。
+        assert_eq!(store.reclaim_stalled(Duration::ZERO).await.unwrap(), 1);
+        let reclaimed = store
+            .claim_next(&["preview.generate"])
+            .await
+            .unwrap()
+            .expect("回収後は再取得できる");
+        assert_eq!(reclaimed.id, job.id);
+        assert_eq!(reclaimed.attempts, 2, "回収後の再実行も試行回数に数える");
+    }
+
+    /// リース内で実行中のジョブは回収しない（二重実行を避ける）。
+    #[tokio::test]
+    async fn reclaim_leaves_recently_claimed_jobs_alone() {
+        let store = JobStore::open_in_memory().await.unwrap();
+        store
+            .enqueue("preview.generate", None, &json!({}))
+            .await
+            .unwrap();
+        store.claim_next(&["preview.generate"]).await.unwrap().unwrap();
+
+        assert_eq!(store.reclaim_stalled(STALLED_LEASE).await.unwrap(), 0);
+        assert!(store.claim_next(&["preview.generate"]).await.unwrap().is_none());
     }
 
     #[tokio::test]

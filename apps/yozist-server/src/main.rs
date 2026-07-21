@@ -286,21 +286,15 @@ async fn main() -> anyhow::Result<()> {
             let mut enqueued = 0usize;
             let mut skipped = 0usize;
             for v in &variants {
-                let ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
-                let missing: std::collections::HashSet<String> =
-                    cache_store.list_missing_for(&ids, *v).await?.into_iter().collect();
-                for (file_id, commit_id) in &candidates {
-                    if missing.contains(file_id) {
-                        enqueue_preview_job(&job_runner, &cache_store, file_id, commit_id, *v).await?;
-                        enqueued += 1;
-                    } else {
-                        skipped += 1;
-                    }
+                let missing = cache_store.list_missing_for(&candidates, *v).await?;
+                skipped += candidates.len() - missing.len();
+                for (file_id, commit_id) in &missing {
+                    enqueue_preview_job(&job_runner, &cache_store, file_id, commit_id, *v).await?;
+                    enqueued += 1;
                 }
             }
             println!("cache-warm: {enqueued} 件投入、{skipped} 件は生成済みのためスキップ。処理中...");
-            job_runner.drain().await;
-            println!("cache-warm: 完了");
+            report_drain_result("cache-warm", job_runner.drain().await);
         }
         Cmd::CacheRegenerate { file, all, variant } => {
             if file.is_some() == *all {
@@ -337,8 +331,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             println!("cache-regenerate: {count} 件投入。処理中...");
-            job_runner.drain().await;
-            println!("cache-regenerate: 完了");
+            report_drain_result("cache-regenerate", job_runner.drain().await);
         }
     }
     Ok(())
@@ -385,6 +378,12 @@ async fn open_cache_layer(
     tokio::fs::create_dir_all(&cache_dir).await?;
     tracing::info!("preview cache dir: {}", cache_dir.display());
 
+    match sweep_leftover_temp_files(&cache_dir).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("前回の生成中断で残った中間ファイルを {n} 件削除"),
+        Err(e) => tracing::warn!("中間ファイルの掃除に失敗: {e}"),
+    }
+
     let job_store = Arc::new(yozist_jobs::JobStore::open(cache_dir.join("jobs.sqlite")).await?);
     let cache_store = Arc::new(yozist_cache::CacheStore::open(cache_dir.join("cache.sqlite")).await?);
 
@@ -411,6 +410,17 @@ async fn open_cache_layer(
     let runner = Arc::new(runner);
 
     Ok((runner, cache_store, cache_dir))
+}
+
+/// `JobRunner::drain` の戻り値（捌けずに残った件数）を人間向けに報告する。
+/// リトライ上限に達して恒久失敗したジョブがあると 0 にならないことがあるため、
+/// 「完了」と言い切らずに残件数を出す。
+fn report_drain_result(cmd: &str, remaining: i64) {
+    match remaining {
+        0 => println!("{cmd}: 完了"),
+        n if n < 0 => println!("{cmd}: 中断（キューの状態を取得できませんでした）"),
+        n => println!("{cmd}: {n} 件が未処理のまま残りました（ログを確認してください）"),
+    }
 }
 
 fn parse_variants(s: Option<&str>) -> anyhow::Result<Vec<yozist_cache::Variant>> {
@@ -488,8 +498,42 @@ async fn sweep_stale_preview_cache(
             _ => cache_store.delete_by_file(&file_id_s).await?,
         };
         for rel in rel_paths {
-            if tokio::fs::remove_file(cache_dir.join(rel)).await.is_ok() {
-                removed += 1;
+            let path = cache_dir.join(&rel);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed += 1,
+                // 既に無いなら回収済み。それ以外の失敗は DB 行だけ消えて実ファイル
+                // が孤児として残るため、黙って捨てずに記録する。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("キャッシュファイルを削除できません {rel}: {e}"),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// 生成中にプロセスが落ちると `PreviewGenerator` の中間 PNG（`.tmp-*.png`）が
+/// シャードディレクトリに残る。DB には現れないため通常のスイーパでは回収
+/// できないので、起動時にまとめて掃除する。
+async fn sweep_leftover_temp_files(cache_dir: &Path) -> anyhow::Result<usize> {
+    let mut removed = 0usize;
+    let mut shards = match tokio::fs::read_dir(cache_dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(shard) = shards.next_entry().await? {
+        if !shard.file_type().await?.is_dir() {
+            continue;
+        }
+        let mut entries = tokio::fs::read_dir(shard.path()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".tmp-") && name.ends_with(".png") {
+                match tokio::fs::remove_file(entry.path()).await {
+                    Ok(()) => removed += 1,
+                    Err(e) => tracing::warn!("中間ファイルを削除できません {name}: {e}"),
+                }
             }
         }
     }

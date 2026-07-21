@@ -1220,6 +1220,43 @@ struct PreviewQuery {
     variant: Option<String>,
 }
 
+/// プレビュー応答のキャッシュヘッダを設定する。
+///
+/// `Cache-Control: private, no-cache` の意図:
+/// - `private` … このエンドポイントは Bearer トークンで保護されている。`public`
+///   を付けると RFC 9111 の「Authorization 付きリクエストの応答は共有キャッシュに
+///   保存しない」という既定を解除してしまい、リバースプロキシ経由で他ユーザへ
+///   配られる余地が生まれる。
+/// - `no-cache` … 保存は許すが利用前に必ず再検証させる。URL に commit を含めて
+///   いないため、再コミット後も同じ URL が別のバイト列を指す（`immutable` や
+///   長い `max-age` は使えない）。再検証は ETag で 304 になるので実質無料。
+fn set_preview_cache_headers(headers: &mut axum::http::HeaderMap, etag: &str) {
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-cache"),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(etag) {
+        headers.insert(axum::http::header::ETAG, v);
+    }
+}
+
+/// `If-None-Match` が `etag` に一致するか。`*` と、カンマ区切りの複数値、
+/// 弱い検証子（`W/` 前置）に対応する。
+fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    let Some(raw) = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    if raw.trim() == "*" {
+        return true;
+    }
+    raw.split(',')
+        .map(|candidate| candidate.trim().trim_start_matches("W/"))
+        .any(|candidate| candidate == etag)
+}
+
 /// 軽量化キャッシュが `ready` なら圧縮済みファイルを、そうでなければ
 /// オリジナルを返しつつ生成ジョブを投入する（リクエストはブロックしない）。
 /// 画像以外の mime は常にオリジナルへフォールバックする（現状は画像のみ対応）。
@@ -1250,22 +1287,20 @@ async fn get_preview(
             let commit_id_s = commit_id.to_string();
             match s.cache_store.lookup(&file_id_s, &commit_id_s, variant).await {
                 Ok(yozist_cache::Lookup::Ready(entry)) => {
+                    // ETag は commit に紐付く。同じ URL でも再コミットすれば別の
+                    // バイト列を返すため、長期キャッシュ（immutable）は使えない。
+                    // no-cache で「保存はするが毎回再検証」させ、変化が無ければ
+                    // 304 で本文を省く。
+                    let etag = format!("\"{commit_id_s}-{}\"", variant.as_str());
+                    if if_none_match_matches(&headers, &etag) {
+                        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+                        set_preview_cache_headers(resp.headers_mut(), &etag);
+                        return Ok(resp);
+                    }
                     let path = s.cache_dir.join(&entry.rel_path);
                     if let Ok(bytes) = tokio::fs::read(&path).await {
                         let mut resp = range_response(entry.mime, &bytes, range);
-                        let hmap = resp.headers_mut();
-                        hmap.insert(
-                            axum::http::header::CACHE_CONTROL,
-                            axum::http::HeaderValue::from_static(
-                                "public, max-age=31536000, immutable",
-                            ),
-                        );
-                        if let Ok(etag) = axum::http::HeaderValue::from_str(&format!(
-                            "\"{commit_id_s}-{}\"",
-                            variant.as_str()
-                        )) {
-                            hmap.insert(axum::http::header::ETAG, etag);
-                        }
+                        set_preview_cache_headers(resp.headers_mut(), &etag);
                         return Ok(resp);
                     }
                     // キャッシュ行はあるが実ファイルが読めない（削除された等）。
@@ -3996,6 +4031,130 @@ mod tests {
                 .unwrap(),
             "public, max-age=31536000, immutable"
         );
+    }
+
+    /// `get_preview` 用に画像 mime を持つファイルを 1 件作る。
+    async fn make_image_file(state: &ApiState) -> (FileMeta, yozist_core::Commit) {
+        state
+            .engine
+            .create_file(
+                "photo.png",
+                b"original-image-bytes",
+                ActorId::new(),
+                None,
+                None,
+                Some(yozist_core::FormatHint {
+                    extension: Some("png".into()),
+                    mime: Some("image/png".into()),
+                    first_bytes: None,
+                    display_name: None,
+                }),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn call_get_preview(
+        state: ApiState,
+        file_id: &str,
+        headers: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        get_preview(
+            State(state),
+            AuthCtx(AuthContext::System),
+            Path(file_id.to_string()),
+            Query(PreviewQuery {
+                variant: Some("thumbnail".into()),
+            }),
+            headers,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    /// 未キャッシュならオリジナルを即返し、生成ジョブを投入する。
+    /// フォールバック応答にキャッシュヘッダを付けてはいけない（オリジナルを
+    /// プレビューとして固定してしまう）。
+    #[tokio::test]
+    async fn get_preview_falls_back_to_original_and_enqueues() {
+        let (state, _td) = make_state().await;
+        let (file, _commit) = make_image_file(&state).await;
+
+        let resp = call_get_preview(state.clone(), &file.id.to_string(), Default::default()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(axum::http::header::CACHE_CONTROL).is_none());
+        assert_eq!(body_bytes(resp).await, b"original-image-bytes");
+
+        assert_eq!(
+            state
+                .job_store
+                .count_incomplete(&["preview.generate"])
+                .await
+                .unwrap(),
+            1,
+            "未キャッシュなら生成ジョブが投入される"
+        );
+    }
+
+    /// キャッシュ済みなら軽量版を返す。URL に commit を含めていないので
+    /// `immutable` は使えず、ETag による再検証を要求する。
+    #[tokio::test]
+    async fn get_preview_serves_cached_variant_with_revalidation() {
+        let (state, _td) = make_state().await;
+        let (file, commit) = make_image_file(&state).await;
+
+        let rel_path = "ab/cached-thumb.jpg";
+        let abs = state.cache_dir.join(rel_path);
+        tokio::fs::create_dir_all(abs.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&abs, b"compressed").await.unwrap();
+        state
+            .cache_store
+            .mark_ready(
+                &file.id.to_string(),
+                &commit.id.to_string(),
+                yozist_cache::Variant::Thumbnail,
+                rel_path,
+                "image/jpeg",
+                10,
+                64,
+                64,
+            )
+            .await
+            .unwrap();
+
+        let resp = call_get_preview(state.clone(), &file.id.to_string(), Default::default()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CACHE_CONTROL).unwrap(),
+            "private, no-cache",
+            "認証付きエンドポイントを共有キャッシュに保存させない / 毎回再検証させる"
+        );
+        let etag = resp
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(etag.contains(&commit.id.to_string()), "ETag は commit に紐付く");
+        assert_eq!(body_bytes(resp).await, b"compressed");
+
+        // 同じ ETag を提示すれば 304（本文なし）。
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_str(&etag).unwrap(),
+        );
+        let resp = call_get_preview(state.clone(), &file.id.to_string(), headers).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        assert!(body_bytes(resp).await.is_empty());
     }
 
     #[tokio::test]
