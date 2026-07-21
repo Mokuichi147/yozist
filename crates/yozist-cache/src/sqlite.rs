@@ -19,6 +19,10 @@ pub struct CacheEntry {
     pub byte_size: i64,
     pub width: i32,
     pub height: i32,
+    /// この成果物を `ready` にした時刻（RFC3339）。同じコミットでも生成
+    /// パラメータを変えて再生成すればここが変わるため、ETag に混ぜて
+    /// 「再生成されたのにクライアントが 304 で古い版を使い続ける」のを防ぐ。
+    pub updated_at: String,
 }
 
 /// `CacheStore::lookup` の結果。
@@ -75,7 +79,7 @@ impl CacheStore {
         variant: Variant,
     ) -> Result<Lookup, CacheError> {
         let row = sqlx::query(
-            "SELECT status, rel_path, mime, byte_size, width, height, error \
+            "SELECT status, rel_path, mime, byte_size, width, height, error, updated_at \
              FROM preview_cache WHERE file_id = ? AND commit_id = ? AND variant = ?",
         )
         .bind(file_id)
@@ -100,6 +104,7 @@ impl CacheStore {
                     byte_size: row.try_get("byte_size")?,
                     width: row.try_get("width")?,
                     height: row.try_get("height")?,
+                    updated_at: row.try_get("updated_at")?,
                 }))
             }
             "failed" => Ok(Lookup::Failed(row.try_get("error")?)),
@@ -157,6 +162,12 @@ impl CacheStore {
         Ok(())
     }
 
+    /// 生成結果を `ready` として記録する。
+    ///
+    /// 既存行を上書きした結果、参照されなくなった旧 `rel_path` があればそれを返す
+    /// （呼び出し側が実ファイルを削除するため）。生成パラメータを変えて再生成
+    /// すると出力の拡張子が変わりうる（thumbnail の JPEG→WebP など）。その場合
+    /// 旧ファイルは DB からパスが失われて孤児になり、スイーパも辿れなくなる。
     #[allow(clippy::too_many_arguments)]
     pub async fn mark_ready(
         &self,
@@ -168,8 +179,23 @@ impl CacheStore {
         byte_size: i64,
         width: i32,
         height: i32,
-    ) -> Result<(), CacheError> {
+    ) -> Result<Option<String>, CacheError> {
         let now = fmt_dt(OffsetDateTime::now_utc());
+        // 旧パスの読み取りと上書きの間に別の生成が割り込むと、消すべきパスを
+        // 取り逃がす（孤児が残る）か、まだ有効なパスを消す恐れがある。
+        // 書き込みロックを最初から取って一連の操作を直列化する。
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT rel_path FROM preview_cache WHERE file_id = ? AND commit_id = ? AND variant = ?",
+        )
+        .bind(file_id)
+        .bind(commit_id)
+        .bind(variant.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten();
+
         sqlx::query(
             "INSERT INTO preview_cache \
                 (file_id, commit_id, variant, status, rel_path, mime, byte_size, width, height, error, created_at, updated_at) \
@@ -189,9 +215,11 @@ impl CacheStore {
         .bind(height)
         .bind(now.clone())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+
+        Ok(previous.filter(|p| p != rel_path))
     }
 
     pub async fn mark_failed(
@@ -434,6 +462,59 @@ mod tests {
             store.lookup("f1", "c1", Variant::Thumbnail).await.unwrap(),
             Lookup::Pending
         ));
+    }
+
+    /// 生成パラメータを変えて再生成すると出力の拡張子が変わりうる。上書きで
+    /// DB から消えるパスを返さないと、実ファイルが孤児として残る
+    /// （スイーパは DB 行の rel_path しか辿れない）。
+    #[tokio::test]
+    async fn mark_ready_reports_superseded_path() {
+        let store = CacheStore::open_in_memory().await.unwrap();
+        let none = store
+            .mark_ready("f1", "c1", Variant::Thumbnail, "ab/x-thumbnail.jpg", "image/jpeg", 1, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(none, None, "新規作成なら上書きされる旧パスは無い");
+
+        // thumbnail の出力が JPEG から WebP に変わった場合を再現する。
+        let superseded = store
+            .mark_ready("f1", "c1", Variant::Thumbnail, "ab/x-thumbnail.webp", "image/webp", 1, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(superseded, Some("ab/x-thumbnail.jpg".to_string()));
+
+        // 同じパスへの再生成では消してはいけない（今書いたファイルが消える）。
+        let same = store
+            .mark_ready("f1", "c1", Variant::Thumbnail, "ab/x-thumbnail.webp", "image/webp", 2, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(same, None);
+    }
+
+    /// ETag に混ぜるため、再生成で `updated_at` が進む必要がある。
+    #[tokio::test]
+    async fn mark_ready_advances_updated_at_on_regeneration() {
+        let store = CacheStore::open_in_memory().await.unwrap();
+        store
+            .mark_ready("f1", "c1", Variant::Preview, "a.jpg", "image/jpeg", 1, 1, 1)
+            .await
+            .unwrap();
+        let Lookup::Ready(first) = store.lookup("f1", "c1", Variant::Preview).await.unwrap() else {
+            panic!("expected Ready");
+        };
+
+        store
+            .mark_ready("f1", "c1", Variant::Preview, "a.jpg", "image/jpeg", 2, 1, 1)
+            .await
+            .unwrap();
+        let Lookup::Ready(second) = store.lookup("f1", "c1", Variant::Preview).await.unwrap() else {
+            panic!("expected Ready");
+        };
+
+        assert!(
+            second.updated_at > first.updated_at,
+            "同じコミットの再生成でも updated_at は進む（ETag の再検証に必要）"
+        );
     }
 
     #[tokio::test]

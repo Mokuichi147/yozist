@@ -133,7 +133,8 @@ impl JobHandler for PreviewJobHandler {
                     .unwrap_or(&g.path)
                     .to_string_lossy()
                     .to_string();
-                self.cache_store
+                let superseded = self
+                    .cache_store
                     .mark_ready(
                         &payload.file_id,
                         &payload.commit_id,
@@ -146,16 +147,49 @@ impl JobHandler for PreviewJobHandler {
                     )
                     .await
                     .map_err(|e| JobError::Retryable(e.to_string()))?;
+
+                // 生成パラメータの変更で拡張子が変わると、旧ファイルは DB から
+                // 参照されなくなりスイーパも辿れない。ここで消さないと孤児が残る。
+                if let Some(old_rel) = superseded {
+                    let old_path = cache_dir.join(&old_rel);
+                    match tokio::fs::remove_file(&old_path).await {
+                        Ok(()) => tracing::debug!("旧プレビューを削除: {old_rel}"),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => tracing::warn!("旧プレビューを削除できません {old_rel}: {e}"),
+                    }
+                }
                 Ok(())
             }
-            Err(GenError::Unsupported(msg)) => {
-                self.cache_store
-                    .mark_failed(&payload.file_id, &payload.commit_id, variant, &msg)
-                    .await
-                    .map_err(|e| JobError::Retryable(e.to_string()))?;
-                Err(JobError::Permanent(msg))
-            }
+            // `preview_cache` を `failed` にするのは `on_permanent_failure` に
+            // 一本化してある（恒久失敗の経路はここだけではないため）。
+            Err(GenError::Unsupported(msg)) => Err(JobError::Permanent(msg)),
             Err(GenError::Io(e)) => Err(JobError::Retryable(e.to_string())),
+        }
+    }
+
+    /// 生成が二度と行われないと確定したので、`preview_cache` も終端状態へ落とす。
+    ///
+    /// これを怠ると行は `pending` のまま残り、`get_preview` は「生成待ち」と
+    /// 解釈して要求のたびに新しいジョブを投入し続ける（dedup は未完了ジョブに
+    /// しか効かないため、恒久失敗した行では重複投入を止められない）。ディスク
+    /// 逼迫などで I/O が継続的に失敗する状況では、これが無いとジョブ行と再試行が
+    /// 際限なく増える。
+    ///
+    /// 一度 `failed` にした組み合わせは自動では再試行されない。環境要因を直した
+    /// 後は `cache-regenerate` で明示的に戻す。
+    async fn on_permanent_failure(&self, payload: &serde_json::Value, error: &str) {
+        let Ok(payload) = serde_json::from_value::<PreviewJobPayload>(payload.clone()) else {
+            return;
+        };
+        let Some(variant) = Variant::parse(&payload.variant) else {
+            return;
+        };
+        if let Err(e) = self
+            .cache_store
+            .mark_failed(&payload.file_id, &payload.commit_id, variant, error)
+            .await
+        {
+            tracing::warn!("プレビューキャッシュの恒久失敗を記録できません: {e}");
         }
     }
 }

@@ -1291,7 +1291,16 @@ async fn get_preview(
                     // バイト列を返すため、長期キャッシュ（immutable）は使えない。
                     // no-cache で「保存はするが毎回再検証」させ、変化が無ければ
                     // 304 で本文を省く。
-                    let etag = format!("\"{commit_id_s}-{}\"", variant.as_str());
+                    //
+                    // 生成時刻も混ぜる: 同じコミットでも生成パラメータを変えて
+                    // `cache-regenerate` すればバイト列は変わる。commit だけだと
+                    // ETag が据え置きになり、クライアントは 304 を受け取り続けて
+                    // 再生成後の版を永久に取得しない。
+                    let etag = format!(
+                        "\"{commit_id_s}-{}-{}\"",
+                        variant.as_str(),
+                        entry.updated_at
+                    );
                     if if_none_match_matches(&headers, &etag) {
                         let mut resp = StatusCode::NOT_MODIFIED.into_response();
                         set_preview_cache_headers(resp.headers_mut(), &etag);
@@ -4155,6 +4164,79 @@ mod tests {
         let resp = call_get_preview(state.clone(), &file.id.to_string(), headers).await;
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
         assert!(body_bytes(resp).await.is_empty());
+    }
+
+    /// 同じコミットのまま再生成（`cache-regenerate` で品質やフォーマットを変更）
+    /// すると、URL もコミットも変わらないままバイト列だけが変わる。ETag が
+    /// コミットだけに紐付いていると、クライアントは 304 を受け取り続けて
+    /// 再生成後の版を永久に取得しない。
+    #[tokio::test]
+    async fn get_preview_etag_changes_after_regeneration() {
+        let (state, _td) = make_state().await;
+        let (file, commit) = make_image_file(&state).await;
+        let file_id = file.id.to_string();
+        let commit_id = commit.id.to_string();
+
+        let write_variant = |rel: &'static str, body: &'static [u8], mime: &'static str| {
+            let state = state.clone();
+            let file_id = file_id.clone();
+            let commit_id = commit_id.clone();
+            async move {
+                let abs = state.cache_dir.join(rel);
+                tokio::fs::create_dir_all(abs.parent().unwrap()).await.unwrap();
+                tokio::fs::write(&abs, body).await.unwrap();
+                state
+                    .cache_store
+                    .mark_ready(
+                        &file_id,
+                        &commit_id,
+                        yozist_cache::Variant::Thumbnail,
+                        rel,
+                        mime,
+                        body.len() as i64,
+                        64,
+                        64,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        write_variant("ab/t.jpg", b"old-jpeg", "image/jpeg").await;
+        let first = call_get_preview(state.clone(), &file_id, Default::default()).await;
+        let first_etag = first
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // 同じコミットのまま WebP で再生成する。
+        let superseded = write_variant("ab/t.webp", b"new-webp", "image/webp").await;
+        assert_eq!(
+            superseded,
+            Some("ab/t.jpg".to_string()),
+            "拡張子が変わった旧ファイルは呼び出し側が削除できるよう返される"
+        );
+
+        // 旧 ETag を提示しても 304 にはならず、新しい本文が返る。
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::IF_NONE_MATCH,
+            axum::http::HeaderValue::from_str(&first_etag).unwrap(),
+        );
+        let second = call_get_preview(state.clone(), &file_id, headers).await;
+        assert_eq!(second.status(), StatusCode::OK, "再生成後は 304 を返さない");
+        let second_etag = second
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(first_etag, second_etag);
+        assert_eq!(body_bytes(second).await, b"new-webp");
     }
 
     #[tokio::test]

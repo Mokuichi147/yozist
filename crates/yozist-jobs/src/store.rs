@@ -55,6 +55,10 @@ const DEFAULT_MAX_ATTEMPTS: i64 = 3;
 /// 冪等なので実害は無い（無駄な再実行のみ）。
 pub const STALLED_LEASE: Duration = Duration::from_secs(10 * 60);
 
+/// 終端状態（done/failed）のジョブ行を保持する期間。過ぎた行は
+/// [`JobStore::purge_finished`] が削除する。障害調査に足りるだけ残す。
+pub const FINISHED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 pub struct JobStore {
     pool: SqlitePool,
 }
@@ -219,18 +223,24 @@ impl JobStore {
     }
 
     /// リトライ可能な失敗。試行回数が上限に達していれば恒久失敗として確定する。
-    pub async fn mark_failed_retry(&self, id: &str, error: &str) -> Result<(), JobsError> {
+    ///
+    /// 戻り値は「恒久失敗として確定したか」。`true` のとき、そのジョブはもう
+    /// 二度と実行されない。ドメイン側は自分の状態（`preview_cache` の行など）を
+    /// 終端状態へ落とす必要があるため、`JobRunner` はこれを見て
+    /// [`crate::JobHandler::on_permanent_failure`] を呼ぶ。
+    pub async fn mark_failed_retry(&self, id: &str, error: &str) -> Result<bool, JobsError> {
         let row = sqlx::query("SELECT attempts, max_attempts FROM jobs WHERE id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
         let Some(row) = row else {
-            return Ok(());
+            return Ok(false);
         };
         let attempts: i64 = row.try_get("attempts")?;
         let max_attempts: i64 = row.try_get("max_attempts")?;
         if attempts >= max_attempts {
-            return self.mark_failed_permanent(id, error).await;
+            self.mark_failed_permanent(id, error).await?;
+            return Ok(true);
         }
         let idx = ((attempts.max(1) - 1) as usize).min(RETRY_BACKOFF_SECS.len() - 1);
         let backoff_secs = RETRY_BACKOFF_SECS[idx];
@@ -245,7 +255,7 @@ impl JobStore {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(false)
     }
 
     pub async fn mark_failed_permanent(&self, id: &str, error: &str) -> Result<(), JobsError> {
@@ -277,6 +287,37 @@ impl JobStore {
         qb.push(")");
         let row = qb.build().fetch_one(&self.pool).await?;
         Ok(row.try_get("c")?)
+    }
+
+    /// 終端状態（done/failed）に落ちてから `retention` 以上経過した行を削除し、
+    /// 削除件数を返す。
+    ///
+    /// 完了ジョブは誰も読まないが、消さない限り単調に増え続ける（ファイル数 ×
+    /// variant 数だけ投入され、再生成のたびに増える）。障害調査のために直近は
+    /// 残したいので、期間で切る。
+    pub async fn purge_finished(&self, retention: Duration) -> Result<u64, JobsError> {
+        let cutoff = fmt_dt(
+            OffsetDateTime::now_utc() - time::Duration::seconds(retention.as_secs() as i64),
+        );
+        let result =
+            sqlx::query("DELETE FROM jobs WHERE status IN ('done', 'failed') AND updated_at < ?")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+impl JobStore {
+    /// テスト用: 指定 dedup_key のジョブを「次の claim で試行上限に達する」
+    /// 状態にする。バックオフ待ちを挟まずに枯渇まで進めるために使う。
+    pub(crate) async fn bump_attempts_to_max(&self, dedup_key: &str) {
+        sqlx::query("UPDATE jobs SET attempts = max_attempts WHERE dedup_key = ?")
+            .bind(dedup_key)
+            .execute(&self.pool)
+            .await
+            .unwrap();
     }
 }
 
@@ -481,6 +522,58 @@ mod tests {
 
         assert_eq!(store.reclaim_stalled(STALLED_LEASE).await.unwrap(), 0);
         assert!(store.claim_next(&["preview.generate"]).await.unwrap().is_none());
+    }
+
+    /// 完了ジョブは保持期間を過ぎたら消える。消さないとファイル数 × variant 数
+    /// のペースで単調に増え続ける。
+    #[tokio::test]
+    async fn purge_finished_removes_old_terminal_jobs_only() {
+        let store = JobStore::open_in_memory().await.unwrap();
+        for key in ["done-old", "failed-old", "pending-old"] {
+            store
+                .enqueue("preview.generate", Some(key), &json!({}))
+                .await
+                .unwrap();
+        }
+        let mut jobs = Vec::new();
+        for _ in 0..2 {
+            jobs.push(store.claim_next(&["preview.generate"]).await.unwrap().unwrap());
+        }
+        store.mark_done(&jobs[0].id).await.unwrap();
+        store.mark_failed_permanent(&jobs[1].id, "nope").await.unwrap();
+
+        // 保持期間が十分長ければ、終端状態でもまだ消さない。
+        assert_eq!(store.purge_finished(STALLED_LEASE).await.unwrap(), 0);
+        // 保持期間 0 なら done/failed だけが消え、未完了は残る。
+        assert_eq!(store.purge_finished(Duration::ZERO).await.unwrap(), 2);
+        assert_eq!(
+            store.count_incomplete(&["preview.generate"]).await.unwrap(),
+            1,
+            "未完了ジョブは保持期間に関係なく残す"
+        );
+    }
+
+    /// `mark_failed_retry` は「恒久失敗として確定したか」を返す。`JobRunner` が
+    /// これを見てドメイン側へ通知するので、境界を取り違えると通知が漏れる。
+    #[tokio::test]
+    async fn mark_failed_retry_reports_whether_it_became_permanent() {
+        let store = JobStore::open_in_memory().await.unwrap();
+        store
+            .enqueue("preview.generate", Some("k"), &json!({}))
+            .await
+            .unwrap();
+
+        let job = store.claim_next(&["preview.generate"]).await.unwrap().unwrap();
+        assert!(
+            !store.mark_failed_retry(&job.id, "transient").await.unwrap(),
+            "試行回数が残っていれば恒久失敗ではない"
+        );
+
+        store.bump_attempts_to_max("k").await;
+        assert!(
+            store.mark_failed_retry(&job.id, "disk full").await.unwrap(),
+            "上限に達したら恒久失敗として確定を報告する"
+        );
     }
 
     #[tokio::test]

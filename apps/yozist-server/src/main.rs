@@ -514,7 +514,14 @@ async fn sweep_stale_preview_cache(
 /// 生成中にプロセスが落ちると `PreviewGenerator` の中間 PNG（`.tmp-*.png`）が
 /// シャードディレクトリに残る。DB には現れないため通常のスイーパでは回収
 /// できないので、起動時にまとめて掃除する。
+///
+/// ただし「今まさに生成中のファイル」と「前回の残骸」は名前では区別できない。
+/// この関数は `serve` からも `cache-warm`/`cache-regenerate` からも呼ばれるため、
+/// 稼働中のサーバの傍らで CLI を叩くと生成途中の中間ファイルを消してしまい、
+/// 生成が I/O エラーとして失敗する。更新から十分に時間が経ったものだけを
+/// 残骸とみなす（判定基準は固着ジョブの回収と同じ猶予）。
 async fn sweep_leftover_temp_files(cache_dir: &Path) -> anyhow::Result<usize> {
+    let cutoff = std::time::SystemTime::now() - yozist_jobs::STALLED_LEASE;
     let mut removed = 0usize;
     let mut shards = match tokio::fs::read_dir(cache_dir).await {
         Ok(rd) => rd,
@@ -529,11 +536,24 @@ async fn sweep_leftover_temp_files(cache_dir: &Path) -> anyhow::Result<usize> {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".tmp-") && name.ends_with(".png") {
-                match tokio::fs::remove_file(entry.path()).await {
-                    Ok(()) => removed += 1,
-                    Err(e) => tracing::warn!("中間ファイルを削除できません {name}: {e}"),
+            if !name.starts_with(".tmp-") || !name.ends_with(".png") {
+                continue;
+            }
+            // mtime が取れないものは判断材料が無いので触らない（次回に持ち越す）。
+            let recent = match entry.metadata().await.and_then(|m| m.modified()) {
+                Ok(modified) => modified > cutoff,
+                Err(e) => {
+                    tracing::warn!("中間ファイルの更新時刻を取得できません {name}: {e}");
+                    true
                 }
+            };
+            if recent {
+                continue;
+            }
+            match tokio::fs::remove_file(entry.path()).await {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("中間ファイルを削除できません {name}: {e}"),
             }
         }
     }

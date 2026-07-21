@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod store;
-pub use store::{JobRecord, JobStatus, JobStore, STALLED_LEASE};
+pub use store::{JobRecord, JobStatus, JobStore, FINISHED_RETENTION, STALLED_LEASE};
 
 /// ジョブハンドラの実行結果エラー。
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +32,15 @@ pub enum JobError {
 #[async_trait]
 pub trait JobHandler: Send + Sync {
     async fn handle(&self, payload: &serde_json::Value) -> Result<(), JobError>;
+
+    /// このジョブがもう二度と実行されないと確定した時に呼ばれる
+    /// （`JobError::Permanent`、またはリトライ上限に達した `Retryable`）。
+    ///
+    /// ドメイン側が「生成中」を表す中間状態を持っている場合、それを終端状態へ
+    /// 落とすために使う。実装しないと、リトライ枯渇後もドメイン側は「生成待ち」
+    /// のままになり、要求のたびに新しいジョブを投入し続ける（dedup は未完了
+    /// ジョブにしか効かないため、恒久失敗した行は重複投入を止められない）。
+    async fn on_permanent_failure(&self, _payload: &serde_json::Value, _error: &str) {}
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +58,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 固着した `running` ジョブを回収する間隔（ワーカー 0 番のみが実行する）。
 const RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 終端状態のジョブ行を掃除する間隔（ワーカー 0 番のみが実行する）。
+/// 保持期間が日単位なので、頻繁に回しても消える行は無い。
+const PURGE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// `kind → JobHandler` の登録表とワーカー起動を担う。
 pub struct JobRunner {
@@ -132,15 +145,28 @@ impl JobRunner {
         }
     }
 
+    async fn purge_finished(&self) {
+        match self.store.purge_finished(store::FINISHED_RETENTION).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("保持期間を過ぎた完了ジョブを {n} 件削除"),
+            Err(e) => tracing::warn!("完了ジョブの削除に失敗: {e}"),
+        }
+    }
+
     async fn worker_loop(&self, worker_id: usize) {
         let kinds: Vec<&str> = self.handlers.keys().map(|s| s.as_str()).collect();
         let mut last_reclaim = tokio::time::Instant::now();
+        let mut last_purge = tokio::time::Instant::now();
         loop {
-            // ワーカー 0 番だけが定期回収を担う（全員でやっても同じ行を奪い合う
-            // だけで意味がない）。
+            // ワーカー 0 番だけが定期メンテナンスを担う（全員でやっても同じ行を
+            // 奪い合うだけで意味がない）。
             if worker_id == 0 && last_reclaim.elapsed() >= RECLAIM_INTERVAL {
                 self.reclaim_stalled().await;
                 last_reclaim = tokio::time::Instant::now();
+            }
+            if worker_id == 0 && last_purge.elapsed() >= PURGE_INTERVAL {
+                self.purge_finished().await;
+                last_purge = tokio::time::Instant::now();
             }
             match self.store.claim_next(&kinds).await {
                 Ok(Some(job)) => self.run_one(job).await,
@@ -168,8 +194,9 @@ impl JobRunner {
         // してジョブ処理が止まる。別タスクなら panic は JoinError として
         // 受け取れ、通常のリトライ経路に流せる。
         let handler = handler.clone();
+        let spawned = handler.clone();
         let payload = job.payload.clone();
-        let outcome = tokio::spawn(async move { handler.handle(&payload).await }).await;
+        let outcome = tokio::spawn(async move { spawned.handle(&payload).await }).await;
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -186,12 +213,128 @@ impl JobRunner {
                 if let Err(e) = self.store.mark_failed_permanent(&job.id, &msg).await {
                     tracing::warn!("failed to mark job {} failed: {e}", job.id);
                 }
+                handler.on_permanent_failure(&job.payload, &msg).await;
             }
             Err(JobError::Retryable(msg)) => {
-                if let Err(e) = self.store.mark_failed_retry(&job.id, &msg).await {
-                    tracing::warn!("failed to mark job {} for retry: {e}", job.id);
+                match self.store.mark_failed_retry(&job.id, &msg).await {
+                    // リトライ上限に達して恒久失敗が確定した。ドメイン側にも
+                    // 終端状態を伝えないと「生成待ち」のまま再投入され続ける。
+                    Ok(true) => handler.on_permanent_failure(&job.payload, &msg).await,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("failed to mark job {} for retry: {e}", job.id),
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    /// 常に指定のエラーを返し、恒久失敗の通知を記録するだけのハンドラ。
+    struct FailingHandler {
+        error: JobError,
+        permanent_failures: Mutex<Vec<String>>,
+    }
+
+    impl FailingHandler {
+        fn new(error: JobError) -> Arc<Self> {
+            Arc::new(Self {
+                error,
+                permanent_failures: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl JobHandler for FailingHandler {
+        async fn handle(&self, _payload: &serde_json::Value) -> Result<(), JobError> {
+            Err(match &self.error {
+                JobError::Permanent(m) => JobError::Permanent(m.clone()),
+                JobError::Retryable(m) => JobError::Retryable(m.clone()),
+            })
+        }
+
+        async fn on_permanent_failure(&self, payload: &serde_json::Value, error: &str) {
+            self.permanent_failures
+                .lock()
+                .unwrap()
+                .push(format!(
+                    "{}:{error}",
+                    payload["file_id"].as_str().unwrap_or_default()
+                ));
+        }
+    }
+
+    async fn drain_with(handler: Arc<FailingHandler>, store: Arc<JobStore>) {
+        let mut runner = JobRunner::new(store);
+        runner.register("t", handler);
+        Arc::new(runner).drain().await;
+    }
+
+    #[tokio::test]
+    async fn permanent_failure_notifies_handler() {
+        let store = Arc::new(JobStore::open_in_memory().await.unwrap());
+        store
+            .enqueue("t", None, &json!({"file_id": "f1"}))
+            .await
+            .unwrap();
+
+        let handler = FailingHandler::new(JobError::Permanent("unsupported".into()));
+        drain_with(handler.clone(), store).await;
+
+        assert_eq!(
+            *handler.permanent_failures.lock().unwrap(),
+            vec!["f1:unsupported".to_string()]
+        );
+    }
+
+    /// リトライ枯渇も恒久失敗であり、ドメイン側へ通知しなければならない。
+    /// 通知が無いとドメイン側は「生成待ち」のまま残り、要求のたびに新しい
+    /// ジョブを投入し続ける（dedup は未完了ジョブにしか効かない）。
+    #[tokio::test]
+    async fn retry_exhaustion_notifies_handler() {
+        let store = Arc::new(JobStore::open_in_memory().await.unwrap());
+        store
+            .enqueue("t", Some("f1:thumb"), &json!({"file_id": "f1"}))
+            .await
+            .unwrap();
+        // 次の claim で上限に達するよう試行回数を引き上げておく（バックオフの
+        // 待ち時間を挟まずに枯渇まで進めるため）。
+        store.bump_attempts_to_max("f1:thumb").await;
+
+        let handler = FailingHandler::new(JobError::Retryable("disk full".into()));
+        drain_with(handler.clone(), store.clone()).await;
+
+        assert_eq!(
+            *handler.permanent_failures.lock().unwrap(),
+            vec!["f1:disk full".to_string()],
+            "リトライ上限に達した Retryable も恒久失敗として通知される"
+        );
+        assert_eq!(store.count_incomplete(&["t"]).await.unwrap(), 0);
+    }
+
+    /// リトライ余地が残っているうちは恒久失敗を通知しない。
+    #[tokio::test]
+    async fn retryable_failure_does_not_notify_while_attempts_remain() {
+        let store = Arc::new(JobStore::open_in_memory().await.unwrap());
+        store
+            .enqueue("t", None, &json!({"file_id": "f1"}))
+            .await
+            .unwrap();
+
+        let handler = FailingHandler::new(JobError::Retryable("transient".into()));
+        let mut runner = JobRunner::new(store.clone());
+        runner.register("t", handler.clone());
+        let runner = Arc::new(runner);
+        // drain はバックオフ待ちを待ち続けるので、1 件だけ処理して打ち切る。
+        let job = store.claim_next(&["t"]).await.unwrap().unwrap();
+        runner.run_one(job).await;
+
+        assert!(handler.permanent_failures.lock().unwrap().is_empty());
+        assert_eq!(store.count_incomplete(&["t"]).await.unwrap(), 1);
     }
 }
