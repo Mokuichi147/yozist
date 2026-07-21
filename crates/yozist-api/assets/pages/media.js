@@ -393,10 +393,13 @@ function pumpQueue() {
  */
 async function loadItem(it) {
   try {
-    const r = await api(`/api/files/${it.file.id}/content`);
+    // グリッド表示用に軽量化キャッシュ（サムネイル）を使う。未キャッシュ時は
+    // サーバ側でオリジナルへ自動フォールバックする。キャッシュ変換で元 mime と
+    // 変わりうるため、実際の mime はレスポンスの Content-Type から得る。
+    const r = await api(`/api/files/${it.file.id}/preview?variant=thumbnail`);
     if (!r.ok) throw new Error(await r.text().catch(() => r.statusText));
     const buf = await r.arrayBuffer();
-    const mime = it.file.mime || 'image/jpeg';
+    const mime = r.headers.get('Content-Type') || it.file.mime || 'image/jpeg';
     const url = URL.createObjectURL(new Blob([buf], { type: mime }));
     it.objectUrl = url;
 

@@ -12,6 +12,8 @@ members = [
     "crates/yozist-ai",
     "crates/yozist-smb",
     "crates/yozist-api",
+    "crates/yozist-jobs",
+    "crates/yozist-cache",
     "apps/yozist-server",
 ]
 
@@ -33,6 +35,8 @@ yozist-auth = { path = "crates/yozist-auth" }
 yozist-ai = { path = "crates/yozist-ai" }
 yozist-smb = { path = "crates/yozist-smb" }
 yozist-api = { path = "crates/yozist-api" }
+yozist-jobs = { path = "crates/yozist-jobs" }
+yozist-cache = { path = "crates/yozist-cache" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
@@ -61,6 +65,11 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 sha2 = "0.10"
 zstd = "0.13"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+
+# プレビュー/サムネイル軽量化キャッシュ (yozist-cache)
+image = "0.25"
+# crates.io 未公開のため git 依存。再現性のためコミットを固定する。
+compressor = { git = "https://github.com/Mokuichi147/compressor", rev = "9ed289475c27bb7dabd871f4149e40e8cfcb6500" }
 
 # Diff / CRDT
 similar = "2.6"

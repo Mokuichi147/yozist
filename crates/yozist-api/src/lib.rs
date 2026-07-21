@@ -67,6 +67,15 @@ pub struct ApiState {
     pub view_registry: Arc<yozist_view::ViewRegistry>,
     /// データディレクトリ（DB / blob を格納）。ストレージ空き容量の問い合わせ先。
     pub data_dir: std::path::PathBuf,
+    /// サムネイル/プレビュー軽量化キャッシュの結果 DB（`preview_cache` テーブル）。
+    pub cache_store: Arc<yozist_cache::CacheStore>,
+    /// 軽量化ファイルの生成をバックグラウンドで実行するジョブキュー。
+    /// `kind = "preview.generate"` で投入する（実処理は `yozist-cache` の
+    /// `PreviewJobHandler` が担う）。
+    pub job_store: Arc<yozist_jobs::JobStore>,
+    /// キャッシュ実ファイルの保存先（SSD 等の高速ストレージを想定）。
+    /// `cache_store` の `rel_path` はこのディレクトリからの相対パス。
+    pub cache_dir: std::path::PathBuf,
 }
 
 /// 展開済み content の単一エントリキャッシュ（直近に読んだファイル）。
@@ -115,6 +124,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/api/files/:id/restore", post(restore_file))
         .route("/api/files/:id/content", get(get_content).post(commit_file))
+        .route("/api/files/:id/preview", get(get_preview))
         .route("/api/files/:id/history", get(history))
         .route("/api/files/:id/commits/:cid", get(read_commit))
         .route("/api/files/:id/commits/:cid/view", get(read_commit_view))
@@ -1134,21 +1144,30 @@ struct ContentQuery {
     utf8: Option<String>,
 }
 
-async fn get_content(
-    State(s): State<ApiState>,
-    AuthCtx(ctx): AuthCtx,
-    Path(id): Path<String>,
-    Query(q): Query<ContentQuery>,
-    headers: axum::http::HeaderMap,
-) -> Result<axum::response::Response, ApiError> {
-    let id = parse_file_id(&id)?;
-    require_permission(&*s.authz, &ctx, &Target::file(id), PermissionMask::READ).await?;
-    let file = s
-        .meta
+/// 読み取り権限チェック込みでファイルメタを取得する。`get_content`/`get_preview`
+/// で共有する。
+async fn require_read_file(
+    s: &ApiState,
+    ctx: &AuthContext,
+    id: FileId,
+) -> Result<FileMeta, ApiError> {
+    require_permission(&*s.authz, ctx, &Target::file(id), PermissionMask::READ).await?;
+    s.meta
         .get_file(&id)
         .await
         .map_err(ApiError::from_db)?
-        .ok_or(ApiError::NotFound)?;
+        .ok_or(ApiError::NotFound)
+}
+
+/// 展開済みオリジナル content から Range 対応レスポンスを組み立てる。
+/// `get_content` と、`get_preview` の未キャッシュ時フォールバックが共有する。
+async fn original_content_response(
+    s: &ApiState,
+    id: FileId,
+    file: &FileMeta,
+    want_utf8: bool,
+    range: Option<&axum::http::HeaderValue>,
+) -> Result<axum::response::Response, ApiError> {
     // 展開済み content をキャッシュから取得（なければ展開して保存）。
     // 連続した Range 取得（仮想スクロール）で blob の再展開を避ける。
     let bytes = match file.current_commit.and_then(|cid| s.content_cache.get(id, cid)) {
@@ -1166,19 +1185,128 @@ async fn get_content(
             arc
         }
     };
-    let range = headers.get(axum::http::header::RANGE);
-    let want_utf8 = q.utf8.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
     if want_utf8 {
         // blob は常に UTF-8。charset 再エンコードせず生のまま、必要範囲だけ返す。
-        let mut ct = file.mime.unwrap_or_else(|| "text/plain".to_string());
+        let mut ct = file.mime.clone().unwrap_or_else(|| "text/plain".to_string());
         if !ct.to_ascii_lowercase().contains("charset=") {
             ct = format!("{ct}; charset=utf-8");
         }
         Ok(range_response(ct, &bytes, range))
     } else {
         // charset 再エンコードが必要な経路（ダウンロード/メディア/互換）。
-        let (ct, body) = encode_content(file.mime, file.charset, (*bytes).clone());
+        let (ct, body) = encode_content(file.mime.clone(), file.charset.clone(), (*bytes).clone());
         Ok(range_response(ct, &body, range))
+    }
+}
+
+async fn get_content(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Query(q): Query<ContentQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let id = parse_file_id(&id)?;
+    let file = require_read_file(&s, &ctx, id).await?;
+    let range = headers.get(axum::http::header::RANGE);
+    let want_utf8 = q.utf8.as_deref().is_some_and(|v| !v.is_empty() && v != "0");
+    original_content_response(&s, id, &file, want_utf8, range).await
+}
+
+#[derive(Deserialize)]
+struct PreviewQuery {
+    /// `thumbnail`（一覧用の小さい版）または `preview`（詳細ページ用の大きい版）。
+    /// 省略時は `preview`。
+    variant: Option<String>,
+}
+
+/// 軽量化キャッシュが `ready` なら圧縮済みファイルを、そうでなければ
+/// オリジナルを返しつつ生成ジョブを投入する（リクエストはブロックしない）。
+/// 画像以外の mime は常にオリジナルへフォールバックする（現状は画像のみ対応）。
+async fn get_preview(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+    Query(q): Query<PreviewQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let id = parse_file_id(&id)?;
+    let file = require_read_file(&s, &ctx, id).await?;
+    let range = headers.get(axum::http::header::RANGE);
+    let variant = q
+        .variant
+        .as_deref()
+        .and_then(yozist_cache::Variant::parse)
+        .unwrap_or(yozist_cache::Variant::Preview);
+
+    let is_image = file
+        .mime
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"));
+
+    if is_image {
+        if let Some(commit_id) = file.current_commit {
+            let file_id_s = id.to_string();
+            let commit_id_s = commit_id.to_string();
+            match s.cache_store.lookup(&file_id_s, &commit_id_s, variant).await {
+                Ok(yozist_cache::Lookup::Ready(entry)) => {
+                    let path = s.cache_dir.join(&entry.rel_path);
+                    if let Ok(bytes) = tokio::fs::read(&path).await {
+                        let mut resp = range_response(entry.mime, &bytes, range);
+                        let hmap = resp.headers_mut();
+                        hmap.insert(
+                            axum::http::header::CACHE_CONTROL,
+                            axum::http::HeaderValue::from_static(
+                                "public, max-age=31536000, immutable",
+                            ),
+                        );
+                        if let Ok(etag) = axum::http::HeaderValue::from_str(&format!(
+                            "\"{commit_id_s}-{}\"",
+                            variant.as_str()
+                        )) {
+                            hmap.insert(axum::http::header::ETAG, etag);
+                        }
+                        return Ok(resp);
+                    }
+                    // キャッシュ行はあるが実ファイルが読めない（削除された等）。
+                    // フォールバックしつつ再投入する。
+                    enqueue_preview_job(&s, &file_id_s, &commit_id_s, variant).await;
+                }
+                Ok(yozist_cache::Lookup::Missing) | Ok(yozist_cache::Lookup::Pending) => {
+                    enqueue_preview_job(&s, &file_id_s, &commit_id_s, variant).await;
+                }
+                Ok(yozist_cache::Lookup::Failed(_)) => {
+                    // 恒久失敗は再投入しない（無限リトライ防止）。
+                }
+                Err(e) => {
+                    tracing::warn!("preview cache lookup failed: {e}");
+                }
+            }
+        }
+    }
+
+    original_content_response(&s, id, &file, false, range).await
+}
+
+/// プレビュー生成ジョブを投入する。同一 (file_id, commit_id, variant) の
+/// 重複投入は `JobStore::enqueue` の dedup_key で防がれる。
+async fn enqueue_preview_job(
+    s: &ApiState,
+    file_id: &str,
+    commit_id: &str,
+    variant: yozist_cache::Variant,
+) {
+    let dedup_key = yozist_cache::PreviewJobPayload::dedup_key(file_id, commit_id, variant);
+    let payload = yozist_cache::PreviewJobPayload::new(file_id, commit_id, variant);
+    if let Err(e) = s
+        .job_store
+        .enqueue("preview.generate", Some(&dedup_key), &payload)
+        .await
+    {
+        tracing::warn!("failed to enqueue preview job: {e}");
+    }
+    if let Err(e) = s.cache_store.mark_pending(file_id, commit_id, variant).await {
+        tracing::warn!("failed to mark preview cache pending: {e}");
     }
 }
 
@@ -3809,6 +3937,9 @@ mod tests {
                 content_cache: Arc::new(ContentCache::default()),
                 view_registry: Arc::new(yozist_view::ViewRegistry::with_defaults()),
                 data_dir: dir.path().to_path_buf(),
+                cache_store: Arc::new(yozist_cache::CacheStore::open_in_memory().await.unwrap()),
+                job_store: Arc::new(yozist_jobs::JobStore::open_in_memory().await.unwrap()),
+                cache_dir: dir.path().join("cache"),
             },
             dir,
         )

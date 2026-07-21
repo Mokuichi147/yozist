@@ -1,0 +1,21 @@
+[package]
+name = "yozist-jobs"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "yozist: generic background job queue (SQLite-backed, pluggable handlers)."
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
