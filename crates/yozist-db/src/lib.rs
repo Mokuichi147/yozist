@@ -46,8 +46,25 @@ pub trait MetaStore: Send + Sync {
     // ---- files ----
     async fn insert_file(&self, meta: &FileMeta) -> Result<(), DbError>;
     async fn get_file(&self, id: &FileId) -> Result<Option<FileMeta>, DbError>;
+    /// 複数 ID をまとめて引く。`get_file` と同じく論理削除済みも返し、存在しない
+    /// ID は結果から落ちる（順序も入力順とは限らない）。
+    ///
+    /// 「多数の ID について現在の状態を知りたい」バッチ処理（プレビュー
+    /// キャッシュの掃除など）が 1 件ずつ `get_file` を呼んで N+1 になるのを防ぐ。
+    async fn get_files(&self, ids: &[FileId]) -> Result<Vec<FileMeta>, DbError>;
     async fn update_file(&self, meta: &FileMeta) -> Result<(), DbError>;
     async fn list_files(&self, limit: u32, offset: u32) -> Result<Vec<FileMeta>, DbError>;
+    /// ID 順のキーセットページング。`after` より大きい ID を `limit` 件返す
+    /// （`None` なら先頭から）。論理削除済みは含めない。
+    ///
+    /// 全件を走査するバッチ処理向け。`list_files` の OFFSET ページングは
+    /// `updated_at` 順のため、走査中にコミットが入ると行が順序ごと移動して
+    /// 取りこぼしが出る。ID 順なら走査中の更新に影響されない。
+    async fn list_files_after(
+        &self,
+        after: Option<&FileId>,
+        limit: u32,
+    ) -> Result<Vec<FileMeta>, DbError>;
     /// ソートキー・昇降順を指定した一覧。ページングと組み合わせて WebUI が使う。
     async fn list_files_sorted(
         &self,

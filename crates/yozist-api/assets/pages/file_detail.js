@@ -298,10 +298,25 @@ async function fetchContentBytes() {
   return r.arrayBuffer();
 }
 
+// インライン表示専用。画像は軽量化キャッシュ（/preview）を使い、未キャッシュ時は
+// サーバ側でオリジナルへ自動フォールバックする。生成されたバイト列の実際の
+// mime はレスポンスの Content-Type から得る（キャッシュ変換で元 mime と
+// 変わりうるため、渡された mime をそのまま Blob に付けない）。
+async function fetchInlineContent(mime) {
+  const isImage = !!mime && mime.startsWith('image/');
+  const path = isImage
+    ? `/api/files/${fileId}/preview?variant=preview`
+    : `/api/files/${fileId}/content`;
+  const r = await api(path);
+  if (!r.ok) throw new Error((await r.text().catch(() => '')) || r.statusText);
+  const buf = await r.arrayBuffer();
+  return { buf, mime: r.headers.get('Content-Type') || mime };
+}
+
 async function objectUrlFor(mime) {
-  const buf = await fetchContentBytes();
+  const { buf, mime: actualMime } = await fetchInlineContent(mime);
   revokeContentUrl();
-  contentObjectUrl = URL.createObjectURL(new Blob([buf], { type: mime }));
+  contentObjectUrl = URL.createObjectURL(new Blob([buf], { type: actualMime }));
   return contentObjectUrl;
 }
 
