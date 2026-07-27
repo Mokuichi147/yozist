@@ -36,16 +36,18 @@ async function loadTags() {
   }
 }
 
-// 選択中の基準・方向で tags を並べ替える。件数が同じ場合は名前で安定させる。
+// 選択中の基準・方向で tags を並べ替える。既定は「件数の降順 → 名前の昇順」。
 function sortTags() {
   const key = /** @type {HTMLSelectElement} */ ($('sort-key')).value;
   const sign = /** @type {HTMLSelectElement} */ ($('sort-dir')).value === 'desc' ? -1 : 1;
   tags.sort((a, b) => {
-    let d;
-    if (key === 'count') d = a.count - b.count;
-    else d = a.name.localeCompare(b.name, 'ja');
-    if (d === 0 && key !== 'name') d = a.name.localeCompare(b.name, 'ja');
-    return d * sign;
+    const primary = key === 'count'
+      ? a.count - b.count
+      : a.name.localeCompare(b.name, 'ja');
+    if (primary !== 0) return primary * sign;
+    // 副キーの名前は方向によらず常に昇順。ここに sign を掛けると、件数の降順
+    // （既定）のときだけ同数のタグが名前の逆順に並び、目当ての名前を探しにくい。
+    return a.name.localeCompare(b.name, 'ja');
   });
 }
 

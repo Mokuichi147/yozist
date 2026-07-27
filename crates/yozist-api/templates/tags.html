@@ -7,13 +7,14 @@
   <!-- 並べ替えは両方のリストに効く（同じ基準で見比べられるようにする） -->
   <div class="flex items-center gap-2">
     <span class="text-xs opacity-60 shrink-0 whitespace-nowrap">並べ替え</span>
+    <!-- 既定は「件数の降順 → 名前の昇順」。よく使うタグから見えるようにする。 -->
     <select id="sort-key" class="select select-bordered select-xs flex-1 min-w-0 max-w-32" onchange="onSortKeyChange()">
+      <option value="count" selected>件数</option>
       <option value="name">名前</option>
-      <option value="count">件数</option>
     </select>
     <select id="sort-dir" class="select select-bordered select-xs flex-1 min-w-0 max-w-32" onchange="applySort()">
+      <option value="desc" selected>降順</option>
       <option value="asc">昇順</option>
-      <option value="desc">降順</option>
     </select>
     <span class="flex-1"></span>
     <button class="btn btn-xs btn-ghost" onclick="loadTags()">更新</button>
