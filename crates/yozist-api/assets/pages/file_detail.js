@@ -10,6 +10,9 @@ let contentObjectUrl = null;  // メディアプレビュー用の object URL
 let allTags = [];             // 全タグ（割り当て数の多い順）
 let assignedTags = [];        // このファイルに割り当て済みのタグ
 let assignedTagIds = new Set(); // このファイルに割り当て済みのタグ ID
+let aiTagIds = new Set();       // AI が所有するタグ ID（手動タグ欄から除外する）
+let aiPollTimer = null;         // 生成待ちのポーリング用タイマー
+let aiPollLeft = 0;             // 残りポーリング回数
 let seriesOptions = [];         // 候補シリーズ（自分が閲覧可能なもの。名前→ID 解決に使う）
 let fileSeries = [];            // このファイルが所属するシリーズ（コンテンツ両端の前後遷移に使う）
 
@@ -165,7 +168,14 @@ async function loadDetail() {
     metaRow('current_commit', currentFile.current_commit, true),
   ]));
   $('fd-share').textContent = '';
-  await Promise.all([loadTags(), loadHistory(), loadFileSeries(), renderContent()]);
+  // AI タグを先に引く。手動タグ欄は AI 所有のタグ ID を除外して描画するため、
+  // 逆順だと一瞬 AI タグが手動タグとして（削除可能な見た目で）出てしまう。
+  await Promise.all([
+    loadAiTags().then(loadTags),
+    loadHistory(),
+    loadFileSeries(),
+    renderContent(),
+  ]);
 }
 
 // 種別ごとのバッジ配色（files 一覧と統一。ダークでも視認できるよう塗りつぶし）
@@ -202,9 +212,11 @@ function renderTags() {
   const q = /** @type {HTMLInputElement} */ ($('fd-add-tag')).value.trim().toLowerCase();
 
   // 割り当て済み（選択済み）。システムタグ（ext:/type: 等）は自動付与で詳細情報に
-  // MIME 等として表示されるため、タグカードには出さない。
+  // MIME 等として表示されるため、タグカードには出さない。AI タグは専用カードに
+  // 出すのでここでは除く。除外は kind ではなく所有（aiTagIds）で判定する:
+  // 同名の手動タグと衝突すると kind は manual へ昇格しうるため。
   const assigned = assignedTags
-    .filter(t => t.kind !== 'system')
+    .filter(t => t.kind !== 'system' && !aiTagIds.has(t.id))
     .map(t =>
       // 手動/AI タグはバッジ全体をクリックで削除（当たり判定を広く取る）
       el('button', {
@@ -215,9 +227,13 @@ function renderTags() {
       }, [t.name + tagIcon(t.kind), el('span', { class: 'leading-none opacity-70' }, '×')])
     );
 
-  // 候補（未選択）。システムタグ・割り当て済みは除外し、入力でフィルター。
+  // 候補（未選択）。システムタグ・AI タグ・割り当て済みは除外し、入力で
+  // フィルター。AI タグを候補に出すと「触れないはずのタグ」を手で付けられる
+  // ことになり、AI タグカードとの住み分けが崩れる（同じ名前を使いたければ
+  // 入力欄から手動タグとして作れる）。
   const cands = allTags.filter(t =>
     t.kind !== 'system' &&
+    t.kind !== 'ai' &&
     !assignedTagIds.has(t.id) &&
     (q === '' || t.name.toLowerCase().includes(q))
   );
@@ -246,6 +262,108 @@ async function assignExistingTag(tagId) {
   if (!r.ok) { uiToast('タグ追加に失敗しました: ' + await r.text(), 'error'); return; }
   /** @type {HTMLInputElement} */ ($('fd-add-tag')).value = '';
   await loadTags();
+}
+
+// --- AI 自動タグ ---
+// 生成待ちの間だけポーリングする。1 枚あたり数十秒かかるので、投入して画面を
+// 見ている利用者に結果が届くようにする。
+const AI_POLL_INTERVAL_MS = 3000;
+const AI_POLL_MAX = 40; // 約 2 分で打ち切る（それ以上は再読込に任せる）
+
+async function loadAiTags() {
+  let info;
+  try {
+    info = await json(`/api/files/${fileId}/ai-tags`);
+  } catch (e) {
+    // AI タグが引けなくてもページ自体は使えるべきなので、カードを隠すだけ。
+    aiTagIds = new Set();
+    $('fd-ai-card').classList.add('hidden');
+    return;
+  }
+  aiTagIds = new Set(info.tags.map(t => t.id));
+  renderAiTags(info);
+}
+
+function renderAiTags(info) {
+  const card = $('fd-ai-card');
+  if (!card) return;
+  if (!info.enabled) {
+    card.classList.add('hidden');
+    stopAiPolling();
+    return;
+  }
+  card.classList.remove('hidden');
+
+  const status = info.run ? info.run.status : null;
+  const box = $('fd-ai-tags');
+  // AI タグはクリックできない（外すには再生成する）。button ではなく span で
+  // 描画して、押せそうな見た目にしない。
+  const badges = info.tags.map(t =>
+    el('span', {
+      class: 'badge badge-sm badge-warning gap-1',
+      title: `AI 生成タグ（${t.model}` +
+        (t.confidence == null ? '' : ` / 確度 ${Math.round(t.confidence * 100)}%`) +
+        '）。再生成でのみ更新されます',
+    }, t.name + ' 🤖')
+  );
+  if (badges.length === 0) {
+    box.replaceChildren(el('span', { class: 'opacity-50 text-xs' },
+      status === 'pending' ? '' : 'タグなし'));
+  } else {
+    box.replaceChildren(...badges);
+  }
+
+  const line = $('fd-ai-status');
+  const btn = /** @type {HTMLButtonElement} */ ($('fd-ai-regen'));
+  if (status === 'pending') {
+    line.replaceChildren(
+      el('span', { class: 'loading loading-spinner loading-xs align-middle mr-1' }),
+      '生成中…'
+    );
+    btn.disabled = true;
+    startAiPolling();
+    return;
+  }
+
+  btn.disabled = false;
+  stopAiPolling();
+  if (status === 'failed') {
+    line.replaceChildren(el('span', { class: 'text-error' },
+      '生成に失敗しました: ' + (info.run.error || '(理由不明)')));
+  } else if (info.stale) {
+    // モデルを差し替えた／内容を更新した後。付け直せることを伝える。
+    line.replaceChildren(
+      `生成時: ${info.run.model} / 現在: ${info.current_model}。再生成できます`
+    );
+  } else if (info.run) {
+    line.replaceChildren(`${info.run.model} で生成`);
+  } else {
+    line.replaceChildren('未生成');
+  }
+}
+
+function startAiPolling() {
+  if (aiPollTimer) return;
+  aiPollLeft = AI_POLL_MAX;
+  aiPollTimer = setInterval(async () => {
+    if (aiPollLeft-- <= 0) { stopAiPolling(); return; }
+    await loadAiTags();
+    // 生成が終わっていれば手動タグ欄の除外集合も更新が要る。
+    await loadTags();
+  }, AI_POLL_INTERVAL_MS);
+}
+
+function stopAiPolling() {
+  if (!aiPollTimer) return;
+  clearInterval(aiPollTimer);
+  aiPollTimer = null;
+}
+
+async function regenerateAiTags() {
+  const r = await api(`/api/files/${fileId}/ai-tags/regenerate`, { method: 'POST' });
+  if (!r.ok) { uiToast('再生成を開始できません: ' + await r.text(), 'error'); return; }
+  uiToast('AI タグの再生成を開始しました', 'success');
+  await loadAiTags();
 }
 
 async function loadHistory() {
@@ -1237,6 +1355,7 @@ Object.assign(window, {
   startRename, toggleEdit, saveEdit, uploadContent, downloadContent,
   deleteFile, restoreFile,
   renderTags, addTag, addToSeries,
+  regenerateAiTags,
   issueShare, grantPermission,
 });
 })();

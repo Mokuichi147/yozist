@@ -112,6 +112,19 @@
         </div>
       </div>
 
+      <!-- AI 自動タグ。サーバ側で AI が無効なら JS がカードごと隠す。 -->
+      <div id="fd-ai-card" class="card bg-base-100 shadow-sm hidden">
+        <div class="card-body p-4">
+          <div class="flex items-center justify-between gap-2">
+            <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">AI タグ</h3>
+            <button id="fd-ai-regen" class="btn btn-xs btn-ghost"
+                    onclick="regenerateAiTags()">再生成</button>
+          </div>
+          <div id="fd-ai-tags" class="flex flex-wrap gap-2 mt-1"></div>
+          <div id="fd-ai-status" class="text-xs opacity-60"></div>
+        </div>
+      </div>
+
       <div class="card bg-base-100 shadow-sm">
         <div class="card-body p-4">
           <h3 class="text-xs uppercase tracking-wider opacity-60 font-semibold">シリーズ</h3>

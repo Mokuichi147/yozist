@@ -20,7 +20,7 @@ use yozist_core::{
     Series, SeriesId, SeriesMember, SeriesSort, Tag, TagId, TagKind,
 };
 
-use crate::{DbError, FileSort, MetaStore};
+use crate::{AiFileTag, AiTagRun, AiTagScope, AiTagStatus, DbError, FileSort, MetaStore};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -60,6 +60,40 @@ impl SqliteMetaStore {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// `ai_tag_runs` の 1 行を upsert する（`mark_ai_tag_*` の共通実装）。
+    /// `created_at` は最初の生成時刻を保つため、更新時は据え置く。
+    async fn upsert_ai_tag_run(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+        status: AiTagStatus,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
+        let now = fmt_dt(time::OffsetDateTime::now_utc());
+        sqlx::query(
+            "INSERT INTO ai_tag_runs
+             (file_id, commit_id, model, status, error, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(file_id) DO UPDATE SET
+                 commit_id = excluded.commit_id,
+                 model = excluded.model,
+                 status = excluded.status,
+                 error = excluded.error,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(file.to_string())
+        .bind(commit.to_string())
+        .bind(model)
+        .bind(status.as_str())
+        .bind(error)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 
@@ -143,6 +177,79 @@ fn row_to_tag(row: SqliteRow) -> Result<Tag, DbError> {
         name,
         kind: parse_tag_kind(&kind)?,
         confidence,
+    })
+}
+
+/// AI タグ付け直し対象の SQL を組み立てる（一覧と件数で条件を共有するため）。
+/// 戻り値は `(sql, pending 見捨て判定の基準時刻)`。
+///
+/// - Missing: 記録なし / 恒久失敗 / キューを失って取り残された pending
+/// - Stale: それに加えて別モデル生成分と、生成後に再コミットされた分
+/// - All: 条件なし
+fn ai_tag_target_query(scope: AiTagScope, select: &str, tail: &str) -> (String, String) {
+    let cutoff = fmt_dt(time::OffsetDateTime::now_utc() - crate::AI_TAG_PENDING_LEASE);
+    let missing = "(r.file_id IS NULL \
+                    OR r.status = 'failed' \
+                    OR (r.status = 'pending' AND r.updated_at < ?))";
+    let cond = match scope {
+        AiTagScope::All => "1 = 1".to_string(),
+        AiTagScope::Missing => missing.to_string(),
+        AiTagScope::Stale => {
+            format!("({missing} OR r.model != ? OR r.commit_id != f.current_commit)")
+        }
+    };
+    let sql = format!(
+        "{select}
+         FROM files f
+         LEFT JOIN ai_tag_runs r ON r.file_id = f.id
+         WHERE f.deleted = 0
+           AND f.mime LIKE 'image/%'
+           AND f.current_commit IS NOT NULL
+           AND {cond}{tail}"
+    );
+    (sql, cutoff)
+}
+
+/// `ai_tag_target_query` が作った SQL のプレースホルダを埋める。
+fn bind_ai_tag_target_params<'q>(
+    q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    scope: AiTagScope,
+    cutoff: &'q str,
+    current_model: &'q str,
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+    let mut q = q;
+    if matches!(scope, AiTagScope::Missing | AiTagScope::Stale) {
+        q = q.bind(cutoff);
+    }
+    if matches!(scope, AiTagScope::Stale) {
+        q = q.bind(current_model);
+    }
+    q
+}
+
+fn parse_ai_tag_status(s: &str) -> Result<AiTagStatus, DbError> {
+    match s {
+        "pending" => Ok(AiTagStatus::Pending),
+        "ready" => Ok(AiTagStatus::Ready),
+        "failed" => Ok(AiTagStatus::Failed),
+        other => Err(DbError::Invalid(format!("unknown ai tag status: {other}"))),
+    }
+}
+
+fn row_to_ai_tag_run(row: SqliteRow) -> Result<AiTagRun, DbError> {
+    let file_id: String = row.try_get("file_id")?;
+    let commit_id: String = row.try_get("commit_id")?;
+    let model: String = row.try_get("model")?;
+    let status: String = row.try_get("status")?;
+    let error: Option<String> = row.try_get("error")?;
+    let updated_at: String = row.try_get("updated_at")?;
+    Ok(AiTagRun {
+        file_id: FileId::from_uuid(parse_uuid(&file_id)?),
+        commit_id: CommitId::from_uuid(parse_uuid(&commit_id)?),
+        model,
+        status: parse_ai_tag_status(&status)?,
+        error,
+        updated_at: parse_dt(&updated_at)?,
     })
 }
 
@@ -656,6 +763,181 @@ impl MetaStore for SqliteMetaStore {
         rows.into_iter().map(row_to_file).collect()
     }
 
+    // ---- AI 自動タグ ----
+
+    async fn get_ai_tag_run(&self, file: &FileId) -> Result<Option<AiTagRun>, DbError> {
+        let row = sqlx::query(
+            "SELECT file_id, commit_id, model, status, error, updated_at
+             FROM ai_tag_runs WHERE file_id = ?",
+        )
+        .bind(file.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_ai_tag_run).transpose()
+    }
+
+    async fn mark_ai_tag_pending(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+    ) -> Result<(), DbError> {
+        // 生成待ちへ戻す時は前回の error を消す。残すと UI が「失敗」と「生成中」を
+        // 同時に表示することになる。
+        self.upsert_ai_tag_run(file, commit, model, AiTagStatus::Pending, None)
+            .await
+    }
+
+    async fn mark_ai_tag_ready(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+    ) -> Result<(), DbError> {
+        self.upsert_ai_tag_run(file, commit, model, AiTagStatus::Ready, None)
+            .await
+    }
+
+    async fn mark_ai_tag_failed(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+        error: &str,
+    ) -> Result<(), DbError> {
+        self.upsert_ai_tag_run(file, commit, model, AiTagStatus::Failed, Some(error))
+            .await
+    }
+
+    async fn replace_ai_file_tags(
+        &self,
+        file: &FileId,
+        model: &str,
+        tags: &[AiFileTag],
+    ) -> Result<(), DbError> {
+        let file_s = file.to_string();
+        let now = fmt_dt(time::OffsetDateTime::now_utc());
+        // AI タグ生成は複数ワーカーが並列に走る。deferred transaction
+        // （SELECT 相当で開始 → DELETE で書き込みへ昇格）だと、2 本が同時に
+        // 昇格しようとして busy_timeout を待たずに "database is locked" になる。
+        // 開始時点で書き込みロックを取り、待ち合わせは busy_timeout に委ねる。
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // 旧 AI タグを file_tags からも外す。file_tags は付与者を持たないので、
+        // ai_file_tags に載っている組み合わせだけを対象にする（同名の手動タグを
+        // 巻き込まないための唯一の手掛かり）。
+        sqlx::query(
+            "DELETE FROM file_tags
+             WHERE file_id = ?
+               AND tag_id IN (SELECT tag_id FROM ai_file_tags WHERE file_id = ?)",
+        )
+        .bind(&file_s)
+        .bind(&file_s)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM ai_file_tags WHERE file_id = ?")
+            .bind(&file_s)
+            .execute(&mut *tx)
+            .await?;
+
+        for t in tags {
+            let tag_s = t.tag_id.to_string();
+            sqlx::query("INSERT OR IGNORE INTO file_tags (file_id, tag_id) VALUES (?, ?)")
+                .bind(&file_s)
+                .bind(&tag_s)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT OR REPLACE INTO ai_file_tags
+                 (file_id, tag_id, model, raw_name, confidence, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&file_s)
+            .bind(&tag_s)
+            .bind(model)
+            .bind(&t.raw_name)
+            .bind(t.confidence)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_ai_file_tags(
+        &self,
+        file: &FileId,
+    ) -> Result<Vec<(Tag, String, Option<f32>)>, DbError> {
+        let rows = sqlx::query(
+            r#"SELECT t.id, t.name, t.kind, t.confidence,
+                      a.model AS ai_model, a.confidence AS ai_confidence
+               FROM ai_file_tags a
+               JOIN tags t ON t.id = a.tag_id
+               WHERE a.file_id = ?
+               ORDER BY a.confidence DESC, t.name ASC"#,
+        )
+        .bind(file.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                let model: String = row.try_get("ai_model")?;
+                let confidence: Option<f32> = row.try_get("ai_confidence")?;
+                Ok((row_to_tag(row)?, model, confidence))
+            })
+            .collect()
+    }
+
+    async fn is_ai_file_tag(&self, file: &FileId, tag: &TagId) -> Result<bool, DbError> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM ai_file_tags WHERE file_id = ? AND tag_id = ?")
+                .bind(file.to_string())
+                .bind(tag.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    async fn list_ai_tag_targets(
+        &self,
+        scope: AiTagScope,
+        current_model: &str,
+    ) -> Result<Vec<(FileId, CommitId)>, DbError> {
+        let (sql, cutoff) = ai_tag_target_query(
+            scope,
+            "SELECT f.id AS file_id, f.current_commit AS commit_id",
+            " ORDER BY f.id",
+        );
+        let rows = bind_ai_tag_target_params(sqlx::query(&sql), scope, &cutoff, current_model)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let file_id: String = row.try_get("file_id")?;
+                let commit_id: String = row.try_get("commit_id")?;
+                Ok((
+                    FileId::from_uuid(parse_uuid(&file_id)?),
+                    CommitId::from_uuid(parse_uuid(&commit_id)?),
+                ))
+            })
+            .collect()
+    }
+
+    async fn count_ai_tag_targets(
+        &self,
+        scope: AiTagScope,
+        current_model: &str,
+    ) -> Result<u64, DbError> {
+        let (sql, cutoff) = ai_tag_target_query(scope, "SELECT COUNT(*) AS n", "");
+        let row = bind_ai_tag_target_params(sqlx::query(&sql), scope, &cutoff, current_model)
+            .fetch_one(&self.pool)
+            .await?;
+        let n: i64 = row.try_get("n")?;
+        Ok(n.max(0) as u64)
+    }
+
     async fn upsert_series(&self, series: &Series) -> Result<SeriesId, DbError> {
         if let Some((existing_id,)) =
             sqlx::query_as::<_, (String,)>("SELECT id FROM series WHERE name = ?")
@@ -950,8 +1232,11 @@ impl MetaStore for SqliteMetaStore {
         tags: &str,
         content: &str,
     ) -> Result<(), DbError> {
-        // FTS5 では UPSERT が無いので DELETE → INSERT
-        let mut tx = self.pool.begin().await?;
+        // FTS5 では UPSERT が無いので DELETE → INSERT。
+        // AI タグ生成の並列ワーカーがタグ差し替えの直後にここへ来るため、
+        // deferred だと書き込み昇格が競合して "database is locked" で落ちる
+        // （失敗は握り潰される＝検索インデックスだけ古いまま残る）。
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("DELETE FROM files_fts WHERE file_id = ?")
             .bind(file.to_string())
             .execute(&mut *tx)
@@ -1819,5 +2104,258 @@ mod tests {
         s.insert_file(&g).await.unwrap();
         s.upsert_fts(&g.id, "b.txt", "", "percent なし").await.unwrap();
         assert_eq!(s.search_fts("0%", 10).await.unwrap(), vec![f.id]);
+    }
+
+    // ---- AI 自動タグ ----
+
+    /// 画像 mime と current_commit を持つファイルを実際に挿入する
+    /// （AI タグの対象になる条件）。`files.current_commit` は commits への FK
+    /// なので、コミット行も併せて作る。
+    async fn insert_image(s: &SqliteMetaStore, name: &str) -> FileMeta {
+        insert_committed(s, name, "image/jpeg").await
+    }
+
+    async fn insert_committed(s: &SqliteMetaStore, name: &str, mime: &str) -> FileMeta {
+        let mut f = sample_file();
+        f.display_name = name.into();
+        f.mime = Some(mime.into());
+        f.current_commit = None;
+        s.insert_file(&f).await.unwrap();
+
+        let commit = Commit {
+            id: CommitId::new(),
+            file_id: f.id,
+            parent: None,
+            actor: ActorId::new(),
+            blob: BlobId::from_hex("aa"),
+            format_id: mime.into(),
+            timestamp: OffsetDateTime::now_utc(),
+            message: None,
+            size: 0,
+            committed_by: None,
+            committed_by_user_id: None,
+            delta_base: None,
+        };
+        s.insert_commit(&commit).await.unwrap();
+        f.current_commit = Some(commit.id);
+        s.update_file(&f).await.unwrap();
+        f
+    }
+
+    async fn ai_tag(s: &SqliteMetaStore, name: &str) -> TagId {
+        s.upsert_tag(&Tag {
+            id: TagId::new(),
+            name: name.into(),
+            kind: TagKind::Ai,
+            confidence: Some(0.9),
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 再生成は AI が付けた分だけを外す。手動タグを巻き込むと、利用者が付けた
+    /// 情報が LLM の気まぐれで消えることになる。
+    #[tokio::test]
+    async fn replace_ai_file_tags_swaps_only_ai_owned_tags() {
+        let s = store().await;
+        let f = insert_image(&s, "photo.jpg").await;
+
+        let manual = s
+            .upsert_tag(&Tag {
+                id: TagId::new(),
+                name: "お気に入り".into(),
+                kind: TagKind::Manual,
+                confidence: None,
+            })
+            .await
+            .unwrap();
+        s.attach_tag(&f.id, &manual).await.unwrap();
+
+        let old = ai_tag(&s, "湖").await;
+        s.replace_ai_file_tags(
+            &f.id,
+            "model-a",
+            &[AiFileTag {
+                tag_id: old,
+                raw_name: "湖".into(),
+                confidence: Some(0.95),
+            }],
+        )
+        .await
+        .unwrap();
+        assert!(s.is_ai_file_tag(&f.id, &old).await.unwrap());
+
+        let new = ai_tag(&s, "山").await;
+        s.replace_ai_file_tags(
+            &f.id,
+            "model-b",
+            &[AiFileTag {
+                tag_id: new,
+                raw_name: "やま".into(),
+                confidence: Some(0.8),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<String> = s
+            .list_tags_of(&f.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"お気に入り".to_string()), "手動タグは残る");
+        assert!(names.contains(&"山".to_string()));
+        assert!(!names.contains(&"湖".to_string()), "旧 AI タグは外れる");
+
+        assert!(!s.is_ai_file_tag(&f.id, &old).await.unwrap());
+        assert!(!s.is_ai_file_tag(&f.id, &manual).await.unwrap());
+        let ai = s.list_ai_file_tags(&f.id).await.unwrap();
+        assert_eq!(ai.len(), 1);
+        assert_eq!(ai[0].1, "model-b");
+    }
+
+    /// スコープは Missing ⊆ Stale ⊆ All。UI/CLI の 3 段階がこの包含に依存する。
+    #[tokio::test]
+    async fn list_ai_tag_targets_scopes_are_nested() {
+        let s = store().await;
+
+        let fresh = insert_image(&s, "a.jpg").await;
+        let other_model = insert_image(&s, "b.jpg").await;
+        let recommitted = insert_image(&s, "c.jpg").await;
+        let done = insert_image(&s, "d.jpg").await;
+        // 画像以外は、コミット済みでも生成記録が無くても対象にならない。
+        let text = insert_committed(&s, "note.md", "text/markdown").await;
+
+        let cur = "model-b";
+        s.mark_ai_tag_ready(&other_model.id, &other_model.current_commit.unwrap(), "model-a")
+            .await
+            .unwrap();
+        s.mark_ai_tag_ready(&recommitted.id, &CommitId::new(), cur)
+            .await
+            .unwrap();
+        s.mark_ai_tag_ready(&done.id, &done.current_commit.unwrap(), cur)
+            .await
+            .unwrap();
+
+        let ids = |v: Vec<(FileId, CommitId)>| {
+            v.into_iter().map(|(f, _)| f).collect::<std::collections::HashSet<_>>()
+        };
+        let missing = ids(s.list_ai_tag_targets(AiTagScope::Missing, cur).await.unwrap());
+        let stale = ids(s.list_ai_tag_targets(AiTagScope::Stale, cur).await.unwrap());
+        let all = ids(s.list_ai_tag_targets(AiTagScope::All, cur).await.unwrap());
+
+        assert_eq!(missing, [fresh.id].into_iter().collect());
+        assert_eq!(
+            stale,
+            [fresh.id, other_model.id, recommitted.id].into_iter().collect()
+        );
+        assert_eq!(all.len(), 4, "画像 4 件すべて。テキストファイルは対象外");
+        assert!(missing.is_subset(&stale) && stale.is_subset(&all));
+        assert!(!all.contains(&text.id));
+    }
+
+    /// 恒久失敗は「未生成」に含めて拾い直せる。含めないと、一時的に LLM が
+    /// 落ちていた分が二度と生成されない。
+    #[tokio::test]
+    async fn list_ai_tag_targets_missing_includes_failed() {
+        let s = store().await;
+        let f = insert_image(&s, "a.jpg").await;
+        s.mark_ai_tag_failed(&f.id, &f.current_commit.unwrap(), "m", "boom")
+            .await
+            .unwrap();
+
+        let run = s.get_ai_tag_run(&f.id).await.unwrap().unwrap();
+        assert_eq!(run.status, AiTagStatus::Failed);
+        assert_eq!(run.error.as_deref(), Some("boom"));
+
+        let got = s.list_ai_tag_targets(AiTagScope::Missing, "m").await.unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// ジョブキュー（キャッシュ側の DB）を失うと pending が取り残される。猶予を
+    /// 過ぎた pending は「未生成」として拾い直せなければならない。
+    #[tokio::test]
+    async fn list_ai_tag_targets_rescues_abandoned_pending() {
+        let s = store().await;
+        let f = insert_image(&s, "a.jpg").await;
+        s.mark_ai_tag_pending(&f.id, &f.current_commit.unwrap(), "m")
+            .await
+            .unwrap();
+
+        // 投入直後は「処理待ち」なので対象にしない（二重投入を避ける）。
+        assert!(s.list_ai_tag_targets(AiTagScope::Missing, "m").await.unwrap().is_empty());
+
+        let old = fmt_dt(OffsetDateTime::now_utc() - crate::AI_TAG_PENDING_LEASE - time::Duration::minutes(1));
+        sqlx::query("UPDATE ai_tag_runs SET updated_at = ? WHERE file_id = ?")
+            .bind(&old)
+            .bind(f.id.to_string())
+            .execute(s.pool())
+            .await
+            .unwrap();
+
+        let got = s.list_ai_tag_targets(AiTagScope::Missing, "m").await.unwrap();
+        assert_eq!(got, vec![(f.id, f.current_commit.unwrap())]);
+    }
+
+    /// AI タグ生成は複数ワーカーが並列に走る。タグ差し替えと FTS 更新が
+    /// 同時に走っても "database is locked" で落ちないこと。
+    ///
+    /// deferred transaction のままだと、書き込みへの昇格が競合した側が
+    /// busy_timeout を待たずに即エラーになる。FTS の失敗は握り潰される設計
+    /// なので、これが起きると検索インデックスだけ静かに古くなる。
+    #[tokio::test]
+    async fn concurrent_ai_tag_writes_do_not_deadlock() {
+        // メモリ DB は接続ごとに別 DB になるため、実ファイルで検証する。
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(
+            SqliteMetaStore::open(dir.path().join("t.sqlite")).await.unwrap(),
+        );
+
+        let mut files = Vec::new();
+        for i in 0..6 {
+            files.push(insert_image(&s, &format!("p{i}.jpg")).await);
+        }
+        let tag = ai_tag(&s, "湖").await;
+
+        let mut set = tokio::task::JoinSet::new();
+        for f in files {
+            let s = s.clone();
+            set.spawn(async move {
+                s.replace_ai_file_tags(
+                    &f.id,
+                    "m",
+                    &[AiFileTag {
+                        tag_id: tag,
+                        raw_name: "湖".into(),
+                        confidence: Some(0.9),
+                    }],
+                )
+                .await?;
+                s.upsert_fts(&f.id, &f.display_name, "湖", "").await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            joined.unwrap().expect("並列書き込みが失敗した");
+        }
+
+        let hits = s.search_fts("湖", 10).await.unwrap();
+        assert_eq!(hits.len(), 6, "全ファイルが FTS に載る");
+    }
+
+    /// 生成待ちへ戻すときは前回の失敗理由を消す。残ると UI が「失敗」と
+    /// 「生成中」を同時に表示する。
+    #[tokio::test]
+    async fn mark_ai_tag_pending_clears_previous_error() {
+        let s = store().await;
+        let f = insert_image(&s, "a.jpg").await;
+        let c = f.current_commit.unwrap();
+        s.mark_ai_tag_failed(&f.id, &c, "m", "boom").await.unwrap();
+        s.mark_ai_tag_pending(&f.id, &c, "m").await.unwrap();
+
+        let run = s.get_ai_tag_run(&f.id).await.unwrap().unwrap();
+        assert_eq!(run.status, AiTagStatus::Pending);
+        assert!(run.error.is_none());
     }
 }

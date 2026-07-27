@@ -40,6 +40,84 @@ pub enum FileSort {
     Size,
 }
 
+/// AI 自動タグ生成のファイル単位の記録（`ai_tag_runs` 1 行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiTagRun {
+    pub file_id: FileId,
+    /// 生成に使ったコミット。現在の `current_commit` と違えば内容が変わっている。
+    pub commit_id: CommitId,
+    /// 生成に使った LLM のモデル名。これが現行設定と違えば付け直しの対象。
+    pub model: String,
+    pub status: AiTagStatus,
+    /// `status = Failed` のときの理由。
+    pub error: Option<String>,
+    pub updated_at: time::OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiTagStatus {
+    /// ジョブを投入済みで生成待ち。
+    Pending,
+    Ready,
+    /// リトライしても無駄と判断された失敗。明示的な再生成でのみ復帰する。
+    Failed,
+}
+
+impl AiTagStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiTagStatus::Pending => "pending",
+            AiTagStatus::Ready => "ready",
+            AiTagStatus::Failed => "failed",
+        }
+    }
+}
+
+/// 付け直しの対象範囲。`Missing ⊆ Stale ⊆ All` になるよう定義する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiTagScope {
+    /// まだ生成されていない（記録なし・失敗・取り残された pending）。
+    Missing,
+    /// `Missing` に加えて、別のモデルで生成された分と、生成後に再コミットされた分。
+    Stale,
+    /// 全画像ファイル。
+    All,
+}
+
+impl AiTagScope {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "missing" => Some(AiTagScope::Missing),
+            "stale" => Some(AiTagScope::Stale),
+            "all" => Some(AiTagScope::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiTagScope::Missing => "missing",
+            AiTagScope::Stale => "stale",
+            AiTagScope::All => "all",
+        }
+    }
+}
+
+/// `replace_ai_file_tags` に渡す 1 件分。`tag_id` は呼び出し側が `upsert_tag` で
+/// 解決済みのものを渡す（タグ本体の採番規則を DB 層に二重実装しないため）。
+#[derive(Debug, Clone)]
+pub struct AiFileTag {
+    pub tag_id: TagId,
+    /// 正規化前の LLM 出力。
+    pub raw_name: String,
+    pub confidence: Option<f32>,
+}
+
+/// キューを失った `pending` を見捨てて再投入可能とみなすまでの猶予。
+/// ジョブ行は `<cache_dir>/jobs.sqlite` にあり、キャッシュごと消されうる一方で
+/// `ai_tag_runs` はメタ DB に残るため、この救済が無いと永久に pending のままになる。
+pub const AI_TAG_PENDING_LEASE: time::Duration = time::Duration::hours(1);
+
 /// メタデータ保存の統一インターフェース。
 #[async_trait]
 pub trait MetaStore: Send + Sync {
@@ -106,6 +184,62 @@ pub trait MetaStore: Send + Sync {
         files: &[FileId],
     ) -> Result<Vec<(FileId, Tag)>, DbError>;
     async fn list_files_by_tags(&self, tags: &[TagId]) -> Result<Vec<FileMeta>, DbError>;
+
+    // ---- AI 自動タグ ----
+    /// ファイルの AI タグ生成記録。未生成なら `None`。
+    async fn get_ai_tag_run(&self, file: &FileId) -> Result<Option<AiTagRun>, DbError>;
+    /// 生成待ちとして記録する（ジョブ投入と対で呼ぶ）。
+    async fn mark_ai_tag_pending(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+    ) -> Result<(), DbError>;
+    /// 生成完了として記録する。
+    async fn mark_ai_tag_ready(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+    ) -> Result<(), DbError>;
+    /// 恒久失敗として記録する。これを怠ると `pending` のまま残り、UI が生成中
+    /// 表示のまま固まる。
+    async fn mark_ai_tag_failed(
+        &self,
+        file: &FileId,
+        commit: &CommitId,
+        model: &str,
+        error: &str,
+    ) -> Result<(), DbError>;
+    /// ファイルの AI タグを丸ごと差し替える。旧 AI タグは `file_tags` からも外し、
+    /// 手動タグ・システムタグには触れない。1 トランザクションで行う。
+    async fn replace_ai_file_tags(
+        &self,
+        file: &FileId,
+        model: &str,
+        tags: &[AiFileTag],
+    ) -> Result<(), DbError>;
+    /// ファイルに付いている AI タグを、生成元モデルと信頼度つきで返す。
+    async fn list_ai_file_tags(
+        &self,
+        file: &FileId,
+    ) -> Result<Vec<(Tag, String, Option<f32>)>, DbError>;
+    /// この (ファイル, タグ) が AI 由来かどうか。手動での取り外しを拒む判定に使う。
+    async fn is_ai_file_tag(&self, file: &FileId, tag: &TagId) -> Result<bool, DbError>;
+    /// 付け直し対象のファイルを `(file_id, current_commit)` で返す。
+    /// 対象は論理削除されていない画像ファイルのみ。
+    async fn list_ai_tag_targets(
+        &self,
+        scope: AiTagScope,
+        current_model: &str,
+    ) -> Result<Vec<(FileId, CommitId)>, DbError>;
+    /// `list_ai_tag_targets` と同じ条件の件数だけを返す。管理画面が「これから
+    /// 何件走るか」を出すために使う（全件の ID を持ち帰らずに済む）。
+    async fn count_ai_tag_targets(
+        &self,
+        scope: AiTagScope,
+        current_model: &str,
+    ) -> Result<u64, DbError>;
 
     // ---- series ----
     async fn upsert_series(&self, series: &Series) -> Result<SeriesId, DbError>;

@@ -7,7 +7,18 @@ description = "yozist: AI analysis providers (tag suggestion, summarization)."
 
 [dependencies]
 yozist-core.workspace = true
+yozist-db.workspace = true
+yozist-jobs.workspace = true
+yozist-versioning.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+image.workspace = true
+narashi.workspace = true
+uuid.workspace = true
+time.workspace = true

@@ -105,15 +105,54 @@ impl JobRunner {
     /// キューが空になるまで自ワーカーだけで処理し、その後戻る。CLI の一括投入
     /// コマンド（cache-warm 等）が「終わったらプロセスを終了する」ために使う。
     ///
-    /// バックオフ待ちのジョブがあると `claim_next` は一時的に `None` を返すため、
-    /// 「未完了が 0 件」になるまで待つ。戻り値は処理し切れずに残った件数
-    /// （0 なら完全に捌けた）。
+    /// 1 件ずつ直列に処理する。並列に捌きたい場合は [`Self::drain_with`]。
+    pub async fn drain(self: &Arc<Self>) -> i64 {
+        self.drain_with(1).await
+    }
+
+    /// [`Self::drain`] の並列版。最大 `concurrency` 件を同時に処理する。
+    ///
+    /// AI タグ生成のように 1 件が数十秒のネットワーク待ちになるジョブは、
+    /// 直列だと待ち時間がそのまま件数倍になる。接続先が同時実行を受けられる
+    /// なら、そのスロット数に合わせて増やす。
+    ///
+    /// 戻り値は処理し切れずに残った件数（0 なら完全に捌けた）。
     ///
     /// NOTE: 判定は同じキューを見る全プロセスの合計に対して行う。サーバ稼働中に
     /// CLI を叩くと、サーバ側が投入し続ける限り 0 にならず戻らないことがある。
-    pub async fn drain(self: &Arc<Self>) -> i64 {
-        let kinds: Vec<&str> = self.handlers.keys().map(|s| s.as_str()).collect();
+    pub async fn drain_with(self: &Arc<Self>, concurrency: usize) -> i64 {
+        // 固着ジョブの回収は 1 度だけ。各ワーカーが個別にやっても同じ行を
+        // 奪い合うだけで意味がない。
         self.reclaim_stalled().await;
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..concurrency.max(1) {
+            let runner = self.clone();
+            set.spawn(async move { runner.drain_loop().await });
+        }
+
+        // 全ワーカーが「未完了 0 件」を見て戻るまで待つ。1 本でも異常終了や
+        // 取りこぼしを報告したら、それを呼び出し側へ伝える。
+        let mut remaining = 0i64;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(0) => {}
+                Ok(v) => remaining = v,
+                Err(e) => {
+                    tracing::warn!("drain ワーカーが異常終了: {e}");
+                    remaining = -1;
+                }
+            }
+        }
+        remaining
+    }
+
+    /// キューが空になるまで 1 件ずつ処理して戻る（`drain_with` のワーカー本体）。
+    ///
+    /// バックオフ待ちのジョブがあると `claim_next` は一時的に `None` を返すため、
+    /// 「未完了が 0 件」になるまで待つ。
+    async fn drain_loop(&self) -> i64 {
+        let kinds: Vec<&str> = self.handlers.keys().map(|s| s.as_str()).collect();
         loop {
             match self.store.claim_next(&kinds).await {
                 Ok(Some(job)) => self.run_one(job).await,
@@ -318,6 +357,63 @@ mod tests {
             "リトライ上限に達した Retryable も恒久失敗として通知される"
         );
         assert_eq!(store.count_incomplete(&["t"]).await.unwrap(), 0);
+    }
+
+    /// 同時に走った件数の最大値を記録するだけのハンドラ。
+    struct ConcurrencyProbe {
+        running: Mutex<usize>,
+        peak: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl JobHandler for ConcurrencyProbe {
+        async fn handle(&self, _payload: &serde_json::Value) -> Result<(), JobError> {
+            {
+                let mut running = self.running.lock().unwrap();
+                *running += 1;
+                let mut peak = self.peak.lock().unwrap();
+                *peak = (*peak).max(*running);
+            }
+            // 実処理（ネットワーク待ち）の代わり。直列なら重ならない。
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            *self.running.lock().unwrap() -= 1;
+            Ok(())
+        }
+    }
+
+    async fn probe_peak(concurrency: usize) -> usize {
+        let store = Arc::new(JobStore::open_in_memory().await.unwrap());
+        for i in 0..6 {
+            store
+                .enqueue("t", Some(&format!("j{i}")), &json!({"file_id": i}))
+                .await
+                .unwrap();
+        }
+        let handler = Arc::new(ConcurrencyProbe {
+            running: Mutex::new(0),
+            peak: Mutex::new(0),
+        });
+        let mut runner = JobRunner::new(store.clone());
+        runner.register("t", handler.clone());
+        let runner = Arc::new(runner);
+
+        assert_eq!(runner.drain_with(concurrency).await, 0);
+        assert_eq!(store.count_incomplete(&["t"]).await.unwrap(), 0);
+        *handler.peak.lock().unwrap()
+    }
+
+    /// 並列 drain は複数のジョブを同時に走らせる。1 件が数十秒かかる AI タグ
+    /// 生成では、ここが直列だと待ち時間が件数倍になる。
+    #[tokio::test]
+    async fn drain_with_runs_jobs_concurrently() {
+        assert!(probe_peak(3).await > 1, "同時実行が起きていない");
+    }
+
+    /// 既定の `drain` は従来どおり 1 件ずつ（CPU バウンドなプレビュー生成が
+    /// 意図せず並列化されないよう、明示的に指定した時だけ並べる）。
+    #[tokio::test]
+    async fn drain_stays_serial() {
+        assert_eq!(probe_peak(1).await, 1);
     }
 
     /// リトライ余地が残っているうちは恒久失敗を通知しない。
