@@ -14,12 +14,10 @@ async function init() {
   await loadTags();
 }
 
-// 配色は file_detail / files 一覧と統一する。AI に warning（高彩度の黄色）を
-// 当てていたが小さいバッジの文字が読みづらく、secondary へ変更した。
+// 配色は file_detail / files 一覧と統一する。AI タグに専用色は当てない
+// （このページでの区別は 🤖 と「自動生成」表示が担う）。
 function tagVariant(kind) {
-  return kind === 'system' ? 'badge-neutral'
-       : kind === 'ai' ? 'badge-secondary'
-       : 'badge-primary';
+  return kind === 'system' ? 'badge-neutral' : 'badge-primary';
 }
 function tagIcon(kind) {
   return kind === 'system' ? ' ⚙' : kind === 'ai' ? ' 🤖' : '';

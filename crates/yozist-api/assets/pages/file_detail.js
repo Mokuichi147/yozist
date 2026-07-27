@@ -180,13 +180,10 @@ async function loadDetail() {
 
 // 種別ごとのバッジ配色（files 一覧・タグ管理と統一。ダークでも視認できるよう塗りつぶし）
 //
-// AI に warning（明度 82% の高彩度の黄色）を当てていたが、小さいバッジの文字が
-// 読みづらかったため secondary にした。primary（indigo）とも neutral とも
-// 色相が離れていて、文字色との明度差も十分にある。
+// AI タグに専用色は当てない。AI タグカードの中では種別が自明で、種別が混ざる
+// 場所（ファイル一覧・タグ管理）では 🤖 が区別を担うため、色を分ける必要がない。
 function tagVariant(kind) {
-  return kind === 'system' ? 'badge-neutral'
-       : kind === 'ai' ? 'badge-secondary'
-       : 'badge-primary';
+  return kind === 'system' ? 'badge-neutral' : 'badge-primary';
 }
 function tagIcon(kind) {
   return kind === 'system' ? ' ⚙' : kind === 'ai' ? ' 🤖' : '';
