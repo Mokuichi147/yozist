@@ -4,37 +4,47 @@
 {% block content %}
 <div id="main" class="hidden max-w-3xl mx-auto p-4 space-y-4">
 
+  <!-- 並べ替えは両方のリストに効く（同じ基準で見比べられるようにする） -->
+  <div class="flex items-center gap-2">
+    <span class="text-xs opacity-60 shrink-0 whitespace-nowrap">並べ替え</span>
+    <select id="sort-key" class="select select-bordered select-xs flex-1 min-w-0 max-w-32" onchange="onSortKeyChange()">
+      <option value="name">名前</option>
+      <option value="count">件数</option>
+    </select>
+    <select id="sort-dir" class="select select-bordered select-xs flex-1 min-w-0 max-w-32" onchange="applySort()">
+      <option value="asc">昇順</option>
+      <option value="desc">降順</option>
+    </select>
+    <span class="flex-1"></span>
+    <button class="btn btn-xs btn-ghost" onclick="loadTags()">更新</button>
+  </div>
+
+  <!-- 手動タグ: 操作できるのはこちらだけ -->
   <div class="card bg-base-100 shadow-sm">
     <div class="card-body p-4">
       <div class="flex items-center justify-between mb-1">
-        <h2 class="text-xs tracking-wider opacity-60 font-semibold">タグ設定</h2>
-        <div class="flex items-center gap-2">
-          <button class="btn btn-xs btn-ghost" onclick="loadTags()">更新</button>
-          <button class="btn btn-xs btn-primary" onclick="createTag()">+ 新規</button>
-        </div>
+        <h2 class="text-xs tracking-wider opacity-60 font-semibold">手動タグ</h2>
+        <button class="btn btn-xs btn-primary" onclick="createTag()">+ 新規</button>
       </div>
       <p class="text-xs opacity-60 mb-2">
-        手動タグの名前変更・追加・削除ができます。複数のタグを選択すると 1 つに合流できます。
-        <span class="opacity-80">🤖 AI タグ</span>は自動生成のため変更できません
-        （ファイル詳細ページの再生成で更新されます）。
+        名前変更・追加・削除ができます。複数のタグを選択すると 1 つに合流できます。
       </p>
-
-      <!-- 並べ替えコントロール（モバイルでも 1 行に収め、画面幅を超えない） -->
-      <div class="flex items-center gap-2 mb-2">
-        <span class="text-xs opacity-60 shrink-0 whitespace-nowrap">並べ替え</span>
-        <select id="sort-key" class="select select-bordered select-xs flex-1 min-w-0 max-w-32" onchange="onSortKeyChange()">
-          <option value="name">名前</option>
-          <option value="count">件数</option>
-        </select>
-        <select id="sort-dir" class="select select-bordered select-xs flex-1 min-w-0 max-w-32" onchange="applySort()">
-          <option value="asc">昇順</option>
-          <option value="desc">降順</option>
-        </select>
-      </div>
 
       <!-- 合流アクションバーは画面下部に固定表示（リストを押し下げないため、ここには置かない） -->
 
-      <div id="tag-list" class="space-y-1">…</div>
+      <div id="manual-tag-list" class="space-y-1">…</div>
+    </div>
+  </div>
+
+  <!-- 自動生成タグ: 読み取り専用 -->
+  <div class="card bg-base-100 shadow-sm">
+    <div class="card-body p-4">
+      <h2 class="text-xs tracking-wider opacity-60 font-semibold mb-1">自動生成タグ</h2>
+      <p class="text-xs opacity-60 mb-2">
+        AI が画像から付けたタグです。変更はできません
+        （ファイル詳細ページの再生成で入れ替わります）。
+      </p>
+      <div id="ai-tag-list" class="space-y-1">…</div>
     </div>
   </div>
 
