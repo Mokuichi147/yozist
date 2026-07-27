@@ -628,6 +628,16 @@ async fn open_ai_layer(
 
     tracing::info!("AI タグ生成モデル: {model} / 埋め込み: {}", cli.ai_embedding_model);
 
+    // 参照を失った AI タグの取り残しを掃除する。通常は差し替えのたびに
+    // `replace_ai_file_tags` が消すが、旧バージョンの残骸や異常終了で残った分を
+    // ここで拾う。ワーカーを起動する前に済ませる（生成中に走らせると、タグを
+    // 作ってからファイルへ結び付けるまでの隙間にある行を消してしまう）。
+    match meta.delete_orphaned_ai_tags().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("参照されていない AI タグを {n} 件削除"),
+        Err(e) => tracing::warn!("AI タグの掃除に失敗: {e}"),
+    }
+
     let provider = yozist_ai::OpenAiVisionProvider::new(
         endpoint,
         model,

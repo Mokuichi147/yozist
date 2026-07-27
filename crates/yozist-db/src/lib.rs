@@ -219,6 +219,13 @@ pub trait MetaStore: Send + Sync {
         model: &str,
         tags: &[AiFileTag],
     ) -> Result<(), DbError>;
+    /// どのファイルからも参照されていない AI タグをまとめて削除し、削除件数を返す。
+    ///
+    /// 通常は `replace_ai_file_tags` が差し替えのたびに掃除するが、旧バージョンの
+    /// 残骸やプロセスの異常終了で取り残された分を拾うために用意する。
+    /// **AI タグの生成が走っていない時に呼ぶこと**（生成中は、タグを作ってから
+    /// ファイルへ結び付けるまでの隙間にある行を消してしまう）。
+    async fn delete_orphaned_ai_tags(&self) -> Result<u64, DbError>;
     /// ファイルに付いている AI タグを、生成元モデルと信頼度つきで返す。
     async fn list_ai_file_tags(
         &self,

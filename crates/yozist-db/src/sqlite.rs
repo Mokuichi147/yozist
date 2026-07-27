@@ -823,6 +823,13 @@ impl MetaStore for SqliteMetaStore {
         // 開始時点で書き込みロックを取り、待ち合わせは busy_timeout に委ねる。
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
+        // 差し替えで参照を失うタグを後で判定するため、外す前に控えておく。
+        let detached: Vec<String> =
+            sqlx::query_scalar("SELECT tag_id FROM ai_file_tags WHERE file_id = ?")
+                .bind(&file_s)
+                .fetch_all(&mut *tx)
+                .await?;
+
         // 旧 AI タグを file_tags からも外す。file_tags は付与者を持たないので、
         // ai_file_tags に載っている組み合わせだけを対象にする（同名の手動タグを
         // 巻き込まないための唯一の手掛かり）。
@@ -862,8 +869,38 @@ impl MetaStore for SqliteMetaStore {
             .await?;
         }
 
+        // 差し替えでどのファイルからも参照されなくなった AI タグを消す。残すと
+        // 0 件のタグがタグ一覧や候補に溜まり続ける（再生成のたびに増える）。
+        //
+        // 対象は kind = 'ai' のみ。AI が寄せ先に使っただけの手動タグは、利用者が
+        // 意図して作ったものなので 0 件でも残す。新規挿入の後に判定するので、
+        // 今回も付け直したタグは参照が残り消えない。
+        for tag_id in &detached {
+            sqlx::query(
+                "DELETE FROM tags
+                 WHERE id = ?
+                   AND kind = 'ai'
+                   AND NOT EXISTS (SELECT 1 FROM file_tags WHERE tag_id = tags.id)",
+            )
+            .bind(tag_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn delete_orphaned_ai_tags(&self) -> Result<u64, DbError> {
+        // 手動タグは 0 件でも消さない（利用者が意図して作ったもの）。
+        let res = sqlx::query(
+            "DELETE FROM tags
+             WHERE kind = 'ai'
+               AND NOT EXISTS (SELECT 1 FROM file_tags WHERE tag_id = tags.id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     async fn list_ai_file_tags(
@@ -2297,6 +2334,144 @@ mod tests {
 
         let got = s.list_ai_tag_targets(AiTagScope::Missing, "m").await.unwrap();
         assert_eq!(got, vec![(f.id, f.current_commit.unwrap())]);
+    }
+
+    /// 差し替えで参照を失った AI タグは削除する。残すと 0 件のタグが再生成の
+    /// たびに溜まり、タグ一覧や候補が使い物にならなくなる。
+    #[tokio::test]
+    async fn replace_ai_file_tags_deletes_orphaned_ai_tags() {
+        let s = store().await;
+        let f = insert_image(&s, "photo.jpg").await;
+
+        let old = ai_tag(&s, "湖").await;
+        s.replace_ai_file_tags(
+            &f.id,
+            "m",
+            &[AiFileTag { tag_id: old, raw_name: "湖".into(), confidence: None }],
+        )
+        .await
+        .unwrap();
+
+        let new = ai_tag(&s, "山").await;
+        s.replace_ai_file_tags(
+            &f.id,
+            "m",
+            &[AiFileTag { tag_id: new, raw_name: "山".into(), confidence: None }],
+        )
+        .await
+        .unwrap();
+
+        let names: Vec<String> = s.list_tags().await.unwrap().into_iter().map(|t| t.name).collect();
+        assert!(!names.contains(&"湖".to_string()), "参照を失った AI タグは消える");
+        assert!(names.contains(&"山".to_string()));
+    }
+
+    /// 付け直しても残るタグは消さない（新規挿入の後に判定していること）。
+    #[tokio::test]
+    async fn replace_ai_file_tags_keeps_reassigned_tags() {
+        let s = store().await;
+        let f = insert_image(&s, "photo.jpg").await;
+        let tag = ai_tag(&s, "湖").await;
+        let one = |id| vec![AiFileTag { tag_id: id, raw_name: "湖".into(), confidence: None }];
+
+        s.replace_ai_file_tags(&f.id, "m", &one(tag)).await.unwrap();
+        s.replace_ai_file_tags(&f.id, "m", &one(tag)).await.unwrap();
+
+        assert!(s.get_tag(&tag).await.unwrap().is_some(), "同じタグを付け直しただけ");
+        assert_eq!(s.list_tags_of(&f.id).await.unwrap().len(), 1);
+    }
+
+    /// 他のファイルがまだ使っている AI タグは消さない。
+    #[tokio::test]
+    async fn replace_ai_file_tags_keeps_tags_used_by_other_files() {
+        let s = store().await;
+        let a = insert_image(&s, "a.jpg").await;
+        let b = insert_image(&s, "b.jpg").await;
+        let shared = ai_tag(&s, "湖").await;
+        let one = |id| vec![AiFileTag { tag_id: id, raw_name: "湖".into(), confidence: None }];
+
+        s.replace_ai_file_tags(&a.id, "m", &one(shared)).await.unwrap();
+        s.replace_ai_file_tags(&b.id, "m", &one(shared)).await.unwrap();
+
+        // a から外しても b がまだ持っている。
+        let other = ai_tag(&s, "山").await;
+        s.replace_ai_file_tags(
+            &a.id,
+            "m",
+            &[AiFileTag { tag_id: other, raw_name: "山".into(), confidence: None }],
+        )
+        .await
+        .unwrap();
+
+        assert!(s.get_tag(&shared).await.unwrap().is_some());
+        assert_eq!(s.list_tags_of(&b.id).await.unwrap().len(), 1);
+    }
+
+    /// AI が寄せ先に使っただけの手動タグは、0 件になっても消さない。
+    /// 利用者が意図して作ったものを LLM の気まぐれで消してはいけない。
+    #[tokio::test]
+    async fn replace_ai_file_tags_never_deletes_manual_tags() {
+        let s = store().await;
+        let f = insert_image(&s, "photo.jpg").await;
+        let manual = s
+            .upsert_tag(&Tag {
+                id: TagId::new(),
+                name: "岩石".into(),
+                kind: TagKind::Manual,
+                confidence: None,
+            })
+            .await
+            .unwrap();
+
+        // AI が「岩」を既存の手動タグ「岩石」へ寄せた状態。
+        s.replace_ai_file_tags(
+            &f.id,
+            "m",
+            &[AiFileTag { tag_id: manual, raw_name: "岩".into(), confidence: None }],
+        )
+        .await
+        .unwrap();
+
+        let other = ai_tag(&s, "山").await;
+        s.replace_ai_file_tags(
+            &f.id,
+            "m",
+            &[AiFileTag { tag_id: other, raw_name: "山".into(), confidence: None }],
+        )
+        .await
+        .unwrap();
+
+        let tag = s.get_tag(&manual).await.unwrap();
+        assert!(tag.is_some(), "手動タグは 0 件でも残る");
+        assert!(matches!(tag.unwrap().kind, TagKind::Manual));
+    }
+
+    /// 取り残された 0 件の AI タグをまとめて掃除する。手動タグは巻き込まない。
+    #[tokio::test]
+    async fn delete_orphaned_ai_tags_sweeps_only_unused_ai_tags() {
+        let s = store().await;
+        let f = insert_image(&s, "photo.jpg").await;
+
+        let used = ai_tag(&s, "湖").await;
+        s.attach_tag(&f.id, &used).await.unwrap();
+        let orphan = ai_tag(&s, "山").await;
+        let manual = s
+            .upsert_tag(&Tag {
+                id: TagId::new(),
+                name: "お気に入り".into(),
+                kind: TagKind::Manual,
+                confidence: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(s.delete_orphaned_ai_tags().await.unwrap(), 1);
+        assert!(s.get_tag(&orphan).await.unwrap().is_none());
+        assert!(s.get_tag(&used).await.unwrap().is_some(), "使われている AI タグは残る");
+        assert!(s.get_tag(&manual).await.unwrap().is_some(), "手動タグは 0 件でも残る");
+
+        // 何度呼んでも安全（掃除対象が無ければ 0 件）。
+        assert_eq!(s.delete_orphaned_ai_tags().await.unwrap(), 0);
     }
 
     /// AI タグ生成は複数ワーカーが並列に走る。タグ差し替えと FTS 更新が
