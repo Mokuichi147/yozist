@@ -178,10 +178,14 @@ async function loadDetail() {
   ]);
 }
 
-// 種別ごとのバッジ配色（files 一覧と統一。ダークでも視認できるよう塗りつぶし）
+// 種別ごとのバッジ配色（files 一覧・タグ管理と統一。ダークでも視認できるよう塗りつぶし）
+//
+// AI に warning（明度 82% の高彩度の黄色）を当てていたが、小さいバッジの文字が
+// 読みづらかったため secondary にした。primary（indigo）とも neutral とも
+// 色相が離れていて、文字色との明度差も十分にある。
 function tagVariant(kind) {
   return kind === 'system' ? 'badge-neutral'
-       : kind === 'ai' ? 'badge-warning'
+       : kind === 'ai' ? 'badge-secondary'
        : 'badge-primary';
 }
 function tagIcon(kind) {
@@ -298,13 +302,16 @@ function renderAiTags(info) {
   const box = $('fd-ai-tags');
   // AI タグはクリックできない（外すには再生成する）。button ではなく span で
   // 描画して、押せそうな見た目にしない。
+  //
+  // 🤖 は付けない。カード自体が「AI タグ」なので、種別を区別する必要があるのは
+  // 種別が混ざる場所（ファイル一覧・タグ管理）だけ。
   const badges = info.tags.map(t =>
     el('span', {
-      class: 'badge badge-sm badge-warning gap-1',
+      class: `badge badge-sm ${tagVariant('ai')} gap-1`,
       title: `AI 生成タグ（${t.model}` +
         (t.confidence == null ? '' : ` / 確度 ${Math.round(t.confidence * 100)}%`) +
         '）。再生成でのみ更新されます',
-    }, t.name + ' 🤖')
+    }, t.name)
   );
   if (badges.length === 0) {
     box.replaceChildren(el('span', { class: 'opacity-50 text-xs' },

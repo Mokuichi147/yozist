@@ -14,9 +14,11 @@ async function init() {
   await loadTags();
 }
 
+// 配色は file_detail / files 一覧と統一する。AI に warning（高彩度の黄色）を
+// 当てていたが小さいバッジの文字が読みづらく、secondary へ変更した。
 function tagVariant(kind) {
   return kind === 'system' ? 'badge-neutral'
-       : kind === 'ai' ? 'badge-warning'
+       : kind === 'ai' ? 'badge-secondary'
        : 'badge-primary';
 }
 function tagIcon(kind) {
@@ -71,20 +73,34 @@ function render() {
     updateMergeBar();
     return;
   }
-  box.replaceChildren(...tags.map(t =>
-    el('div', { class: 'flex items-center gap-2 row-compact' }, [
-      el('input', {
-        type: 'checkbox', class: 'checkbox checkbox-xs',
-        checked: selected.has(t.id),
-        onchange: (/** @type {Event} */ e) =>
-          toggleSelect(t.id, /** @type {HTMLInputElement} */ (e.target).checked),
-      }),
+  box.replaceChildren(...tags.map(t => {
+    // AI タグは自動生成なので、ここで改名・削除・合流はできない（サーバも拒否
+    // する）。押せそうな見た目のまま 400 を返すのは不親切なので操作を伏せる。
+    // 手を入れたい場合は同名タグを手動で作れば手動タグへ昇格する。
+    const editable = t.kind !== 'ai';
+    return el('div', { class: 'flex items-center gap-2 row-compact' }, [
+      editable
+        ? el('input', {
+            type: 'checkbox', class: 'checkbox checkbox-xs',
+            checked: selected.has(t.id),
+            onchange: (/** @type {Event} */ e) =>
+              toggleSelect(t.id, /** @type {HTMLInputElement} */ (e.target).checked),
+          })
+        : el('span', { class: 'w-4' }),
       el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name + tagIcon(t.kind)),
       el('span', { class: 'text-xs opacity-50' }, `${t.count} 件`),
       el('span', { class: 'flex-1' }),
-      el('button', { class: 'btn btn-xs btn-ghost', onclick: () => renameTag(t.id) }, '名前変更'),
-      el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => deleteTag(t.id) }, '削除'),
-    ])));
+      editable
+        ? el('button', { class: 'btn btn-xs btn-ghost', onclick: () => renameTag(t.id) }, '名前変更')
+        : el('span', {
+            class: 'text-xs opacity-50',
+            title: 'AI が生成したタグです。ファイル詳細ページの再生成で更新されます',
+          }, '自動生成'),
+      editable
+        ? el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => deleteTag(t.id) }, '削除')
+        : null,
+    ]);
+  }));
   updateMergeBar();
 }
 
