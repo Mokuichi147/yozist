@@ -95,6 +95,14 @@ user-permission-core = "0.4"
 jsonwebtoken = "9"
 rand = "0.8"
 
+# AI 自動タグ生成 (yozist-ai)
+# narashi は既定で onnx/candle のローカル推論も抱えるが、埋め込みは OpenAI 互換
+# エンドポイントに投げるため openai だけを有効にする（約 1GB のモデル取得と
+# fastembed/ort のビルドを避ける）。
+narashi = { version = "0.7", default-features = false, features = ["openai"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64 = "0.22"
+
 # CLI / Config
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml", "env"] }

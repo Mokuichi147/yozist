@@ -14,13 +14,10 @@ async function init() {
   await loadTags();
 }
 
+// 配色は file_detail / files 一覧と統一する。AI タグに専用色は当てない
+// （このページでの区別はカードの分割が担う）。
 function tagVariant(kind) {
-  return kind === 'system' ? 'badge-neutral'
-       : kind === 'ai' ? 'badge-warning'
-       : 'badge-primary';
-}
-function tagIcon(kind) {
-  return kind === 'system' ? ' ⚙' : kind === 'ai' ? ' 🤖' : '';
+  return kind === 'system' ? 'badge-neutral' : 'badge-primary';
 }
 
 async function loadTags() {
@@ -33,20 +30,24 @@ async function loadTags() {
     sortTags();
     render();
   } catch (e) {
-    $('tag-list').replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
+    for (const id of ['manual-tag-list', 'ai-tag-list']) {
+      $(id).replaceChildren(el('div', { class: 'opacity-50 text-xs' }, '取得失敗'));
+    }
   }
 }
 
-// 選択中の基準・方向で tags を並べ替える。件数が同じ場合は名前で安定させる。
+// 選択中の基準・方向で tags を並べ替える。既定は「件数の降順 → 名前の昇順」。
 function sortTags() {
   const key = /** @type {HTMLSelectElement} */ ($('sort-key')).value;
   const sign = /** @type {HTMLSelectElement} */ ($('sort-dir')).value === 'desc' ? -1 : 1;
   tags.sort((a, b) => {
-    let d;
-    if (key === 'count') d = a.count - b.count;
-    else d = a.name.localeCompare(b.name, 'ja');
-    if (d === 0 && key !== 'name') d = a.name.localeCompare(b.name, 'ja');
-    return d * sign;
+    const primary = key === 'count'
+      ? a.count - b.count
+      : a.name.localeCompare(b.name, 'ja');
+    if (primary !== 0) return primary * sign;
+    // 副キーの名前は方向によらず常に昇順。ここに sign を掛けると、件数の降順
+    // （既定）のときだけ同数のタグが名前の逆順に並び、目当ての名前を探しにくい。
+    return a.name.localeCompare(b.name, 'ja');
   });
 }
 
@@ -64,28 +65,42 @@ function applySort() {
   render();
 }
 
+// 手動タグと自動生成タグはできることが違う（改名・削除・合流は手動タグだけ）
+// ので、リストごと分ける。混ぜて行ごとに操作を出し分けると、押せる行と押せない
+// 行が入り混じって読みづらい。
 function render() {
-  const box = $('tag-list');
-  if (tags.length === 0) {
+  renderList($('manual-tag-list'), tags.filter(t => t.kind !== 'ai'), true);
+  renderList($('ai-tag-list'), tags.filter(t => t.kind === 'ai'), false);
+  updateMergeBar();
+}
+
+function renderList(box, list, editable) {
+  if (list.length === 0) {
     box.replaceChildren(el('div', { class: 'opacity-50 text-xs' }, 'タグなし'));
-    updateMergeBar();
     return;
   }
-  box.replaceChildren(...tags.map(t =>
+  box.replaceChildren(...list.map(t =>
     el('div', { class: 'flex items-center gap-2 row-compact' }, [
-      el('input', {
-        type: 'checkbox', class: 'checkbox checkbox-xs',
-        checked: selected.has(t.id),
-        onchange: (/** @type {Event} */ e) =>
-          toggleSelect(t.id, /** @type {HTMLInputElement} */ (e.target).checked),
-      }),
-      el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name + tagIcon(t.kind)),
+      // 自動生成タグは選択できない（合流はサーバ側でも拒否される）。
+      editable
+        ? el('input', {
+            type: 'checkbox', class: 'checkbox checkbox-xs',
+            checked: selected.has(t.id),
+            onchange: (/** @type {Event} */ e) =>
+              toggleSelect(t.id, /** @type {HTMLInputElement} */ (e.target).checked),
+          })
+        : null,
+      // 種別はカードの見出しで分かるので、バッジにアイコンは付けない。
+      el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name),
       el('span', { class: 'text-xs opacity-50' }, `${t.count} 件`),
       el('span', { class: 'flex-1' }),
-      el('button', { class: 'btn btn-xs btn-ghost', onclick: () => renameTag(t.id) }, '名前変更'),
-      el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => deleteTag(t.id) }, '削除'),
+      editable
+        ? el('button', { class: 'btn btn-xs btn-ghost', onclick: () => renameTag(t.id) }, '名前変更')
+        : null,
+      editable
+        ? el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => deleteTag(t.id) }, '削除')
+        : null,
     ])));
-  updateMergeBar();
 }
 
 function tagById(id) { return tags.find(t => t.id === id); }
@@ -168,7 +183,8 @@ function openMerge() {
         type: 'radio', name: 'merge-target', class: 'radio radio-xs',
         value: t.id, checked: t.id === defaultTarget.id,
       }),
-      el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name + tagIcon(t.kind)),
+      // 合流できるのは手動タグだけなので、種別アイコンは要らない。
+      el('span', { class: `badge badge-sm ${tagVariant(t.kind)} gap-1` }, t.name),
       el('span', { class: 'text-xs opacity-50' }, `${t.count} 件`),
     ])));
   /** @type {HTMLDialogElement} */ ($('merge-modal')).showModal();

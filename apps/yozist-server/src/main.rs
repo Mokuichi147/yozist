@@ -6,6 +6,7 @@
 //! - `version`            … バージョン表示
 //! - `cache-warm`         … サムネイル/プレビュー軽量化キャッシュの未生成分を一括生成
 //! - `cache-regenerate`   … サムネイル/プレビュー軽量化キャッシュを強制的に再生成
+//! - `ai-tag-generate`    … 画像の AI 自動タグを一括生成（未生成 / モデル変更分 / 全件）
 //!
 //! # 設定優先順位
 //! 1. CLI 引数
@@ -77,6 +78,76 @@ struct Cli {
     #[arg(long, env = "YOZIST_CACHE_WORKERS", value_parser = clap::value_parser!(u32).range(1..=64))]
     cache_workers: Option<u32>,
 
+    /// AI 自動タグ生成に使う OpenAI 互換エンドポイント（`/v1` まで含むベース URL）。
+    /// **未指定なら AI 機能全体が無効**になる（既存の動作のまま）。
+    #[arg(long, env = "YOZIST_AI_ENDPOINT")]
+    ai_endpoint: Option<String>,
+
+    /// タグ生成に使う vision 対応モデル名。`--ai-endpoint` 指定時は必須。
+    /// この値は生成済みタグに記録され、変更すると付け直しの対象になる。
+    #[arg(long, env = "YOZIST_AI_MODEL")]
+    ai_model: Option<String>,
+
+    /// AI エンドポイントの API キー。キー不要なローカルサーバでは省略できる。
+    #[arg(long, env = "YOZIST_AI_API_KEY", hide_env_values = true)]
+    ai_api_key: Option<String>,
+
+    /// 表記ゆれ解消（narashi）に使う埋め込みエンドポイント。未指定時は
+    /// `--ai-endpoint` と同じ。
+    #[arg(long, env = "YOZIST_AI_EMBEDDING_ENDPOINT")]
+    ai_embedding_endpoint: Option<String>,
+
+    /// 表記ゆれ解消に使う埋め込みモデル名。
+    #[arg(
+        long,
+        env = "YOZIST_AI_EMBEDDING_MODEL",
+        default_value = "text-embedding-qwen3-embedding-4b"
+    )]
+    ai_embedding_model: String,
+
+    /// 1 ファイルに付ける AI タグの最大数。
+    #[arg(long, env = "YOZIST_AI_TAG_MAX", default_value_t = 10,
+          value_parser = clap::value_parser!(u32).range(1..=100))]
+    ai_tag_max: u32,
+
+    /// これ未満の信頼度（0.0-1.0）の候補は捨てる。
+    #[arg(long, env = "YOZIST_AI_TAG_MIN_CONFIDENCE", default_value_t = 0.5,
+          value_parser = parse_confidence)]
+    ai_tag_min_confidence: f32,
+
+    /// 表記ゆれ統合のしきい値（0-100）。高いほど別タグとして残りやすい。
+    #[arg(long, env = "YOZIST_AI_TAG_SIMILARITY",
+          default_value_t = yozist_ai::DEFAULT_SIMILARITY_THRESHOLD,
+          value_parser = parse_similarity)]
+    ai_tag_similarity: f32,
+
+    /// 寄せ先候補として埋め込みに渡す既存タグの上限（使用数の多い順）。
+    /// 埋め込みは毎回全件送るため、増やすほど 1 回のリクエストが重くなる。
+    #[arg(long, env = "YOZIST_AI_VOCAB_LIMIT", default_value_t = 300,
+          value_parser = clap::value_parser!(u32).range(0..=5000))]
+    ai_vocab_limit: u32,
+
+    /// AI タグ生成の同時実行数（サーバのワーカー本数、および
+    /// `ai-tag-generate` が同時に走らせる件数）。
+    ///
+    /// 生成はほぼ全部がネットワーク待ち（1 枚あたり数十秒）で、こちらの CPU は
+    /// 使わない。直列にすると待ち時間がそのまま件数倍になるため既定で並列に
+    /// する。接続先が受けられる同時実行スロット数に合わせて調整する。
+    #[arg(long, env = "YOZIST_AI_WORKERS", default_value_t = 4,
+          value_parser = clap::value_parser!(u32).range(1..=32))]
+    ai_workers: u32,
+
+    /// リクエストに載せる `reasoning_effort`。推論モデルは思考に数百トークン
+    /// 使い、`max_tokens` に達すると本文が空のまま打ち切られるため既定で切る。
+    /// 受け付ける値はサーバによって違う（空文字を渡すとフィールドごと省略する）。
+    #[arg(long, env = "YOZIST_AI_REASONING_EFFORT", default_value = "none")]
+    ai_reasoning_effort: String,
+
+    /// AI エンドポイントへの 1 リクエストのタイムアウト（秒）。
+    #[arg(long, env = "YOZIST_AI_TIMEOUT_SECS", default_value_t = 180,
+          value_parser = clap::value_parser!(u64).range(1..=3600))]
+    ai_timeout_secs: u64,
+
     #[command(subcommand)]
     command: Cmd,
 }
@@ -106,6 +177,18 @@ enum Cmd {
         /// 対象 variant（`thumbnail` / `preview`）。省略時は両方。
         #[arg(long)]
         variant: Option<String>,
+    },
+    /// AI 自動タグを生成する（既に付いているものは差し替える）。
+    AiTagGenerate {
+        /// 対象範囲。
+        /// `missing` = 未生成（記録なし・失敗・取り残された生成待ち）、
+        /// `stale` = missing に加えて別モデルで生成した分と再コミット分、
+        /// `all` = 全画像ファイル。
+        #[arg(long, default_value = "missing")]
+        scope: String,
+        /// 対象ファイル ID。指定時は --scope を無視して 1 件だけ生成し直す。
+        #[arg(long)]
+        file: Option<String>,
     },
 }
 
@@ -206,6 +289,17 @@ async fn main() -> anyhow::Result<()> {
             job_runner.spawn_workers(workers);
             let job_store = job_runner.store().clone();
 
+            // AI 自動タグ層。プレビューと同じ JobStore を共有しつつ、ワーカーは
+            // 別立てにする（生成が数十秒のネットワーク待ちなので、相乗りさせると
+            // プレビュー生成が詰まる）。
+            let ai = open_ai_layer(&cli, engine.clone(), meta.clone(), job_store.clone()).await?;
+            if let Some(ai) = &ai {
+                tracing::info!("AI タグ生成ワーカー: {}", cli.ai_workers);
+                ai.runner.spawn_workers(cli.ai_workers as usize);
+            } else {
+                tracing::info!("AI タグ生成は無効（--ai-endpoint 未指定）");
+            }
+
             let state = ApiState {
                 meta: meta.clone(),
                 engine: engine.clone(),
@@ -221,6 +315,7 @@ async fn main() -> anyhow::Result<()> {
                 cache_store: cache_store.clone(),
                 job_store,
                 cache_dir: cache_dir.clone(),
+                ai: ai.as_ref().map(|a| a.service.clone()),
             };
             let app = yozist_api::router(state);
 
@@ -355,6 +450,57 @@ async fn main() -> anyhow::Result<()> {
             println!("cache-regenerate: {count} 件投入。処理中...");
             report_drain_result("cache-regenerate", job_runner.drain().await);
         }
+        Cmd::AiTagGenerate { scope, file } => {
+            let (meta, engine) = open_meta_and_engine(&cli.data).await?;
+            let cache_dir = resolve_cache_dir(&cli).await?;
+            let job_store =
+                Arc::new(yozist_jobs::JobStore::open(cache_dir.join("jobs.sqlite")).await?);
+            let ai = open_ai_layer(&cli, engine, meta.clone(), job_store)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "AI タグ生成が無効です（--ai-endpoint / --ai-model を指定してください）"
+                    )
+                })?;
+
+            let summary = if let Some(id) = file {
+                // ファイル指定は「この 1 件を今すぐ作り直す」意図なので scope は見ない。
+                let uuid = uuid::Uuid::parse_str(id)
+                    .map_err(|e| anyhow::anyhow!("invalid file id: {e}"))?;
+                let file_id = FileId::from_uuid(uuid);
+                let f = meta
+                    .get_file(&file_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("file not found: {id}"))?;
+                let commit = f
+                    .current_commit
+                    .ok_or_else(|| anyhow::anyhow!("コミットがまだありません: {id}"))?;
+                let inserted = ai.service.enqueue(&file_id, &commit).await?;
+                yozist_ai::EnqueueSummary {
+                    targets: 1,
+                    enqueued: usize::from(inserted),
+                    already_queued: usize::from(!inserted),
+                }
+            } else {
+                let scope = yozist_db::AiTagScope::parse(scope).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--scope は missing / stale / all のいずれかです: {scope}"
+                    )
+                })?;
+                ai.service.enqueue_scope(scope).await?
+            };
+
+            println!(
+                "ai-tag-generate: 対象 {} 件のうち {} 件投入、{} 件は投入済みのジョブが処理待ち。\
+                 同時 {} 件で処理中...",
+                summary.targets, summary.enqueued, summary.already_queued, cli.ai_workers
+            );
+            // 生成はネットワーク待ちなので直列だと件数倍の時間がかかる。
+            report_drain_result(
+                "ai-tag-generate",
+                ai.runner.drain_with(cli.ai_workers as usize).await,
+            );
+        }
     }
     Ok(())
 }
@@ -393,12 +539,7 @@ async fn open_cache_layer(
     cli: &Cli,
     engine: Arc<VersioningEngine>,
 ) -> anyhow::Result<(Arc<yozist_jobs::JobRunner>, Arc<yozist_cache::CacheStore>, PathBuf)> {
-    let cache_dir = cli
-        .cache_dir
-        .clone()
-        .unwrap_or_else(|| cli.data.join("cache"));
-    tokio::fs::create_dir_all(&cache_dir).await?;
-    tracing::info!("preview cache dir: {}", cache_dir.display());
+    let cache_dir = resolve_cache_dir(cli).await?;
 
     match sweep_leftover_temp_files(&cache_dir).await {
         Ok(0) => {}
@@ -434,6 +575,107 @@ async fn open_cache_layer(
     Ok((runner, cache_store, cache_dir))
 }
 
+/// キャッシュディレクトリを解決して作成する。ここにはプレビュー実体のほか、
+/// 全ジョブ種別が共有する `jobs.sqlite` も置かれる。
+async fn resolve_cache_dir(cli: &Cli) -> anyhow::Result<PathBuf> {
+    let cache_dir = cli
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| cli.data.join("cache"));
+    tokio::fs::create_dir_all(&cache_dir).await?;
+    tracing::info!("preview cache dir: {}", cache_dir.display());
+    Ok(cache_dir)
+}
+
+/// AI 自動タグ層。`--ai-endpoint` 未指定なら組み立てない。
+struct AiLayer {
+    /// `ai.tag` だけを登録した専用ランナー。プレビュー生成と同じ `JobStore` を
+    /// 共有しつつ、ワーカー本数を独立に決めるために runner を分けている
+    /// （`JobStore::claim_next` は kind で絞れる）。相乗りさせると、数十秒の
+    /// ネットワーク待ちが CPU バウンドなプレビュー生成のワーカーを塞ぐ。
+    runner: Arc<yozist_jobs::JobRunner>,
+    service: Arc<yozist_ai::AiTagService>,
+}
+
+/// AI タグ生成に必要な一式（vision プロバイダ・narashi 正規化・ジョブハンドラ）を
+/// 組み立て、`kind = "ai.tag"` として登録した専用ランナーを返す。
+/// `--ai-endpoint` 未指定時は `Ok(None)`（AI 機能なしで従来どおり動く）。
+async fn open_ai_layer(
+    cli: &Cli,
+    engine: Arc<VersioningEngine>,
+    meta: SharedMetaStore,
+    job_store: Arc<yozist_jobs::JobStore>,
+) -> anyhow::Result<Option<AiLayer>> {
+    let Some(endpoint) = cli.ai_endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let model = cli
+        .ai_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("--ai-endpoint を指定する場合は --ai-model も必要です")
+        })?;
+
+    let embedding_endpoint = cli
+        .ai_embedding_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(endpoint);
+
+    tracing::info!("AI タグ生成モデル: {model} / 埋め込み: {}", cli.ai_embedding_model);
+
+    // 参照を失った AI タグの取り残しを掃除する。通常は差し替えのたびに
+    // `replace_ai_file_tags` が消すが、旧バージョンの残骸や異常終了で残った分を
+    // ここで拾う。ワーカーを起動する前に済ませる（生成中に走らせると、タグを
+    // 作ってからファイルへ結び付けるまでの隙間にある行を消してしまう）。
+    match meta.delete_orphaned_ai_tags().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("参照されていない AI タグを {n} 件削除"),
+        Err(e) => tracing::warn!("AI タグの掃除に失敗: {e}"),
+    }
+
+    let provider = yozist_ai::OpenAiVisionProvider::new(
+        endpoint,
+        model,
+        cli.ai_api_key.clone(),
+        cli.ai_tag_max as usize,
+        Some(cli.ai_reasoning_effort.clone()),
+        std::time::Duration::from_secs(cli.ai_timeout_secs),
+    )?;
+    let normalizer = yozist_ai::TagNormalizer::new(
+        embedding_endpoint,
+        cli.ai_embedding_model.clone(),
+        cli.ai_api_key.clone(),
+        cli.ai_tag_similarity,
+    )?;
+
+    let settings = yozist_ai::AiTagSettings {
+        model: model.to_string(),
+        max_tags: cli.ai_tag_max as usize,
+        min_confidence: cli.ai_tag_min_confidence,
+        vocab_limit: cli.ai_vocab_limit as usize,
+    };
+
+    let handler: Arc<dyn yozist_jobs::JobHandler> = Arc::new(yozist_ai::AiTagJobHandler::new(
+        engine,
+        meta.clone(),
+        Arc::new(provider),
+        Arc::new(normalizer),
+        settings,
+    ));
+    let mut runner = yozist_jobs::JobRunner::new(job_store.clone());
+    runner.register(yozist_ai::AI_TAG_JOB_KIND, handler);
+
+    Ok(Some(AiLayer {
+        runner: Arc::new(runner),
+        service: Arc::new(yozist_ai::AiTagService::new(job_store, meta, model.to_string())),
+    }))
+}
+
 /// `JobRunner::drain` の戻り値（捌けずに残った件数）を人間向けに報告する。
 /// リトライ上限に達して恒久失敗したジョブがあると 0 にならないことがあるため、
 /// 「完了」と言い切らずに残件数を出す。
@@ -451,6 +693,25 @@ fn parse_quality(s: &str) -> Result<f32, String> {
     let v: f32 = s.parse().map_err(|_| format!("数値ではありません: {s}"))?;
     if !(0.0..=100.0).contains(&v) {
         return Err(format!("品質は 0-100 の範囲で指定してください: {v}"));
+    }
+    Ok(v)
+}
+
+/// 信頼度の閾値は 0.0-1.0。範囲外だと全部落ちる／全部通るのどちらかになり、
+/// 設定ミスに気付きにくいので起動時に弾く。
+fn parse_confidence(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|_| format!("数値ではありません: {s}"))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("信頼度は 0.0-1.0 の範囲で指定してください: {v}"));
+    }
+    Ok(v)
+}
+
+/// 表記ゆれ統合のしきい値は 0-100（narashi のスコア域）。
+fn parse_similarity(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|_| format!("数値ではありません: {s}"))?;
+    if !(0.0..=100.0).contains(&v) {
+        return Err(format!("しきい値は 0-100 の範囲で指定してください: {v}"));
     }
     Ok(v)
 }

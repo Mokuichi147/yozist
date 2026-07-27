@@ -76,6 +76,9 @@ pub struct ApiState {
     /// キャッシュ実ファイルの保存先（SSD 等の高速ストレージを想定）。
     /// `cache_store` の `rel_path` はこのディレクトリからの相対パス。
     pub cache_dir: std::path::PathBuf,
+    /// AI 自動タグ生成の投入口。`--ai-endpoint` 未指定なら `None`（機能無効）。
+    /// 生成結果はキャッシュではなくメタ DB に永続化される。
+    pub ai: Option<Arc<yozist_ai::AiTagService>>,
 }
 
 /// 展開済み content の単一エントリキャッシュ（直近に読んだファイル）。
@@ -138,6 +141,15 @@ pub fn router(state: ApiState) -> Router {
             get(list_file_tags).post(attach_tag),
         )
         .route("/api/files/:id/tags/:tag_id", axum::routing::delete(detach_tag))
+        .route("/api/files/:id/ai-tags", get(get_ai_tags))
+        .route(
+            "/api/files/:id/ai-tags/regenerate",
+            post(regenerate_ai_tags),
+        )
+        // 注意: 静的セグメント "regenerate" は同階層に :id ルートを足す時に
+        // 先勝ちになる（matchit の仕様）。現状 /api/ai-tags 直下は 2 本のみ。
+        .route("/api/ai-tags", get(ai_tag_status))
+        .route("/api/ai-tags/regenerate", post(regenerate_ai_tags_bulk))
         .route("/api/files/:id/series", get(list_file_series))
         .route("/api/tags", get(list_tags).post(upsert_tag))
         // 注意: 静的セグメント "stats"/"merge" は `:id` より優先マッチする（matchit の仕様）。
@@ -685,6 +697,10 @@ async fn create_file(
     if let Some(client) = client.as_deref() {
         s.engine.attach_client_tag(file.id, client).await;
     }
+
+    // 画像なら AI 自動タグ生成を投入する（有効時のみ。バックグラウンド処理なので
+    // レスポンスは待たない）。
+    enqueue_ai_tag_job(&s, file.id).await;
 
     let file = record_file_actor(&s, file.id, &ctx, true).await.unwrap_or(file);
     Ok((StatusCode::CREATED, Json(file)))
@@ -1459,6 +1475,8 @@ async fn commit_file(
 
     let commit = result?;
     record_file_actor(&s, id, &ctx, false).await;
+    // 内容が変わったので、この commit に対する AI タグを取り直す。
+    enqueue_ai_tag_job(&s, id).await;
     Ok(Json(commit))
 }
 
@@ -1800,8 +1818,12 @@ struct TagStat {
 }
 
 /// 管理操作（改名・削除・合流）の対象タグを検証する。タグが存在しなければ `NotFound`、
-/// システムタグ（拡張子・種別など自動付与）なら `BadRequest` を返す。システムタグは
-/// ファイル属性から自動再生成されるため、手動での改名・削除・合流の対象にしない。
+/// システムタグ・AI タグなら `BadRequest` を返す。
+///
+/// どちらも自動生成されるタグで、手で書き換えても次の生成で上書きされる。
+/// システムタグはファイル属性から、AI タグは再生成から作り直される。
+/// 手を入れたい場合は同名タグを手動で作れば、`upsert_tag` の優先度ルール
+/// （Manual > Ai > System）で manual へ昇格し、以後は編集できるようになる。
 async fn require_editable_tag(s: &ApiState, id: &TagId) -> Result<(), ApiError> {
     let tag = s
         .meta
@@ -1809,12 +1831,15 @@ async fn require_editable_tag(s: &ApiState, id: &TagId) -> Result<(), ApiError> 
         .await
         .map_err(ApiError::from_db)?
         .ok_or(ApiError::NotFound)?;
-    if matches!(tag.kind, TagKind::System) {
-        return Err(ApiError::BadRequest(
+    match tag.kind {
+        TagKind::System => Err(ApiError::BadRequest(
             "システムタグは変更・削除・合流できません".into(),
-        ));
+        )),
+        TagKind::Ai => Err(ApiError::BadRequest(
+            "AI 生成タグは変更・削除・合流できません（再生成で更新されます）".into(),
+        )),
+        TagKind::Manual => Ok(()),
     }
-    Ok(())
 }
 
 async fn list_tag_stats(State(s): State<ApiState>) -> Result<Json<Vec<TagStat>>, ApiError> {
@@ -1970,6 +1995,18 @@ async fn detach_tag(
     let tag_uuid = uuid::Uuid::parse_str(&tag_id)
         .map(TagId::from_uuid)
         .map_err(|e| ApiError::BadRequest(format!("tag_id: {e}")))?;
+    // AI が付けたタグは手動で外させない。外しても次の再生成で戻るうえ、
+    // ai_file_tags 側に所有権が残ると「付いていないのに AI タグ扱い」という
+    // 不整合になる。更新したいときは再生成を使う。
+    if s.meta
+        .is_ai_file_tag(&file_id, &tag_uuid)
+        .await
+        .map_err(ApiError::from_db)?
+    {
+        return Err(ApiError::BadRequest(
+            "AI 生成タグは手動で外せません（再生成で更新されます）".into(),
+        ));
+    }
     let res = s
         .meta
         .detach_tag(&file_id, &tag_uuid)
@@ -1990,6 +2027,287 @@ async fn detach_tag(
     res?;
     refresh_fts_tags(&s, &file_id).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// AI 自動タグ
+// ---------------------------------------------------------------------------
+
+/// AI 機能が有効なら投入口を返す。無効時は 400（機能そのものが無いので、
+/// リトライしても意味が無いことを呼び出し側に伝える）。
+fn require_ai(s: &ApiState) -> Result<&Arc<yozist_ai::AiTagService>, ApiError> {
+    s.ai.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("AI タグ生成が無効です（サーバ側の設定が必要です）".into())
+    })
+}
+
+fn ai_enqueue_error(e: yozist_ai::AiTagEnqueueError) -> ApiError {
+    match e {
+        yozist_ai::AiTagEnqueueError::Db(e) => ApiError::from_db(e),
+        e => ApiError::Internal(e.to_string()),
+    }
+}
+
+#[derive(Serialize)]
+struct AiTagItem {
+    id: TagId,
+    name: String,
+    /// このタグを生成したモデル。ファイルごとに記録される。
+    model: String,
+    confidence: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct AiTagRunView {
+    status: &'static str,
+    model: String,
+    error: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct AiTagsResponse {
+    /// サーバ側で AI 機能が有効か。false なら UI はカードごと隠す。
+    enabled: bool,
+    /// 現在の設定で使うモデル。`run.model` と違えば付け直しの余地がある。
+    current_model: Option<String>,
+    run: Option<AiTagRunView>,
+    /// 生成時のモデル or コミットが現在と食い違っているか。
+    stale: bool,
+    tags: Vec<AiTagItem>,
+}
+
+async fn get_ai_tags(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<Json<AiTagsResponse>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    let file = require_read_file(&s, &ctx, file_id).await?;
+
+    let Some(ai) = s.ai.as_ref() else {
+        // 無効時も 200 で返す。UI は enabled を見てカードを隠すだけでよく、
+        // エラー処理を書かせない。
+        return Ok(Json(AiTagsResponse {
+            enabled: false,
+            current_model: None,
+            run: None,
+            stale: false,
+            tags: Vec::new(),
+        }));
+    };
+
+    let run = s
+        .meta
+        .get_ai_tag_run(&file_id)
+        .await
+        .map_err(ApiError::from_db)?;
+    let tags = s
+        .meta
+        .list_ai_file_tags(&file_id)
+        .await
+        .map_err(ApiError::from_db)?;
+
+    let stale = run.as_ref().is_some_and(|r| {
+        r.model != ai.model() || file.current_commit != Some(r.commit_id)
+    });
+
+    Ok(Json(AiTagsResponse {
+        enabled: true,
+        current_model: Some(ai.model().to_string()),
+        run: run.map(|r| AiTagRunView {
+            status: r.status.as_str(),
+            model: r.model,
+            error: r.error,
+            updated_at: r
+                .updated_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+        }),
+        stale,
+        tags: tags
+            .into_iter()
+            .map(|(tag, model, confidence)| AiTagItem {
+                id: tag.id,
+                name: tag.name,
+                model,
+                confidence,
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Serialize)]
+struct AiTagEnqueued {
+    /// 実際にジョブ行が入ったか。false は既存の未完了ジョブが拾う。
+    enqueued: bool,
+}
+
+async fn regenerate_ai_tags(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Path(id): Path<String>,
+) -> Result<Json<AiTagEnqueued>, ApiError> {
+    let file_id = parse_file_id(&id)?;
+    require_permission(
+        &*s.authz,
+        &ctx,
+        &Target::file(file_id),
+        PermissionMask::WRITE,
+    )
+    .await?;
+    let ai = require_ai(&s)?.clone();
+
+    let file = s
+        .meta
+        .get_file(&file_id)
+        .await
+        .map_err(ApiError::from_db)?
+        .ok_or(ApiError::NotFound)?;
+    if !file.mime.as_deref().is_some_and(|m| m.starts_with("image/")) {
+        return Err(ApiError::BadRequest(
+            "AI タグ生成は画像ファイルのみ対応しています".into(),
+        ));
+    }
+    let commit = file
+        .current_commit
+        .ok_or_else(|| ApiError::BadRequest("コミットがまだありません".into()))?;
+
+    let res = ai.enqueue(&file_id, &commit).await.map_err(ai_enqueue_error);
+    let file_str = file_id.to_string();
+    let meta = format!("{{\"model\":\"{}\"}}", ai.model());
+    audit_event(
+        &s,
+        &ctx,
+        "ai_tag_regenerate",
+        Some("file"),
+        Some(&file_str),
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    Ok(Json(AiTagEnqueued { enqueued: res? }))
+}
+
+#[derive(Serialize)]
+struct AiTagStatusResponse {
+    enabled: bool,
+    current_model: Option<String>,
+    /// 各スコープの対象件数。`missing <= stale <= all` になる。
+    missing: u64,
+    stale: u64,
+    all: u64,
+}
+
+/// 管理画面用。AI 機能の有無と、各スコープが何件を対象にするかを返す。
+async fn ai_tag_status(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+) -> Result<Json<AiTagStatusResponse>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let Some(ai) = s.ai.as_ref() else {
+        return Ok(Json(AiTagStatusResponse {
+            enabled: false,
+            current_model: None,
+            missing: 0,
+            stale: 0,
+            all: 0,
+        }));
+    };
+    let model = ai.model();
+    let mut counts = [0u64; 3];
+    for (i, scope) in [
+        yozist_db::AiTagScope::Missing,
+        yozist_db::AiTagScope::Stale,
+        yozist_db::AiTagScope::All,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        counts[i] = s
+            .meta
+            .count_ai_tag_targets(scope, model)
+            .await
+            .map_err(ApiError::from_db)?;
+    }
+    Ok(Json(AiTagStatusResponse {
+        enabled: true,
+        current_model: Some(model.to_string()),
+        missing: counts[0],
+        stale: counts[1],
+        all: counts[2],
+    }))
+}
+
+#[derive(Deserialize)]
+struct AiTagBulkInput {
+    /// `missing` / `stale` / `all`。
+    scope: String,
+}
+
+#[derive(Serialize)]
+struct AiTagBulkResult {
+    targets: usize,
+    enqueued: usize,
+    already_queued: usize,
+}
+
+async fn regenerate_ai_tags_bulk(
+    State(s): State<ApiState>,
+    AuthCtx(ctx): AuthCtx,
+    Json(input): Json<AiTagBulkInput>,
+) -> Result<Json<AiTagBulkResult>, ApiError> {
+    require_authenticated(&ctx).await?;
+    let ai = require_ai(&s)?.clone();
+    let scope = yozist_db::AiTagScope::parse(&input.scope).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "scope は missing / stale / all のいずれかです: {}",
+            input.scope
+        ))
+    })?;
+
+    let res = ai.enqueue_scope(scope).await.map_err(ai_enqueue_error);
+    let meta = format!(
+        "{{\"scope\":\"{}\",\"model\":\"{}\"}}",
+        scope.as_str(),
+        ai.model()
+    );
+    audit_event(
+        &s,
+        &ctx,
+        "ai_tag_bulk_regenerate",
+        None,
+        None,
+        Some(&meta),
+        &res.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+    )
+    .await;
+    let summary = res?;
+    Ok(Json(AiTagBulkResult {
+        targets: summary.targets,
+        enqueued: summary.enqueued,
+        already_queued: summary.already_queued,
+    }))
+}
+
+/// 画像のアップロード / コミット後に AI タグ生成を投入する。
+///
+/// 失敗しても呼び出し元の操作は壊さない（`attach_source_tag` と同じ方針）。
+/// 生成されなかった分は `ai-tag-generate --scope missing` で拾い直せる。
+async fn enqueue_ai_tag_job(s: &ApiState, file_id: FileId) {
+    let Some(ai) = s.ai.as_ref() else { return };
+    let Ok(Some(file)) = s.meta.get_file(&file_id).await else {
+        return;
+    };
+    if !file.mime.as_deref().is_some_and(|m| m.starts_with("image/")) {
+        return;
+    }
+    let Some(commit) = file.current_commit else {
+        return;
+    };
+    if let Err(e) = ai.enqueue(&file_id, &commit).await {
+        tracing::warn!("AI タグ生成ジョブを投入できません: {e}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -3988,6 +4306,8 @@ mod tests {
                 cache_store: Arc::new(yozist_cache::CacheStore::open_in_memory().await.unwrap()),
                 job_store: Arc::new(yozist_jobs::JobStore::open_in_memory().await.unwrap()),
                 cache_dir: dir.path().join("cache"),
+                // テストは AI 無効構成（外部エンドポイントに依存させない）。
+                ai: None,
             },
             dir,
         )

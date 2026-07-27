@@ -32,6 +32,37 @@ SMB 上に見えるのは「従来のフォルダ階層」ではなく、タグ�
 
 **フィルター**は macOS のスマートフォルダのように、タグ（手動 / システム / AI / 種別不問）・シリーズ・種類(MIME)・名前・日付（作成 / 更新）の条件を「すべて(AND) / いずれか(OR)」で組み合わせて定義できる。名前・条件は作成したユーザーが WebUI からいつでも変更でき、作成・編集・削除は専用の **フィルターページ (`/ui/filters`)** で行う。条件評価は REST（一覧）と SMB（`filters\<名前>\`）で共通の `yozist-db::resolve_filter` が担い、DB を都度参照するため変更は即時反映される。Explorer のドラッグ＆ドロップでタグ付けが完結する。
 
+### AI による自動タグ付け
+
+画像ファイルは、vision 対応 LLM（OpenAI 互換エンドポイント）で内容からタグを自動生成できる。
+アップロード／コミット時にバックグラウンドのジョブキューへ投入され、生成が終わるとタグが付く。
+
+LLM の出すタグ名は表記ゆれが激しい（「白背景 / 白い背景 / 白バック」）ため、
+[narashi](https://crates.io/crates/narashi) の多言語埋め込みで既存タグ語彙へ寄せる（日本語優先）。
+「山」が既存の「山岳」に吸収される、といった統合が自動で効く。
+
+- 生成タグは手動タグと同じ `tags` / `file_tags` に載り、検索・フィルタ・SMB からそのまま使える
+- どのモデルで生成したかをファイル単位で記録し、モデルを差し替えた分だけ付け直せる
+- 生成タグは利用者からは変更できない（更新は再生成のみ）。同名タグを手動で作れば
+  優先度ルール（Manual > AI > System）で手動タグへ昇格し、以後は編集できる
+- 付け直しは **未生成 / このモデルで未生成 / すべて** の 3 段階で、
+  WebUI の管理ページと CLI (`ai-tag-generate --scope`) の両方から実行できる
+- 生成はほぼ全部がネットワーク待ちなので、サーバ・CLI とも既定で 4 件を同時に
+  処理する（`--ai-workers`）。接続先が受けられる同時実行数に合わせて調整する。
+  プレビュー生成（CPU バウンド）とはワーカーを分けてあり、互いに詰まらせない
+
+`--ai-endpoint` を指定しない限り機能ごと無効（既存の動作のまま）。設定は CLI 引数と
+環境変数のどちらでも渡せる（`--help` を参照）。
+
+```sh
+# 接続先とモデルを指定して起動
+cargo run -p yozist-server -- --ai-endpoint http://<host>:<port>/v1 --ai-model <model> serve
+
+# 既存ファイルへの一括適用 / モデル変更後の付け直し
+cargo run -p yozist-server -- --ai-endpoint ... --ai-model ... ai-tag-generate --scope missing
+cargo run -p yozist-server -- --ai-endpoint ... --ai-model ... ai-tag-generate --scope stale
+```
+
 ### 並行アクセス前提
 
 - テキスト: CRDT で自動マージ（`yrs` ベース）
@@ -54,7 +85,7 @@ yozist/
 │   ├── yozist-versioning/ CrdtFormat trait + CrdtRegistry（プラガブル）
 │   ├── yozist-tagging/    3 層タグ + シリーズ
 │   ├── yozist-auth/       UserPermission の Rust 移植 + ACL
-│   ├── yozist-ai/         AiProvider trait
+│   ├── yozist-ai/         AiProvider trait + vision タグ生成 + narashi 正規化
 │   ├── yozist-smb/        タグ／シリーズ別仮想 share
 │   └── yozist-api/        axum REST + WebUI（leptos）
 └── apps/
