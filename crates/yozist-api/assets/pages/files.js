@@ -12,6 +12,8 @@ let tagsByFile = {};        // file_id -> [Tag]
 let hasMore = false;        // ブラウズモード時にまだ続きがあるか (X-Has-More)
 let browseOffset = 0;       // ブラウズモードの DB オフセット
 let browseMode = true;      // フィルタなし（サーバページング）かどうか
+// フィルタ適用中に候補として残すタグ名。null は「制限しない」。
+let availableTags = null;
 
 async function init() {
   const me = await requireAuth();
@@ -31,15 +33,40 @@ async function loadTags() {
   } catch (e) { allTags = []; }
 }
 
+// フィルタ結果に含まれるタグ名を集計し、候補の絞り込みに使う。
+//
+// ブラウズモード（フィルタなし）では制限しない: 一覧はサーバページングで
+// 先頭ページしか読んでいないため、そこに出ていないタグを隠すと「押せば結果が
+// あるタグ」が消えてしまう。
+//
+// /api/files/tags はタグなしのファイルも空配列で返すので、`id in tagsByFile`
+// で「取得済み」を判定できる。まだ 1 件も取得できていない間は制限しない
+// （取得完了後に fetchTagsFor から再計算・再描画される）。
+function updateAvailableTags() {
+  if (browseMode) { availableTags = null; return; }
+  const names = new Set();
+  let loaded = 0;
+  for (const f of allFiles) {
+    if (!(f.id in tagsByFile)) continue;
+    loaded++;
+    for (const t of tagsByFile[f.id]) names.add(t.name);
+  }
+  availableTags = (loaded === 0 && allFiles.length > 0) ? null : names;
+}
+
 function renderTags() {
   const box = $('f-tags');
   const filter = (/** @type {HTMLInputElement} */ ($('f-tag-search')).value || '').trim().toLowerCase();
-  // 選択中タグは絞り込みに関わらず常に先頭へ（解除手段を見失わないように）
+  // 選択中タグは絞り込み・フィルタ結果に関わらず常に残す（解除手段を見失わないように）
   const visible = allTags.filter(t =>
-    selectedTags.has(t.name) || !filter || t.name.toLowerCase().includes(filter));
+    selectedTags.has(t.name)
+    || ((!availableTags || availableTags.has(t.name))
+        && (!filter || t.name.toLowerCase().includes(filter))));
   if (visible.length === 0) {
     box.replaceChildren(el('span', { class: 'text-xs opacity-50' },
-      allTags.length === 0 ? 'タグなし' : '該当するタグなし'));
+      allTags.length === 0 ? 'タグなし'
+        : filter ? '該当するタグなし'
+        : '絞り込み結果にタグなし'));
     return;
   }
   // allTags は /api/tags?sort=usage の順（割り当て数の降順 → 名前の昇順）。
@@ -100,6 +127,7 @@ function resetFilters() {
   /** @type {HTMLSelectElement} */ ($('f-series')).value = '';
   /** @type {HTMLSelectElement} */ ($('f-filter')).value = '';
   selectedTags.clear();
+  availableTags = null;   // 直前のフィルタ結果による絞り込みを引きずらない
   renderTags();
   applyFilters();
 }
@@ -194,6 +222,8 @@ async function applyFilters() {
   allFiles = files;
   hasMore = false;
   renderFiles();
+  updateAvailableTags();
+  renderTags();
   fetchTagsFor(files.map(f => f.id));
 }
 
@@ -219,6 +249,8 @@ async function fetchBrowsePage() {
   browseOffset = Number.isNaN(next) ? browseOffset + PAGE : next;
   allFiles = allFiles.concat(page);
   renderFiles();
+  updateAvailableTags();
+  renderTags();
   fetchTagsFor(page.map(f => f.id));
 }
 
@@ -258,6 +290,9 @@ async function fetchTagsFor(ids) {
   /** @type {NodeListOf<HTMLElement>} */ (document.querySelectorAll('[data-tags-for]')).forEach(node => {
     renderRowTags(node, node.dataset.tagsFor);
   });
+  // 左カラムの候補も、取得できたタグで絞り直す
+  updateAvailableTags();
+  renderTags();
 }
 
 function renderRowTags(box, fileId) {
