@@ -116,7 +116,7 @@ let aiModel = '';
 
 const AI_SCOPE_LABEL = {
   missing: '未割り当てのみ',
-  stale: '未割り当て + モデル変更分',
+  stale: 'このモデルで未生成',
   all: 'すべて',
 };
 
