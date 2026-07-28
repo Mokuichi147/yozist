@@ -115,7 +115,7 @@ let aiCounts = { missing: 0, stale: 0, all: 0 };
 let aiModel = '';
 
 const AI_SCOPE_LABEL = {
-  missing: '未割り当てのみ',
+  missing: '未割り当て',
   stale: 'このモデルで未生成',
   all: 'すべて',
 };
