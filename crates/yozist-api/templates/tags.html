@@ -17,7 +17,7 @@
       <option value="asc">昇順</option>
     </select>
     <span class="flex-1"></span>
-    <button class="btn btn-xs btn-ghost" onclick="loadTags()">更新</button>
+    <button class="btn btn-xs btn-ghost" onclick="refresh()">更新</button>
   </div>
 
   <!-- 手動タグ: 操作できるのはこちらだけ -->
@@ -37,14 +37,26 @@
     </div>
   </div>
 
-  <!-- 自動生成タグ: 読み取り専用 -->
+  <!-- 自動生成タグ: 個々のタグは読み取り専用。入れ替えは一括割り当てで行う -->
   <div class="card bg-base-100 shadow-sm">
     <div class="card-body p-4">
-      <h2 class="text-xs tracking-wider opacity-60 font-semibold mb-1">自動生成タグ</h2>
-      <p class="text-xs opacity-60 mb-2">
-        AI が画像から付けたタグです。変更はできません
-        （ファイル詳細ページの再生成で入れ替わります）。
-      </p>
+      <!-- 一括割り当ては見出し行に同居させる（説明は確認ダイアログ側に置く）。
+           サーバ側で AI が無効なら JS が #ai-assign ごと隠す。 -->
+      <div class="flex flex-wrap items-center gap-2 mb-2">
+        <h2 class="text-xs tracking-wider opacity-60 font-semibold">自動生成タグ</h2>
+        <span class="flex-1"></span>
+        <div id="ai-assign" class="hidden">
+          <div class="flex items-center gap-2">
+            <select id="ai-scope" class="select select-bordered select-xs min-w-0">
+              <option value="missing" selected>未割り当て</option>
+              <option value="stale">このモデルで未生成</option>
+              <option value="all">すべて</option>
+            </select>
+            <button class="btn btn-xs btn-primary shrink-0" onclick="runAiAssign()">割り当て</button>
+          </div>
+        </div>
+      </div>
+
       <div id="ai-tag-list" class="space-y-1">…</div>
     </div>
   </div>

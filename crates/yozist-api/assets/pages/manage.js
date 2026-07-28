@@ -11,59 +11,7 @@ async function init() {
 }
 
 async function refresh() {
-  await Promise.all([loadGroups(), loadShares(), loadAudit(), loadAiStatus()]);
-}
-
-// ---- ai auto tags ----
-// スコープごとの対象件数。確認ダイアログに出すため保持する。
-let aiCounts = { missing: 0, stale: 0, all: 0 };
-
-const AI_SCOPE_LABEL = {
-  missing: '未生成',
-  stale: 'このモデルで未生成',
-  all: 'すべて',
-};
-
-async function loadAiStatus() {
-  const card = $('ai-card');
-  let info;
-  try {
-    info = await json('/api/ai-tags');
-  } catch (e) {
-    card.classList.add('hidden');
-    return;
-  }
-  if (!info.enabled) { card.classList.add('hidden'); return; }
-  card.classList.remove('hidden');
-  aiCounts = { missing: info.missing, stale: info.stale, all: info.all };
-  $('ai-model').replaceChildren(info.current_model);
-  $('ai-result').replaceChildren(
-    `未生成 ${info.missing} 件 / このモデルで未生成 ${info.stale} 件 / 全体 ${info.all} 件`
-  );
-}
-
-async function regenerateAiTags(scope) {
-  const count = aiCounts[scope] ?? 0;
-  if (count === 0) { uiToast('対象のファイルがありません', 'info'); return; }
-  const label = AI_SCOPE_LABEL[scope] || scope;
-  const ok = await uiConfirm(
-    `${label}の ${count} 件について AI タグを生成し直しますか？\n` +
-    '1 枚あたり数十秒かかります。',
-    { danger: scope === 'all', okText: '開始' }
-  );
-  if (!ok) return;
-
-  try {
-    const r = await json('/api/ai-tags/regenerate', { method: 'POST', body: { scope } });
-    uiToast(
-      `${r.enqueued} 件を投入しました` +
-      (r.already_queued ? `（${r.already_queued} 件は処理待ち）` : ''),
-      'success'
-    );
-    await loadAiStatus();
-  } catch (e) {
-    uiToast('投入に失敗しました: ' + e.message, 'error');
-  }
+  await Promise.all([loadGroups(), loadShares(), loadAudit()]);
 }
 
 // ---- groups ----
@@ -225,5 +173,5 @@ init();
 
 // テンプレートのインライン onclick から参照される関数を明示的に公開する。
 // (manageGroupMembers / removeMember / revokeShare は el() のクロージャ直結になり公開不要)
-Object.assign(window, { createGroup, loadShares, loadAudit, regenerateAiTags });
+Object.assign(window, { createGroup, loadShares, loadAudit });
 })();

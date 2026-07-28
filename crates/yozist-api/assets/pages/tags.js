@@ -11,7 +11,12 @@ async function init() {
   const me = await requireAuth();
   if (!me) return;
   $('main').classList.remove('hidden');
-  await loadTags();
+  await refresh();
+}
+
+// 一覧と一括割り当ての対象件数はどちらも AI の実行で変わるので、まとめて取り直す。
+async function refresh() {
+  await Promise.all([loadTags(), loadAiStatus()]);
 }
 
 // 配色は file_detail / files 一覧と統一する。AI タグに専用色は当てない
@@ -101,6 +106,63 @@ function renderList(box, list, editable) {
         ? el('button', { class: 'btn btn-xs btn-error btn-outline', onclick: () => deleteTag(t.id) }, '削除')
         : null,
     ])));
+}
+
+// ---- AI タグの一括割り当て ----
+// スコープごとの対象件数。選択肢の表示と確認ダイアログに出すため保持する。
+let aiCounts = { missing: 0, stale: 0, all: 0 };
+// 現在のモデル名。画面には出さず、確認ダイアログでだけ見せる。
+let aiModel = '';
+
+const AI_SCOPE_LABEL = {
+  missing: '未割り当て',
+  stale: 'このモデルで未生成',
+  all: 'すべて',
+};
+
+async function loadAiStatus() {
+  const box = $('ai-assign');
+  let info;
+  try {
+    info = await json('/api/ai-tags');
+  } catch (e) {
+    box.classList.add('hidden');
+    return;
+  }
+  // AI が無効なら実行しても何も起きないので、操作自体を出さない。
+  if (!info.enabled) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  aiCounts = { missing: info.missing, stale: info.stale, all: info.all };
+  aiModel = info.current_model;
+  // どれを選ぶと何件動くのかを、選ぶ前に選択肢そのもので見せる。
+  for (const opt of /** @type {HTMLSelectElement} */ ($('ai-scope')).options) {
+    opt.textContent = `${AI_SCOPE_LABEL[opt.value]}（${aiCounts[opt.value] ?? 0} 件）`;
+  }
+}
+
+async function runAiAssign() {
+  const scope = /** @type {HTMLSelectElement} */ ($('ai-scope')).value;
+  const count = aiCounts[scope] ?? 0;
+  if (count === 0) { uiToast('対象のファイルがありません', 'info'); return; }
+  const ok = await uiConfirm(
+    `${AI_SCOPE_LABEL[scope]}の ${count} 件に AI タグを割り当て直しますか？\n` +
+    `モデル: ${aiModel} / 1 枚あたり数十秒かかります。`,
+    // すべては生成済みの分まで作り直す（時間と API 費用がかかる）ので警告色にする。
+    { danger: scope === 'all', okText: '開始' }
+  );
+  if (!ok) return;
+
+  try {
+    const r = await json('/api/ai-tags/regenerate', { method: 'POST', body: { scope } });
+    uiToast(
+      `${r.enqueued} 件を投入しました` +
+      (r.already_queued ? `（${r.already_queued} 件は処理待ち）` : ''),
+      'success'
+    );
+    await loadAiStatus();
+  } catch (e) {
+    uiToast('投入に失敗しました: ' + e.message, 'error');
+  }
 }
 
 function tagById(id) { return tags.find(t => t.id === id); }
@@ -216,6 +278,6 @@ init();
 // テンプレートのインライン onclick/onchange から参照される関数を明示的に公開する。
 // (toggleSelect / renameTag / deleteTag は el() のクロージャ直結になり公開不要)
 Object.assign(window, {
-  loadTags, onSortKeyChange, applySort, clearSelection, createTag, openMerge,
+  refresh, onSortKeyChange, applySort, clearSelection, createTag, openMerge, runAiAssign,
 });
 })();

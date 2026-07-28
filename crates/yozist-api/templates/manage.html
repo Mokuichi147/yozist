@@ -24,24 +24,8 @@
     </div>
   </div>
 
-  <!-- AI 自動タグの一括生成。サーバ側で AI が無効なら JS がカードごと隠す。 -->
-  <div id="ai-card" class="card bg-base-100 shadow-sm hidden">
-    <div class="card-body p-4">
-      <div class="flex items-center justify-between mb-2">
-        <h2 class="text-xs uppercase tracking-wider opacity-60 font-semibold">ai auto tags</h2>
-        <span id="ai-model" class="text-xs opacity-60"></span>
-      </div>
-      <p class="text-xs opacity-60 mb-2">
-        画像 1 枚あたり数十秒かかります。処理はバックグラウンドのキューで進みます。
-      </p>
-      <div class="flex flex-wrap gap-2">
-        <button class="btn btn-xs" onclick="regenerateAiTags('missing')">未生成のみ</button>
-        <button class="btn btn-xs" onclick="regenerateAiTags('stale')">このモデルで未生成</button>
-        <button class="btn btn-xs btn-outline btn-error" onclick="regenerateAiTags('all')">すべて再生成</button>
-      </div>
-      <div id="ai-result" class="text-sm mt-2 opacity-70"></div>
-    </div>
-  </div>
+  <!-- AI 自動タグの一括割り当てはタグ管理ページ（/ui/tags）に置いた。
+       タグそのものの一覧と同じ画面の方が、生成結果を見ながら操作できる。 -->
 
   <div class="card bg-base-100 shadow-sm">
     <div class="card-body p-4">
