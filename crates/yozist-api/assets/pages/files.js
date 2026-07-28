@@ -42,8 +42,12 @@ function renderTags() {
       allTags.length === 0 ? 'タグなし' : '該当するタグなし'));
     return;
   }
+  // allTags は /api/tags?sort=usage の順（割り当て数の降順 → 名前の昇順）。
+  // 選択中タグだけを先頭へ寄せ、それ以外は元の順序を保つ（名前で並べ直さない）。
+  const rank = new Map(allTags.map((t, i) => [t.name, i]));
   visible.sort((a, b) =>
-    (Number(selectedTags.has(b.name)) - Number(selectedTags.has(a.name))) || a.name.localeCompare(b.name));
+    (Number(selectedTags.has(b.name)) - Number(selectedTags.has(a.name)))
+    || (rank.get(a.name) - rank.get(b.name)));
   box.replaceChildren(...visible.map(t => {
     const active = selectedTags.has(t.name);
     const icon = t.kind === 'system' ? ' ⚙' : t.kind === 'ai' ? ' 🤖' : '';
