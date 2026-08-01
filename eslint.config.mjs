@@ -13,6 +13,10 @@ const browserGlobals = Object.fromEntries([
   'requestAnimationFrame', 'cancelAnimationFrame',
   'console', 'alert', 'confirm', 'prompt', 'CustomEvent', 'Event',
   'HTMLElement', 'Element', 'Node', 'NodeList',
+  // instanceof 判定や JSDoc 型キャストで参照する DOM サブタイプ。
+  'HTMLImageElement', 'HTMLVideoElement', 'HTMLAnchorElement',
+  'HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement', 'HTMLDialogElement',
+  'IntersectionObserver',
 ].map(name => [name, 'readonly']));
 
 // base.html が読み込む common.js（/ui/assets/common.js）が定義する共有グローバル。
