@@ -1,0 +1,32 @@
+{# 複数選択中に出る一括操作バー。ファイル一覧 / メディア一覧で共通。
+   position:fixed で画面下部に浮かせる。通常のフローに入れると (1) 選択モードに
+   入った瞬間に一覧全体が下へずれ、(2) 少しスクロールしただけで操作ボタンが
+   画面外に出てしまうため。フローから外す代わりに、開いている間は body に
+   sel-bar-open を付けて下端に余白を作り、最後の項目がバーに隠れないようにする。
+   onclick から呼ぶ関数は各ページの JS（files.js / media.js）が公開する。 #}
+<div id="sel-bar" class="hidden">
+  {# 帯自体はクリックを透過させ、中央のカードだけが操作を受ける #}
+  <div class="fixed inset-x-0 bottom-0 z-40 flex justify-center p-2 sm:p-3 pointer-events-none">
+    <div class="pointer-events-auto flex flex-wrap items-center justify-center gap-1.5 max-w-full
+                rounded-box border border-base-300 bg-base-100 px-3 py-2 shadow-lg">
+      <button class="btn btn-xs btn-ghost btn-square" onclick="exitSelMode()"
+              title="選択モードを終了">✕</button>
+      <span id="sel-count" class="text-sm font-medium"></span>
+      <button class="btn btn-xs btn-ghost" onclick="selectAllVisible()"
+              title="いま表示している項目をすべて選択">表示中を全選択</button>
+      <button class="btn btn-xs btn-ghost" data-needs-selection
+              onclick="clearSelection()">選択解除</button>
+      <span class="mx-1 h-4 w-px bg-base-300 max-sm:hidden"></span>
+      <button class="btn btn-xs" data-needs-selection onclick="bulkAddTag()"
+              title="選択したファイルに同じタグを付ける">🏷 タグ追加</button>
+      <button class="btn btn-xs" data-needs-selection onclick="bulkRemoveTag()"
+              title="選択したファイルから同じタグを外す">タグ削除</button>
+      <button class="btn btn-xs" data-needs-selection onclick="bulkAddToSeries()"
+              title="選択したファイルをシリーズへまとめて追加">シリーズに追加</button>
+      <button class="btn btn-xs" data-needs-selection onclick="bulkDownload()"
+              title="選択したファイルを 1 件ずつダウンロード">⬇ ダウンロード</button>
+      <button class="btn btn-xs btn-error btn-outline" data-needs-selection onclick="bulkDelete()"
+              title="選択したファイルをゴミ箱へ移動">🗑 削除</button>
+    </div>
+  </div>
+</div>

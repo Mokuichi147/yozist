@@ -30,10 +30,15 @@
       <option value="size_asc">サイズが小さい順</option>
       <option value="created_desc">作成が新しい順</option>
     </select>
+
+    <button id="sel-toggle" class="btn btn-xs" onclick="toggleSelMode()"
+            title="複数選択モードに切り替える（タイルの長押しでも入れます）">☑ 選択</button>
   </div>
 
   <div id="gallery-status" class="text-sm opacity-50 py-8 text-center">読み込み中…</div>
   <div id="gallery" class="jg" aria-live="polite"></div>
+
+  {% include "_selection_bar.html" %}
 
 </div>
 {% endblock %}
@@ -56,11 +61,18 @@
     border-radius: 0.25rem;
     background: rgba(127, 127, 127, 0.15);
     color: inherit;
+  }
+  /* タイル全面を占めるリンク。チェックボックスはこの外側（.jg-item 直下）に置く */
+  .jg-link {
+    display: block;
+    width: 100%;
+    height: 100%;
+    color: inherit;
     text-decoration: none;
   }
-  .jg-item:focus-visible {
+  .jg-link:focus-visible {
     outline: 2px solid currentColor;
-    outline-offset: 2px;
+    outline-offset: -2px;
   }
   .jg-item img,
   .jg-item video {
@@ -104,8 +116,46 @@
     color: #fff;
     pointer-events: none;
   }
+  /* 選択チェックボックスは選択モードのときだけ出す（普段のギャラリーの見た目は
+     変えない。選択モードへはツールバーの「☑ 選択」か、タイルの長押しで入る）。
+     写真の上に重なるので、明暗どちらの写真でも見えるよう下地を敷く。 */
+  .jg-item .jg-check {
+    display: none;
+    position: absolute;
+    top: 0.35rem;
+    left: 0.35rem;
+    z-index: 2;
+    line-height: 0;
+    /* 指で狙える大きさにする（チェックボックス本体は 20px 前後しかない）。
+       余白ごと下地を敷くので、明暗どちらの写真の上でも位置が分かる。
+       下地はテーマの背景色にする。白で固定すると、ダークテーマでは
+       「明るい枠・明るいチェック」が白地に埋もれて見えなくなる。
+       輪郭線は付けず、影だけで写真から浮かせる。 */
+    padding: 0.3rem;
+    border-radius: 0.375rem;
+    background: var(--color-base-100, #fff);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+  }
+  .jg.sel-mode .jg-check { display: block; }
+  /* 長押しでの選択時に iOS のリンクプレビューが割り込まないようにする */
+  .jg-link { -webkit-touch-callout: none; }
+  /* 画面下に浮かぶ操作バーの下へ最後の行を送れるように余白を足す（バー自体は
+     position:fixed なので、開いてもギャラリーの位置は動かない） */
+  body.sel-bar-open { padding-bottom: 5.5rem; }
+  /* 選択済みタイルは primary の枠で示す。
+     枠はタイルの余白（padding + 背景色）として描き、写真は内側へ寄せる。
+     outline のように写真の上へ重ねると、枠の色が写真と混ざって見え方が
+     タイルごとに変わってしまう（同系色の写真では消える）。重ねなければ
+     枠は常に primary そのものの一色になる。
+     写真の減光はしない。この下地の上で薄くすると写真が primary に
+     色被りしてしまうし、枠とチェックで選択中は十分わかる。 */
+  .jg-item.selected {
+    padding: 3px;
+    background: var(--color-primary, #6366f1);
+  }
 {% endblock %}
 
 {% block script %}
+<script src="/ui/pages/bulk_actions.js"></script>
 <script src="/ui/pages/media.js"></script>
 {% endblock %}

@@ -285,6 +285,8 @@ mod tests {
             "filters.js",
             "trash.js",
             "series_settings.js",
+            // ページ固有ではなく files / media が共有する一括操作。
+            "bulk_actions.js",
         ] {
             assert!(names.contains(&expected), "missing page script: {expected}");
         }

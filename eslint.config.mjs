@@ -30,13 +30,20 @@ const commonJsGlobals = Object.fromEntries([
   'EXT_MIME', 'TEXT_EXT', 'extOf', 'mediaKind', 'viewerKind', 'ViewRuntime',
 ].map(name => [name, 'readonly']));
 
+// ページ間で共有する assets/pages/*.js が定義するグローバル。common.js と違い
+// 全ページには読み込まれず、必要なページのテンプレートだけが <script> で読む。
+const sharedPageGlobals = Object.fromEntries([
+  // bulk_actions.js: ファイル一覧 / メディア一覧の一括操作
+  'BulkActions',
+].map(name => [name, 'readonly']));
+
 export default [
   {
     files: ['crates/yozist-api/assets/**/*.js'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'script',
-      globals: { ...browserGlobals, ...commonJsGlobals },
+      globals: { ...browserGlobals, ...commonJsGlobals, ...sharedPageGlobals },
     },
     rules: {
       'no-undef': 'error',
