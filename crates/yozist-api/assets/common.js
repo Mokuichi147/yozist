@@ -245,7 +245,8 @@ function uiConfirm(message, opts = {}) {
  * @property {string} [placeholder]
  * @property {string} [hint]
  * @property {number} [rows] textarea の行数
- * @property {{value: string, label: string}[]} [options] select の選択肢
+ * @property {{value: string, label: string}[]} [options]
+ *   select の選択肢。text 系フィールドでは datalist の入力候補になる（自由入力も可）
  * @property {boolean} [readonly]
  */
 /**
@@ -285,6 +286,21 @@ function uiPrompt(opts) {
         input = document.createElement('input');
         input.type = f.type || 'text';
         input.className = 'input input-bordered input-sm w-full';
+        // options 付きの text は「既存から選ぶ / 新しく打つ」の両方をしたい欄
+        // （タグ名・シリーズ名など）。select にすると新規入力ができなくなるので
+        // datalist で候補を出すだけにして、自由入力は妨げない。
+        if (f.options && f.options.length) {
+          const listId = 'ui-prompt-list-' + f.name;
+          const dl = document.createElement('datalist');
+          dl.id = listId;
+          f.options.forEach(o => {
+            const opt = document.createElement('option');
+            opt.value = o.value;
+            dl.appendChild(opt);
+          });
+          wrap.appendChild(dl);
+          input.setAttribute('list', listId);
+        }
       }
       // placeholder / readOnly は input・textarea のみ持つ（select には従来どおり無効果）
       if (f.placeholder) /** @type {HTMLInputElement|HTMLTextAreaElement} */ (input).placeholder = f.placeholder;

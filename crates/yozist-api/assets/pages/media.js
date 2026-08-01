@@ -7,7 +7,8 @@
 /** @typedef {{ id: string, display_name: string, mime?: string|null, size: number,
  *              created_at: *, updated_at: * }} MediaFile */
 /** @typedef {{ file: MediaFile, kind: 'image'|'video', ratio: number,
- *              known: boolean, el: HTMLAnchorElement, mediaEl: HTMLImageElement|HTMLVideoElement|null,
+ *              known: boolean, el: HTMLElement, link: HTMLAnchorElement,
+ *              mediaEl: HTMLImageElement|HTMLVideoElement|null,
  *              objectUrl: string|null, loading: boolean, failed: boolean }} GalleryItem */
 
 // Justified Gallery 互換の既定値（miromannino/Justified-Gallery に近い設定）
@@ -30,6 +31,14 @@ let layoutTimer = 0;
 /** @type {GalleryItem[]} */
 const loadQueue = [];
 let activeLoads = 0;
+
+// ---- 複数選択 ----
+// file_id → ファイルメタ。ID だけでなく実体を持つのは、種別フィルタで一覧から
+// 外れた選択項目に対しても操作を続けられるようにするため。
+/** @type {Map<string, MediaFile>} */
+const selected = new Map();
+let selMode = false;        // 選択モード（チェックボックスを常時表示）
+let lastAnchorId = null;    // Shift+クリックによる範囲選択の起点
 
 async function init() {
   const me = await requireAuth();
@@ -182,6 +191,7 @@ function rebuildItems(files) {
 
   items = files.map(f => createItem(f));
   $('media-count').textContent = `(${items.length})`;
+  renderSelectionBar();
 
   const status = $('gallery-status');
   if (items.length === 0) {
@@ -215,9 +225,9 @@ function createItem(f) {
   const kind = mediaKindOf(f);
   // ?from=media を付けてファイル詳細へ渡し、詳細ページの「戻る」がここに戻れるようにする
   // （file_detail.js の setupBackLink 参照）。
-  const a = el('a', {
+  const link = el('a', {
     href: `/ui/files/${f.id}?from=media`,
-    class: 'jg-item',
+    class: 'jg-link',
     title: f.display_name,
   }, [
     el('span', { class: 'jg-placeholder', 'aria-hidden': 'true' },
@@ -225,12 +235,37 @@ function createItem(f) {
     kind === 'video' && el('span', { class: 'jg-badge' }, '動画'),
     el('span', { class: 'jg-label' }, f.display_name),
   ]);
+  // タイルは「リンク + チェックボックス」の入れ物。チェックボックスをリンクの
+  // 中に置くと、選択のたびに詳細ページへ遷移してしまう。クリックを
+  // preventDefault で止める手もあるが、それだとチェック状態の反転まで巻き戻される
+  // （キャンセルされた activation behavior は listener の後に元の値へ戻す）ため、
+  // 構造としてリンクの外に出す。
+  const tile = el('div', {
+    class: 'jg-item' + (selected.has(f.id) ? ' selected' : ''),
+    'data-file-id': f.id,
+  }, [
+    link,
+    // 表示の出し分けは入れ物の span 側で行う（daisyUI の .checkbox が持つ
+    // display をこちらで上書きしないため）。
+    el('span', { class: 'jg-check' }, el('input', {
+      type: 'checkbox',
+      // checkbox-primary: 選択済みはタイルの枠と同じ primary で塗られ、チェックは
+      // primary-content で描かれる。既定色（base-content）だと下地と同系色になり、
+      // 「チェックが入っているのか分からない」状態になる。
+      class: 'checkbox checkbox-sm checkbox-primary',
+      checked: selected.has(f.id),
+      'data-sel': f.id,
+      title: '選択（Shift+クリックで範囲選択）',
+      'aria-label': f.display_name + ' を選択',
+    })),
+  ]);
   return {
     file: f,
     kind,
     ratio: kind === 'video' ? VIDEO_RATIO : DEFAULT_RATIO,
     known: false,
-    el: a,
+    el: tile,
+    link,
     mediaEl: null,
     objectUrl: null,
     loading: false,
@@ -477,13 +512,172 @@ function mountMedia(it, media) {
   it.mediaEl = media;
   const ph = it.el.querySelector('.jg-placeholder');
   if (ph) ph.remove();
-  // ラベル・バッジの手前にメディアを挿入
-  it.el.insertBefore(media, it.el.firstChild);
+  // ラベル・バッジの手前（リンクの中）へメディアを挿入する
+  it.link.insertBefore(media, it.link.firstChild);
 }
+
+// ---- 複数選択 ----------------------------------------------------------------
+// タイル自体がファイル詳細へのリンクなので、選択とリンク遷移をどう分けるかが要点。
+//   - 選択モードでないとき: 従来どおりタップで詳細へ遷移する
+//   - 選択モードのとき: タイルのどこを押しても選択のトグル（写真アプリと同じ）
+$('gallery').addEventListener('click', e => {
+  const target = /** @type {HTMLElement} */ (e.target);
+  const box = /** @type {HTMLElement|null} */ (target.closest('[data-sel]'));
+  if (box) {
+    // チェックボックスはリンクの外なので既定動作を止める必要がない
+    // （止めるとチェック状態の反転まで巻き戻る）。状態は選択集合から描き直す。
+    onSelectClick(box.dataset.sel, e.shiftKey);
+    return;
+  }
+  if (!selMode) return;
+  const tile = /** @type {HTMLElement|null} */ (target.closest('.jg-item'));
+  if (!tile) return;
+  e.preventDefault();
+  onSelectClick(tile.dataset.fileId, e.shiftKey);
+});
+
+// Shift 併用時は直前に触れたタイルとの範囲をまとめて同じ状態にする。
+function onSelectClick(id, shift) {
+  const on = !selected.has(id);
+  if (shift && lastAnchorId && lastAnchorId !== id) selectRange(lastAnchorId, id, on);
+  else setSelected(id, on);
+  lastAnchorId = id;
+  syncSelectionUi();
+}
+
+function setSelected(id, on) {
+  if (!on) { selected.delete(id); return; }
+  const it = items.find(x => x.file.id === id);
+  if (it) selected.set(id, it.file);
+}
+
+// 表示順で from〜to の間にあるタイルをまとめて on にする。
+function selectRange(fromId, toId, on) {
+  const a = items.findIndex(it => it.file.id === fromId);
+  const b = items.findIndex(it => it.file.id === toId);
+  if (a < 0 || b < 0) { setSelected(toId, on); return; }
+  for (let i = Math.min(a, b); i <= Math.max(a, b); i++) setSelected(items[i].file.id, on);
+}
+
+function selectAllVisible() {
+  for (const it of items) selected.set(it.file.id, it.file);
+  syncSelectionUi();
+}
+
+function clearSelection() {
+  selected.clear();
+  lastAnchorId = null;
+  syncSelectionUi();
+}
+
+// 選択モード。チェックボックスはこのモードのときだけ現れる（普段のギャラリーの
+// 見た目を変えないため）。入口はツールバーの「☑ 選択」と、タイルの長押し。
+function setSelMode(on) {
+  if (selMode === on) return;
+  selMode = on;
+  $('gallery').classList.toggle('sel-mode', selMode);
+  $('sel-toggle').classList.toggle('btn-active', selMode);
+  // 抜けるときは選択も捨てる。入るときは未選択でも操作バーを出す（「表示中を
+  // 全選択」や終了ボタンへ、1 件選ぶ前に手が届くように）。
+  if (!selMode) clearSelection();
+  else renderSelectionBar();
+}
+
+function toggleSelMode() { setSelMode(!selMode); }
+function exitSelMode() { setSelMode(false); }
+
+// タイルの長押し: 選択モードへ入り、そのタイルを選択する（続く click は
+// 握り潰されるので詳細ページへは遷移しない）。
+// 長押しはあくまで「選択モードへの入口」なので、下の 2 つでは検出しない。
+// どちらも長押し成立時の click 握り潰しが操作を殺してしまうため:
+//   - 選択モード中: タップだけで選択できるので長押しは不要
+//   - チェックボックスの上: 小さい的を狙って押すと 450ms は簡単に超えるので、
+//     ここで拾うと「チェックを外せない」状態になる
+BulkActions.longPressSelect(
+  $('gallery'),
+  target => (selMode || target.closest('[data-sel]'))
+    ? null
+    : target.closest('.jg-item')?.dataset.fileId,
+  id => {
+    setSelMode(true);
+    setSelected(id, true);
+    lastAnchorId = id;
+    syncSelectionUi();
+  },
+);
+
+// 選択集合をタイル（チェック状態・選択枠）と操作バーへ反映する。
+// タイル要素は layout() で使い回されるので、作り直さず属性だけ更新する。
+function syncSelectionUi() {
+  for (const it of items) {
+    const on = selected.has(it.file.id);
+    it.el.classList.toggle('selected', on);
+    const box = /** @type {HTMLInputElement|null} */ (it.el.querySelector('[data-sel]'));
+    if (box) box.checked = on;
+  }
+  renderSelectionBar();
+}
+
+function renderSelectionBar() {
+  const n = selected.size;
+  const open = selMode || n > 0;
+  $('sel-bar').classList.toggle('hidden', !open);
+  // バーは position:fixed で最後の行に重なるので、開いている間だけ下端に余白を作る。
+  document.body.classList.toggle('sel-bar-open', open);
+  if (!open) return;
+  // 種別フィルタで一覧から外れている選択項目があることが分かるよう、
+  // 表示中の件数も添える（選択自体はフィルタをまたいで保持される）。
+  const visible = items.filter(it => selected.has(it.file.id)).length;
+  $('sel-count').textContent = n === 0
+    ? '項目を選択'
+    : visible === n
+      ? `${n} 件選択中`
+      : `${n} 件選択中（表示中 ${visible} 件）`;
+  // 未選択のうちは押しても何も起きないボタンを無効化する。
+  /** @type {NodeListOf<HTMLButtonElement>} */
+  (document.querySelectorAll('#sel-bar [data-needs-selection]'))
+    .forEach(b => { b.disabled = n === 0; });
+}
+
+// 一括操作の対象。シリーズ追加の並び順が見た目どおりになるよう表示順に揃え、
+// フィルタで一覧から外れている選択項目はその後ろへ回す。
+function selectedFiles() {
+  const inView = items.filter(it => selected.has(it.file.id)).map(it => it.file);
+  const seen = new Set(inView.map(f => f.id));
+  return [...inView, ...[...selected.values()].filter(f => !seen.has(f.id))];
+}
+
+// 一括操作。BulkActions が true（一覧の再読み込みが必要）を返したときだけ引き直す。
+async function runBulk(fn, { clearAfter = false } = {}) {
+  const files = selectedFiles();
+  if (files.length === 0) return;
+  const changed = await fn(files);
+  if (clearAfter) clearSelection();
+  if (changed) await loadMedia();
+  syncSelectionUi();
+}
+
+const bulkAddTag      = () => runBulk(BulkActions.addTag);
+const bulkRemoveTag   = () => runBulk(BulkActions.removeTag);
+const bulkAddToSeries = () => runBulk(BulkActions.addToSeries);
+const bulkDownload    = () => runBulk(BulkActions.download);
+// 削除したファイルは一覧から消えるので、選択も残さない。
+const bulkDelete      = () => runBulk(BulkActions.remove, { clearAfter: true });
+
+// Escape は 1 回目で選択解除、2 回目で選択モードを抜ける（入力欄の編集中は邪魔しない）。
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || (!selMode && selected.size === 0)) return;
+  const t = /** @type {HTMLElement} */ (e.target);
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (selected.size > 0) clearSelection();
+  else setSelMode(false);
+});
 
 // テンプレートのインライン onclick/onchange から参照される関数を公開
 Object.assign(window, {
   setKind, applyFilters,
+  toggleSelMode, exitSelMode, selectAllVisible, clearSelection,
+  bulkAddTag, bulkRemoveTag, bulkAddToSeries, bulkDownload, bulkDelete,
 });
 
 init();

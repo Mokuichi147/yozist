@@ -69,6 +69,8 @@
               <option value="size_asc">サイズが小さい順</option>
               <option value="created_desc">作成が新しい順</option>
             </select>
+            <button id="sel-toggle" class="btn btn-xs" onclick="toggleSelMode()"
+                    title="複数選択モードに切り替える（行の長押しでも入れます）">☑ 選択</button>
             <a href="/ui/media" class="btn btn-xs" title="写真・動画を Justified Gallery で表示">🖼 メディア</a>
             <button class="btn btn-xs" onclick="newFile()">＋ 新規ファイル</button>
             <button class="btn btn-xs btn-primary" onclick="$('upload-input').click()">⬆ アップロード</button>
@@ -95,13 +97,26 @@
     </div>
 
   </div>
+
+  {% include "_selection_bar.html" %}
 </div>
 {% endblock %}
 
 {% block style %}
   #drop-zone.drag-over { outline: 2px dashed var(--color-primary, #6366f1); outline-offset: -4px; }
+
+  /* チェックボックスは選択モードのときだけ出す。普段の一覧の見た目は変えない
+     （選択モードへはツールバーの「☑ 選択」か、行の長押しで入る）。 */
+  #file-list .sel-box { display: none; }
+  #file-list.sel-mode .sel-box { display: inline-flex; align-items: center; }
+  /* 長押しでの選択時に iOS のリンクプレビューが割り込まないようにする */
+  #file-list a { -webkit-touch-callout: none; }
+  /* 画面下に浮かぶ操作バーの下へ最後の行を送れるように余白を足す（バー自体は
+     position:fixed なので、開いても一覧の位置は動かない） */
+  body.sel-bar-open { padding-bottom: 5.5rem; }
 {% endblock %}
 
 {% block script %}
+<script src="/ui/pages/bulk_actions.js"></script>
 <script src="/ui/pages/files.js"></script>
 {% endblock %}

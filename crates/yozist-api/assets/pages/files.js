@@ -13,6 +13,14 @@ let hasMore = false;        // ブラウズモード時にまだ続きがある�
 let browseOffset = 0;       // ブラウズモードの DB オフセット
 let browseMode = true;      // フィルタなし（サーバページング）かどうか
 
+// ---- 複数選択 ----
+// file_id → ファイルメタ。ID だけでなく実体を持つのは、フィルタや並び順を変えて
+// 一覧から外れた選択項目に対しても操作を続けられるようにするため
+// （バーの件数と実際の操作対象が食い違わない）。
+const selected = new Map();
+let selMode = false;        // 選択モード（チェックボックスを常時表示）
+let lastAnchorId = null;    // Shift+クリックによる範囲選択の起点
+
 async function init() {
   const me = await requireAuth();
   if (!me) return;
@@ -345,33 +353,201 @@ function renderFiles() {
         : '該当ファイルなし — フィルタ条件を見直してください。'));
   } else {
     list.replaceChildren(...allFiles.map(f =>
-      el('li', {}, el('a', { href: `/ui/files/${f.id}`, class: 'flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200' }, [
-        el('span', { class: 'text-lg shrink-0', 'aria-hidden': 'true' }, fileIcon(f)),
-        el('span', { class: 'min-w-0 flex-1' }, [
-          el('span', { class: 'font-semibold truncate block' }, f.display_name),
-          el('span', { class: 'flex flex-wrap gap-1 mt-0.5 empty:hidden', 'data-tags-for': f.id }),
+      // チェックボックスはリンクの外に置く（中に入れると選択のたびに詳細へ遷移する）。
+      // 表示の出し分けは入れ物の span 側で行う（daisyUI の .checkbox が持つ
+      // display をこちらで上書きしないため）。
+      el('li', { class: 'flex items-center gap-1', 'data-file-id': f.id }, [
+        el('span', { class: 'sel-box shrink-0 ml-1' }, el('input', {
+          type: 'checkbox',
+          // 選択済みの色はメディア一覧のタイル枠と揃える（checkbox-primary）。
+          class: 'checkbox checkbox-sm checkbox-primary',
+          checked: selected.has(f.id),
+          'data-sel': f.id,
+          title: '選択（Shift+クリックで範囲選択）',
+          'aria-label': f.display_name + ' を選択',
+        })),
+        el('a', { href: `/ui/files/${f.id}`, class: 'flex items-center gap-3 px-2 py-2 rounded hover:bg-base-200 min-w-0 flex-1' }, [
+          el('span', { class: 'text-lg shrink-0', 'aria-hidden': 'true' }, fileIcon(f)),
+          el('span', { class: 'min-w-0 flex-1' }, [
+            el('span', { class: 'font-semibold truncate block' }, f.display_name),
+            el('span', { class: 'flex flex-wrap gap-1 mt-0.5 empty:hidden', 'data-tags-for': f.id }),
+          ]),
+          // base.html の .hidden は !important なので sm:block で上書きできない。max-sm:hidden を使う
+          el('span', { class: 'text-xs opacity-60 shrink-0 text-right block max-sm:hidden w-32' }, [
+            el('span', { class: 'block', title: '更新日時' }, fmtTs(f.updated_at)),
+            el('span', { class: 'block' }, fmtSize(f.size) + actorLabel(f)),
+          ]),
         ]),
-        // base.html の .hidden は !important なので sm:block で上書きできない。max-sm:hidden を使う
-        el('span', { class: 'text-xs opacity-60 shrink-0 text-right block max-sm:hidden w-32' }, [
-          el('span', { class: 'block', title: '更新日時' }, fmtTs(f.updated_at)),
-          el('span', { class: 'block' }, fmtSize(f.size) + actorLabel(f)),
-        ]),
-      ]))));
+      ])));
     // 取得済みタグがあれば即時反映
     /** @type {NodeListOf<HTMLElement>} */ (list.querySelectorAll('[data-tags-for]'))
       .forEach(t => renderRowTags(t, t.dataset.tagsFor));
   }
 
   $('load-more-wrap').classList.toggle('hidden', !(browseMode && hasMore));
+  renderSelectionBar();
 }
 
-// 行内のタグチップはイベントデリゲーションで処理（クリックで絞り込みトグル）
+// 行内のタグチップと選択チェックボックスはイベントデリゲーションで処理する
+// （行は applyFilters のたびに作り直されるので、個別にリスナを張らない）。
 $('file-list').addEventListener('click', e => {
-  const tagBtn = /** @type {HTMLElement|null} */
-    (/** @type {HTMLElement} */ (e.target).closest('[data-tag]'));
-  if (!tagBtn) return;
+  const target = /** @type {HTMLElement} */ (e.target);
+  const box = /** @type {HTMLInputElement|null} */ (target.closest('[data-sel]'));
+  if (box) { onSelectClick(box.dataset.sel, e.shiftKey); return; }
+  const tagBtn = /** @type {HTMLElement|null} */ (target.closest('[data-tag]'));
+  if (tagBtn) {
+    e.preventDefault();
+    toggleTag(tagBtn.dataset.tag);
+    return;
+  }
+  // 選択モード中は行のどこを押しても選択のトグル（詳細へは遷移しない）。
+  // チェックボックスを狙わなくても選べるようにするため。
+  if (!selMode) return;
+  const row = /** @type {HTMLElement|null} */ (target.closest('[data-file-id]'));
+  if (!row) return;
   e.preventDefault();
-  toggleTag(tagBtn.dataset.tag);
+  onSelectClick(row.dataset.fileId, e.shiftKey);
+});
+
+// ---- 複数選択 ----
+
+// チェックボックスのクリック。Shift 併用時は直前に触れた行との範囲をまとめて
+// 同じ状態にする（クリックで既定のトグルは済んでいるので、望む状態は選択集合から求める）。
+function onSelectClick(id, shift) {
+  const on = !selected.has(id);
+  if (shift && lastAnchorId && lastAnchorId !== id) selectRange(lastAnchorId, id, on);
+  else setSelected(id, on);
+  lastAnchorId = id;
+  syncSelectionUi();
+}
+
+function setSelected(id, on) {
+  if (!on) { selected.delete(id); return; }
+  const f = allFiles.find(x => x.id === id);
+  if (f) selected.set(id, f);
+}
+
+// 一覧上で from〜to の間にある行をまとめて on にする（範囲は表示順で決まる）。
+function selectRange(fromId, toId, on) {
+  const a = allFiles.findIndex(f => f.id === fromId);
+  const b = allFiles.findIndex(f => f.id === toId);
+  if (a < 0 || b < 0) { setSelected(toId, on); return; }
+  for (let i = Math.min(a, b); i <= Math.max(a, b); i++) setSelected(allFiles[i].id, on);
+}
+
+function selectAllVisible() {
+  allFiles.forEach(f => selected.set(f.id, f));
+  syncSelectionUi();
+}
+
+function clearSelection() {
+  selected.clear();
+  lastAnchorId = null;
+  syncSelectionUi();
+}
+
+// 選択モード。チェックボックスはこのモードのときだけ現れる（普段の一覧の
+// 見た目を変えないため）。入口はツールバーの「☑ 選択」と、行の長押し。
+function setSelMode(on) {
+  if (selMode === on) return;
+  selMode = on;
+  $('file-list').classList.toggle('sel-mode', selMode);
+  $('sel-toggle').classList.toggle('btn-active', selMode);
+  // 抜けるときは選択も捨てる。入るときは未選択でも操作バーを出す（「表示中を
+  // 全選択」や終了ボタンへ、1 件選ぶ前に手が届くように）。
+  if (!selMode) clearSelection();
+  else renderSelectionBar();
+}
+
+function toggleSelMode() { setSelMode(!selMode); }
+function exitSelMode() { setSelMode(false); }
+
+// 行の長押し: 選択モードへ入り、その行を選択する（続く click は握り潰されるので
+// 詳細ページへは遷移しない）。
+// 長押しはあくまで「選択モードへの入口」なので、下の 2 つでは検出しない。
+// どちらも長押し成立時の click 握り潰しが操作を殺してしまうため:
+//   - 選択モード中: 行のタップだけで選択できるので長押しは不要
+//   - チェックボックスの上: 狙って押すと 450ms は簡単に超えるので、ここで拾うと
+//     「チェックを外せない」状態になる
+BulkActions.longPressSelect(
+  $('file-list'),
+  target => (selMode || target.closest('[data-sel]'))
+    ? null
+    : target.closest('[data-file-id]')?.dataset.fileId,
+  id => {
+    setSelMode(true);
+    setSelected(id, true);
+    lastAnchorId = id;
+    syncSelectionUi();
+  },
+);
+
+// 選択集合を DOM（チェック状態と操作バー）へ反映する。行を作り直さずに済ませる。
+function syncSelectionUi() {
+  /** @type {NodeListOf<HTMLInputElement>} */ (document.querySelectorAll('#file-list [data-sel]'))
+    .forEach(box => { box.checked = selected.has(box.dataset.sel); });
+  renderSelectionBar();
+}
+
+function renderSelectionBar() {
+  const n = selected.size;
+  const open = selMode || n > 0;
+  $('sel-bar').classList.toggle('hidden', !open);
+  // バーは position:fixed で最後の行に重なるので、開いている間だけ下端に余白を作る。
+  document.body.classList.toggle('sel-bar-open', open);
+  if (!open) return;
+  // 一覧に見えている件数も出す。フィルタを変えた後「操作対象が画面にない」ことが
+  // 分かるようにするため（選択自体はフィルタをまたいで保持される）。
+  const visible = allFiles.filter(f => selected.has(f.id)).length;
+  $('sel-count').textContent = n === 0
+    ? '項目を選択'
+    : visible === n
+      ? `${n} 件選択中`
+      : `${n} 件選択中（表示中 ${visible} 件）`;
+  // 未選択のうちは押しても何も起きないボタンを無効化する。
+  /** @type {NodeListOf<HTMLButtonElement>} */
+  (document.querySelectorAll('#sel-bar [data-needs-selection]'))
+    .forEach(b => { b.disabled = n === 0; });
+}
+
+// 一括操作の対象。シリーズ追加の並び順が見た目どおりになるよう一覧の表示順に
+// 揃え、フィルタで一覧から外れている選択項目はその後ろへ回す。
+function selectedFiles() {
+  const inView = allFiles.filter(f => selected.has(f.id));
+  const seen = new Set(inView.map(f => f.id));
+  const rest = [...selected.values()].filter(f => !seen.has(f.id));
+  return [...inView, ...rest];
+}
+
+// 一括操作。BulkActions が true（一覧の再読み込みが必要）を返したときだけ引き直す。
+async function runBulk(fn, { clearAfter = false } = {}) {
+  const files = selectedFiles();
+  if (files.length === 0) return;
+  const changed = await fn(files);
+  if (clearAfter) clearSelection();
+  if (changed) {
+    // タグは行に出るので、変更された分のキャッシュを捨ててから引き直す。
+    // 左カラムのタグ一覧も、新しく作ったタグや使われなくなったタグを反映させる。
+    files.forEach(f => { delete tagsByFile[f.id]; });
+    await Promise.all([loadTags(), applyFilters()]);
+  }
+  syncSelectionUi();
+}
+
+const bulkAddTag      = () => runBulk(BulkActions.addTag);
+const bulkRemoveTag   = () => runBulk(BulkActions.removeTag);
+const bulkAddToSeries = () => runBulk(BulkActions.addToSeries);
+const bulkDownload    = () => runBulk(BulkActions.download);
+// 削除したファイルは一覧から消えるので、選択も残さない。
+const bulkDelete      = () => runBulk(BulkActions.remove, { clearAfter: true });
+
+// Escape は 1 回目で選択解除、2 回目で選択モードを抜ける（入力欄の編集中は邪魔しない）。
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || (!selMode && selected.size === 0)) return;
+  const t = /** @type {HTMLElement} */ (e.target);
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (selected.size > 0) clearSelection();
+  else setSelMode(false);
 });
 
 // ---- アップロード ----
@@ -460,5 +636,7 @@ init();
 Object.assign(window, {
   applyFilters, applyFiltersDebounced, resetFilters, renderTags,
   loadMore, uploadFiles, newFile,
+  toggleSelMode, exitSelMode, selectAllVisible, clearSelection,
+  bulkAddTag, bulkRemoveTag, bulkAddToSeries, bulkDownload, bulkDelete,
 });
 })();
